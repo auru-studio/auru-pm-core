@@ -81,6 +81,58 @@ impl fmt::Display for PluginId {
     }
 }
 
+/// Error returned when a registry key is not a plugin identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsePluginIdError(String);
+
+impl fmt::Display for ParsePluginIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "'{}' is not a plugin identity", self.0)
+    }
+}
+
+impl std::error::Error for ParsePluginIdError {}
+
+impl std::str::FromStr for PluginId {
+    type Err = ParsePluginIdError;
+
+    /// Parse the form [`Display`](fmt::Display) writes.
+    ///
+    /// This is how plugin registries key their entries: a stable, readable
+    /// string that survives being written in a JSON file by hand.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let invalid = || ParsePluginIdError(value.to_owned());
+        let (scheme, rest) = value.split_once(':').ok_or_else(invalid)?;
+        match scheme {
+            "vst2" => Ok(Self::Vst2 {
+                unique_id: rest.parse().map_err(|_| invalid())?,
+            }),
+            "vst3" => {
+                let mut tuid = [0_u32; 4];
+                let mut fields = rest.split('-');
+                for slot in &mut tuid {
+                    *slot = fields
+                        .next()
+                        .ok_or_else(invalid)?
+                        .parse()
+                        .map_err(|_| invalid())?;
+                }
+                if fields.next().is_some() {
+                    return Err(invalid());
+                }
+                Ok(Self::Vst3 { tuid })
+            }
+            "au" if !rest.is_empty() => Ok(Self::AudioUnit {
+                name: rest.to_owned(),
+            }),
+            "live" if !rest.is_empty() => Ok(Self::Native {
+                device: rest.to_owned(),
+            }),
+            _ => Err(invalid()),
+        }
+    }
+}
+
 /// One distinct plugin used by the set, with how many times it appears.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PluginRef {
@@ -390,6 +442,56 @@ mod tests {
         assert_eq!(plugins.len(), 2);
         assert_eq!(plugins[0].device_type, Some(1));
         assert_eq!(plugins[1].device_type, Some(2));
+    }
+
+    #[test]
+    fn every_identity_should_survive_its_registry_key() {
+        // The key is what a registry file is written and maintained by, so a
+        // round trip has to be exact — a misparsed id means a plugin the user
+        // owns is reported as unrecognised.
+        for id in [
+            PluginId::Vst2 {
+                unique_id: 1_483_109_208,
+            },
+            PluginId::Vst3 {
+                tuid: [1_448_297_816, 1_718_833_267, 1_701_999_981, 540_147_712],
+            },
+            PluginId::AudioUnit {
+                name: "Some AU".to_owned(),
+            },
+            PluginId::Native {
+                device: "Eq8".to_owned(),
+            },
+        ] {
+            let key = id.to_string();
+            assert_eq!(
+                key.parse::<PluginId>().expect("round trip"),
+                id,
+                "key {key} did not parse back"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_registry_key_should_be_rejected() {
+        // Better to report an unusable registry line than to silently key an
+        // entry under an identity nothing will ever match.
+        for bad in [
+            "",
+            "vst2:",
+            "vst2:not-a-number",
+            "vst3:1-2-3",
+            "vst3:1-2-3-4-5",
+            "au:",
+            "live:",
+            "something:else",
+            "no-scheme",
+        ] {
+            assert!(
+                bad.parse::<PluginId>().is_err(),
+                "{bad:?} should not parse as a plugin identity"
+            );
+        }
     }
 
     #[test]

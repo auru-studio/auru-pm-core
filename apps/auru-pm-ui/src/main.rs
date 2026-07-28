@@ -24,7 +24,10 @@ use crate::catalog::{
     stub_provider_catalog,
 };
 use crate::menus::{CloseWindow, Minimize, OpenSettings, Zoom};
-use crate::model::{Project, ProjectAction, ProjectStatus, SyncDirection, stub_projects};
+use crate::model::{
+    PLUGIN_SETTINGS_REASSURANCE, Project, ProjectAction, ProjectStatus, SyncDirection,
+    stub_projects,
+};
 
 const TRANSFER_DURATION: Duration = Duration::from_millis(1_500);
 const DISPLAY_FONT: &str = "New York";
@@ -89,7 +92,8 @@ impl ProjectManager {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
-        let display_name_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Alice, Bob, or Charlie"));
+        let display_name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Alice, Bob, or Charlie"));
         let search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("⌕ search projects…"));
         let credential_input =
@@ -727,14 +731,44 @@ impl ProjectManager {
             )
             .child(primary_action);
 
-        let info_grid = div()
-            .flex()
-            .flex_col()
-            .border_1()
-            .border_color(line())
+        let mut info_grid = div().flex().flex_col().border_1().border_color(line());
+
+        // What the project *is*, when its detail has been read. Shown first
+        // because it is what tells someone which project they are looking at.
+        if let Some(detail) = &project.detail {
+            info_grid = info_grid
+                .child(
+                    div()
+                        .flex()
+                        .child(info_cell("TEMPO", detail.tempo_line(), bright()))
+                        .child(info_cell("KEY", detail.key_line(), bright())),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .border_t_1()
+                        .border_color(line())
+                        .child(info_cell("TRACKS", detail.tracks_line(), bright()))
+                        .child(info_cell("LENGTH", detail.length_line(), bright())),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .border_t_1()
+                        .border_color(line())
+                        .child(info_cell("MADE WITH", detail.made_with(), bright()))
+                        .child(info_cell("FILES", detail.files_line(), bright())),
+                );
+        }
+
+        let backup_row_border = if project.detail.is_some() { 1.0 } else { 0.0 };
+        let mut backup_row = div().flex();
+        if backup_row_border > 0.0 {
+            backup_row = backup_row.border_t_1().border_color(line());
+        }
+        info_grid = info_grid
             .child(
-                div()
-                    .flex()
+                backup_row
                     .child(info_cell(
                         "SAFE COPY LIVES ON",
                         "Auru Cloud · eu-west",
@@ -762,6 +796,99 @@ impl ProjectManager {
                         color,
                     )),
             );
+
+        // Only rendered when something is actually missing. A project whose
+        // plugins are all present should say nothing at all rather than show
+        // an empty section implying there is something to deal with.
+        let missing_plugins = (!project.missing_plugins.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .child(section_label("[ PLUGINS NOT ON THIS COMPUTER ]"))
+                .children(project.missing_plugins.iter().enumerate().map(
+                    |(plugin_index, plugin)| {
+                        let link = plugin.link.clone();
+                        let mut row = div()
+                            .flex()
+                            .min_h(px(40.0))
+                            .items_center()
+                            .justify_between()
+                            .gap_4()
+                            .border_t_1()
+                            .border_color(line())
+                            .px_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .min_w_0()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .overflow_x_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_size(px(10.0))
+                                            .text_color(ink())
+                                            .child(plugin.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(9.0))
+                                            .text_color(faint())
+                                            .child(plugin.detail_line()),
+                                    ),
+                            );
+
+                        if let Some(url) = link {
+                            row = row.child(
+                                div()
+                                    .id(format!("plugin-link-{}-{plugin_index}", project.id))
+                                    .flex_shrink_0()
+                                    .cursor_pointer()
+                                    .text_size(px(9.0))
+                                    .text_color(blue())
+                                    .hover(|this| this.text_color(bright()))
+                                    .on_click(cx.listener(move |_, _, window, cx| {
+                                        // Opening the maker's page is as far as
+                                        // this goes: obtaining and authorizing a
+                                        // plugin is between the person and its
+                                        // vendor, and nothing here touches that.
+                                        cx.open_url(&url);
+                                        window.push_notification(
+                                            Notification::info(
+                                                "Opened the plugin maker's page in your browser.",
+                                            )
+                                            .title("Where to get it"),
+                                            cx,
+                                        );
+                                    }))
+                                    .child("WHERE TO GET IT  ↗"),
+                            );
+                        } else {
+                            row = row.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(9.0))
+                                    .text_color(faint())
+                                    .child("SEARCH BY NAME"),
+                            );
+                        }
+
+                        row.into_any_element()
+                    },
+                ))
+                .child(
+                    div()
+                        .border_t_1()
+                        .border_color(line())
+                        .pt_3()
+                        .px_1()
+                        .text_size(px(9.0))
+                        .text_color(dim())
+                        .child(PLUGIN_SETTINGS_REASSURANCE),
+                )
+        });
 
         let versions = div()
             .flex()
@@ -850,6 +977,7 @@ impl ProjectManager {
                                 .text_color(faint())
                                 .child(project.displayed_path()),
                         )
+                        .children(missing_plugins)
                         .child(versions),
                 ),
             )

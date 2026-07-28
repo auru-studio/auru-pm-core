@@ -55,6 +55,17 @@ impl ProjectInfo {
         })
     }
 
+    /// Derive the summary from canonical snapshot bytes.
+    ///
+    /// The form most callers have: [`ProjectSnapshot::as_bytes`] and blobs
+    /// fetched from a provider are both byte slices. `None` for bytes that are
+    /// not a snapshot, or a snapshot with nothing to summarize.
+    ///
+    /// [`ProjectSnapshot::as_bytes`]: crate::ProjectSnapshot::as_bytes
+    pub fn from_snapshot_bytes(bytes: &[u8]) -> Option<Self> {
+        Self::from_snapshot(&serde_json::from_slice(bytes).ok()?)
+    }
+
     /// Canonical JSON, with map keys in sorted order — the same rule commit
     /// hashing uses, so the same summary always hashes to the same blob.
     pub fn canonical_encoding(&self) -> Result<Vec<u8>, serde_json::Error> {

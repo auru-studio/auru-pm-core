@@ -17,6 +17,7 @@ pub mod hash;
 pub mod http;
 pub mod merge;
 pub mod oauth;
+pub mod plugin_registry;
 pub mod project_format;
 pub mod project_info;
 pub mod provider;
@@ -48,6 +49,10 @@ pub use merge::{
     resolve_conflicts,
 };
 pub use oauth::{DeviceCodeResponse, OAuthProgress, start_device_flow};
+pub use plugin_registry::{
+    AURU_PLUGIN_REGISTRY_URL, PluginAvailability, PluginEntry, PluginRegistry, PluginSearchPaths,
+    PluginSource, ResolvedPlugin,
+};
 pub use project_format::{ProjectFormat, ProjectSnapshot, restore_project, snapshot_project};
 pub use project_info::{PROJECT_INFO_SCHEMA, ProjectInfo};
 pub use provider::{

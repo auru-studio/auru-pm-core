@@ -1,0 +1,131 @@
+{
+  "_comment": [
+    "Plugin registry compiled into the build, used when the hosted registry at",
+    "pm.auru.studio is unreachable or has not been fetched yet.",
+    "",
+    "Entries are keyed by plugin identity as written by PluginId's Display:",
+    "  vst2:<UniqueId>            from VstPluginInfo/UniqueId",
+    "  vst3:<f0>-<f1>-<f2>-<f3>   from Vst3PluginInfo/Uid/Fields.0..3",
+    "  live:<ElementTag>          a device built into Ableton Live",
+    "",
+    "Only identities that have been read out of a real project belong here.",
+    "A VST3 class id cannot be guessed from a plugin's name, and an entry under",
+    "a wrong identity is worse than no entry: it would attach one plugin's",
+    "vendor and link to a different plugin entirely. The hosted registry is",
+    "where the broad catalogue is maintained.",
+    "",
+    "This file never contains licences, licence keys, activation data, or",
+    "installers. It says what a plugin is and where its maker distributes it."
+  ],
+  "plugins": [
+    {
+      "id": "vst2:1483109208",
+      "name": "Serum",
+      "vendor": "Xfer Records",
+      "source": {
+        "kind": "vendor",
+        "product_url": "https://xferrecords.com/products/serum"
+      }
+    },
+    {
+      "id": "vst2:1483109209",
+      "name": "Serum FX",
+      "vendor": "Xfer Records",
+      "source": {
+        "kind": "vendor",
+        "product_url": "https://xferrecords.com/products/serum"
+      },
+      "notes": "The effects-only version, included with Serum."
+    },
+    {
+      "id": "vst3:1448297816-1718833267-1701999981-540147712",
+      "name": "Serum 2",
+      "vendor": "Xfer Records",
+      "source": {
+        "kind": "vendor",
+        "product_url": "https://xferrecords.com/products/serum"
+      }
+    },
+    {
+      "id": "vst3:1448297816-1718833523-1701999981-540156006",
+      "name": "Serum 2 FX",
+      "vendor": "Xfer Records",
+      "source": {
+        "kind": "vendor",
+        "product_url": "https://xferrecords.com/products/serum"
+      },
+      "notes": "The effects-only version, included with Serum 2."
+    },
+    {
+      "id": "vst2:1517176172",
+      "name": "Ozone 8 Elements",
+      "vendor": "iZotope",
+      "source": {
+        "kind": "vendor",
+        "product_url": "https://www.izotope.com/en/products/ozone.html",
+        "installer_url": "https://www.izotope.com/en/products/product-portal.html"
+      },
+      "notes": "Superseded by later Ozone versions; older releases are available through iZotope's Product Portal."
+    },
+
+    { "id": "live:Eq8", "name": "EQ Eight", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:ChannelEq", "name": "Channel EQ", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Compressor2", "name": "Compressor", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:GlueCompressor", "name": "Glue Compressor", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Limiter", "name": "Limiter", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Gate", "name": "Gate", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Saturator", "name": "Saturator", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Utility", "name": "Utility", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:AutoFilter", "name": "Auto Filter", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:AutoPan", "name": "Auto Pan", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Reverb", "name": "Reverb", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:HybridReverb", "name": "Hybrid Reverb", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Delay", "name": "Delay", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Echo", "name": "Echo", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:FilterDelay", "name": "Filter Delay", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:GrainDelay", "name": "Grain Delay", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Redux2", "name": "Redux", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Redux", "name": "Redux", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Erosion", "name": "Erosion", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Overdrive", "name": "Overdrive", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:DrumBuss", "name": "Drum Buss", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Roar", "name": "Roar", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Chorus2", "name": "Chorus-Ensemble", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:PhaserNew", "name": "Phaser-Flanger", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Shifter", "name": "Shifter", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:SpectralResonator", "name": "Spectral Resonator", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:SpectralTime", "name": "Spectral Time", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Corpus", "name": "Corpus", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Resonators", "name": "Resonators", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Vocoder", "name": "Vocoder", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Amp", "name": "Amp", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Cabinet", "name": "Cabinet", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Pedal", "name": "Pedal", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Looper", "name": "Looper", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:BeatRepeat", "name": "Beat Repeat", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Tuner", "name": "Tuner", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Spectrum", "name": "Spectrum", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+
+    { "id": "live:Operator", "name": "Operator", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Wavetable", "name": "Wavetable", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Drift", "name": "Drift", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Meld", "name": "Meld", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Granulator3", "name": "Granulator III", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Simpler", "name": "Simpler", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:MultiSampler", "name": "Sampler", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:Hybrid", "name": "Collision", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+
+    { "id": "live:InstrumentGroupDevice", "name": "Instrument Rack", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:AudioEffectGroupDevice", "name": "Audio Effect Rack", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:MidiEffectGroupDevice", "name": "MIDI Effect Rack", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:DrumGroupDevice", "name": "Drum Rack", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+
+    { "id": "live:MidiArpeggiator", "name": "Arpeggiator", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:MidiChord", "name": "Chord", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:MidiScale", "name": "Scale", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:MidiPitcher", "name": "Pitch", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:MidiVelocity", "name": "Velocity", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:MidiNoteLength", "name": "Note Length", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } },
+    { "id": "live:MidiRandom", "name": "Random", "vendor": "Ableton", "source": { "kind": "bundled-with-live" } }
+  ]
+}
