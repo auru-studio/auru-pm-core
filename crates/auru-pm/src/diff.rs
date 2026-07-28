@@ -101,7 +101,7 @@ pub fn summarize_diff(ancestor: &Value, current: &Value) -> DiffSummary {
     items
 }
 
-fn fmt_f64(v: f64) -> String {
+pub(crate) fn fmt_f64(v: f64) -> String {
     if v.fract() == 0.0 {
         format!("{}", v as i64)
     } else {
@@ -111,11 +111,11 @@ fn fmt_f64(v: f64) -> String {
 
 /// Time signature snapshot used by position formatting in the clip diff.
 #[derive(Clone, Copy)]
-struct TimeSig {
+pub(crate) struct TimeSig {
     /// Beats per bar (in beats of the denominator unit).
-    numerator: u32,
+    pub(crate) numerator: u32,
     /// Note value that gets one beat (2 = half, 4 = quarter, 8 = eighth…).
-    denominator: u32,
+    pub(crate) denominator: u32,
 }
 
 fn diff_channels(items: &mut Vec<String>, a: Option<&Value>, b: Option<&Value>, time_sig: TimeSig) {
@@ -359,7 +359,7 @@ fn audio_field<'a>(v: &'a Value, field: &str) -> Option<&'a Value> {
 /// 0-indexed sixteenth-note subbeat within the beat). `time_sig` controls
 /// the bar length — `numerator` beats per bar of the `denominator` unit
 /// (e.g. 6/8 → 6 eighth-notes per bar, which is 3 quarter-note beats).
-fn fmt_pos_beats(beats: f64, time_sig: TimeSig) -> String {
+pub(crate) fn fmt_pos_beats(beats: f64, time_sig: TimeSig) -> String {
     // Project clips store `position_beats` in *quarter-note* beats. Convert
     // the time-sig numerator (in `denominator` units) into quarter-note
     // beats so the math stays in a single unit.
@@ -521,6 +521,13 @@ impl ProjectDiff {
 /// can render as per-channel cards. External DAW changes are returned as
 /// project-level rows because their native channel schemas are DAW-specific.
 pub fn structured_diff(ancestor: &Value, current: &Value) -> ProjectDiff {
+    // Ableton Live Sets get a real per-track comparison. Falling through on
+    // `None` matters: a Live Set we cannot read — one with no `LiveSet`
+    // element, say — must reach the format-agnostic summary below rather than
+    // producing an empty diff, which would claim the versions are identical.
+    if let Some(diff) = crate::ableton::diff::structured_diff(ancestor, current) {
+        return diff;
+    }
     if is_external_snapshot(ancestor) || is_external_snapshot(current) {
         return ProjectDiff {
             project_changes: summarize_external_diff(ancestor, current, false),
@@ -1013,7 +1020,7 @@ fn diff_channel_instrument(
 }
 
 /// Convert a linear gain value to dB (−inf for 0).
-fn linear_to_db(linear: f64) -> f64 {
+pub(crate) fn linear_to_db(linear: f64) -> f64 {
     if linear <= 0.0 {
         return -f64::INFINITY;
     }
@@ -1021,7 +1028,7 @@ fn linear_to_db(linear: f64) -> f64 {
 }
 
 /// Format a pan value in [−1, 1] as a user-readable string.
-fn fmt_pan(pan: f64) -> String {
+pub(crate) fn fmt_pan(pan: f64) -> String {
     if pan.abs() < 0.005 {
         "C".to_owned()
     } else if pan < 0.0 {

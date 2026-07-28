@@ -20,6 +20,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tower_http::decompression::RequestDecompressionLayer;
 
 // ── Shared state ─────────────────────────────────────────────────────────────
 
@@ -62,7 +63,10 @@ async fn get_health() -> impl IntoResponse {
             "permissions": false,
             "branches": false,
             "server_side_merge": false,
-            "auth_methods": ["none"]
+            "auth_methods": ["none"],
+            // Blob uploads may arrive gzipped; the decompression layer on the
+            // router unwraps them before the handler sees the body.
+            "compressed_uploads": true
         }
     }))
 }
@@ -228,6 +232,11 @@ async fn main() {
         .route("/v1/projects/:handle/history", get(get_history))
         .route("/v1/blobs/has", post(post_blobs_has))
         .route("/v1/blobs/:hash", put(put_blob).get(get_blob))
+        // Unwrap `Content-Encoding: gzip` request bodies before they reach a
+        // handler, so `put_blob` always stores plaintext regardless of how the
+        // client chose to send it. Advertised as `compressed_uploads` in
+        // `/v1/health`; clients only compress when they have seen that.
+        .layer(RequestDecompressionLayer::new().gzip(true))
         .with_state(db);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));

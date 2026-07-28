@@ -18,6 +18,19 @@ pub struct Capabilities {
     pub branches: bool,
     pub server_side_merge: bool,
     pub auth_methods: Vec<AuthMethod>,
+    /// Whether the server decodes `Content-Encoding: gzip` on blob uploads.
+    ///
+    /// Defaults to `false`, which is what makes this safe to add: a server
+    /// written before this field existed omits it, the client reads `false`,
+    /// and uploads stay uncompressed. Sending a compressed body to a server
+    /// that ignored the header would have it store the compressed bytes under
+    /// the plaintext hash — corruption that would only surface later, when the
+    /// blob was read back and no longer parsed.
+    ///
+    /// Downloads need no capability: response compression is negotiated by
+    /// `Accept-Encoding` in the ordinary way.
+    #[serde(default)]
+    pub compressed_uploads: bool,
 }
 
 /// Authentication scheme advertised by a provider via `/v1/health`.

@@ -140,6 +140,9 @@ impl ProjectProvider for FilesystemProvider {
             branches: false,
             server_side_merge: false,
             auth_methods: vec![AuthMethod::None],
+            // Not an HTTP provider — there is no transfer encoding to
+            // negotiate. Blobs are still stored compressed by the CAS.
+            compressed_uploads: false,
         }
     }
 
@@ -256,6 +259,7 @@ mod tests {
             description: String::new(),
             auru_version: "0.1.0".into(),
             format_version: 8,
+            metadata: None,
         };
         commit.id = compute_commit_id(&commit).unwrap();
         commit

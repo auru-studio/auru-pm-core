@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::commit::CommitId;
 use crate::error::{Error, Result};
+use crate::hash::ContentHash;
 
 /// Conventional filename suffix appended to the `.auru` path.
 pub const SIDECAR_SUFFIX: &str = ".auru-pm.json";
@@ -62,6 +63,36 @@ pub struct Sidecar {
     /// configured provider — drained on reconnect.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_pushes: Vec<CommitId>,
+
+    /// The working state as it was before the last merge attempt.
+    ///
+    /// Set whenever a push has to reconcile with a remote that moved, and
+    /// cleared once the resulting commit lands. While it is set, the user's
+    /// own version of the project is recoverable in full regardless of what
+    /// the merge did. See [`Stash`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stash: Option<Stash>,
+}
+
+/// A snapshot of local work taken before a merge.
+///
+/// Merging someone else's changes into a project is the one operation here
+/// that can leave a person worse off than before they started. The snapshot
+/// costs one content-addressed blob — usually already stored, since the same
+/// bytes are about to be pushed — and turns every merge into something that
+/// can be walked back.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Stash {
+    /// CAS hash of the local snapshot as it stood before merging.
+    pub snapshot: ContentHash,
+    /// Unix epoch seconds the stash was taken.
+    pub created_at: i64,
+    /// Commit the local work was based on, for context when restoring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<CommitId>,
+    /// Why the stash was taken, shown when offering to restore it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

@@ -258,6 +258,7 @@ async fn m2_commit_roundtrip_over_http() {
         description: "chorus rough draft".into(),
         auru_version: "0.1.0".into(),
         format_version: 8,
+        metadata: None,
     };
     commit.id = compute_commit_id(&commit).unwrap();
 
@@ -338,6 +339,7 @@ async fn m2_advance_head_conflict() {
             description: String::new(),
             auru_version: "0".into(),
             format_version: 8,
+            metadata: None,
         };
         c.id = compute_commit_id(&c).unwrap();
         c
@@ -389,6 +391,7 @@ async fn m2_two_commit_history() {
             description: String::new(),
             auru_version: "0".into(),
             format_version: 8,
+            metadata: None,
         };
         c.id = compute_commit_id(&c).unwrap();
         c

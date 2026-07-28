@@ -13,6 +13,15 @@ use crate::error::{Error, Result};
 use crate::hash::ContentHash;
 use crate::provider::{Capabilities, HeadAdvance, Member, PermSet, ProjectProvider, UserId};
 
+/// Gzip `bytes`, or `None` if the encoder failed — in which case the caller
+/// sends the body uncompressed rather than failing the upload.
+fn gzip(bytes: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).ok()?;
+    encoder.finish().ok()
+}
+
 // ── Wire types ───────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -202,13 +211,36 @@ impl ProjectProvider for HttpProvider {
         self.caps.clone()
     }
 
+    /// Upload a blob, compressing the body when the server said it can decode it.
+    ///
+    /// Snapshots are canonical JSON and compress about sevenfold, so this is
+    /// most of the upload for a project of any size. The hash in the URL always
+    /// names the *plaintext* — compression is purely a transfer encoding, and
+    /// the server stores what it decodes.
     async fn put_blob(&self, hash: &ContentHash, bytes: &[u8]) -> Result<()> {
         let url = format!("{}/v1/blobs/{}", self.base_url, hash);
-        let resp = self
+        let mut request = self
             .client
             .put(&url)
-            .header(header::CONTENT_TYPE, "application/octet-stream")
-            .body(bytes.to_vec())
+            .header(header::CONTENT_TYPE, "application/octet-stream");
+
+        // Only when the server advertised support. Compressing regardless
+        // would corrupt blobs on any server that ignores the header.
+        match self
+            .caps
+            .compressed_uploads
+            .then(|| gzip(bytes))
+            .and_then(|compressed| compressed.filter(|body| body.len() < bytes.len()))
+        {
+            Some(compressed) => {
+                request = request
+                    .header(header::CONTENT_ENCODING, "gzip")
+                    .body(compressed);
+            }
+            None => request = request.body(bytes.to_vec()),
+        }
+
+        let resp = request
             .send()
             .await
             .map_err(|e| Error::Network(e.to_string()))?;

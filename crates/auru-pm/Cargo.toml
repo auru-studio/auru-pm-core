@@ -27,6 +27,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 [dev-dependencies]
 axum = "0.7"
 tempfile = "3"
+tower-http = { version = "0.6", features = ["decompression-gzip"] }
 tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "net"] }
 
 [lints]

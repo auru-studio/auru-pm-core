@@ -13,10 +13,12 @@
 //! to the same blob.
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::ableton::{BundlePolicy, PlannedAsset};
 use crate::hash::ContentHash;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,11 +30,85 @@ pub struct SampleManifest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SampleEntry {
-    /// Project-relative logical path of the sample, eg `samples/kick.wav`.
-    /// Used for display and for path-collision detection on download.
+    /// Logical path of the asset.
+    ///
+    /// Native Auru snapshots record the raw `file_path` from the clip, which
+    /// is absolute. Ableton project-folder commits record a path relative to
+    /// the project folder with `/` separators, eg
+    /// `Samples/Processed/loop.wav` — that is what gets written back out on
+    /// restore. Used for display and for path-collision detection on download.
     pub path: String,
     pub hash: ContentHash,
     pub size: u64,
+    /// What the asset is, for display and for deciding what to write on
+    /// restore. Absent — and omitted from the encoding — for plain samples,
+    /// which keeps native manifests byte-identical to those written before
+    /// project folders existed.
+    #[serde(default, skip_serializing_if = "AssetKind::is_default")]
+    pub kind: AssetKind,
+    /// Where the asset was gathered from, when it lived outside the project
+    /// folder. This is the exact path string the Live Set referenced, and it
+    /// is the key that [`crate::ableton::rewrite`] matches on to repoint the
+    /// `FileRef` at the vendored copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
+/// What an entry in the asset manifest is.
+///
+/// [`Self::Sample`] is the default and is skipped when encoding, so a manifest
+/// containing only samples — every manifest written before project-folder
+/// support — encodes to exactly the same bytes as before, and therefore hashes
+/// the same and yields the same commit id.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AssetKind {
+    /// Audio the project plays.
+    #[default]
+    Sample,
+    /// A `.asd` warp/transient analysis sidecar. Live can regenerate these,
+    /// but doing so discards hand-edited warp markers.
+    Analysis,
+    /// A device preset or rack — `.adv`, `.adg`, `.alp`.
+    Preset,
+    /// One of Live's own `Backup/` autosaves.
+    Backup,
+    /// `Ableton Project Info/` contents and platform folder metadata.
+    ProjectInfo,
+    /// Anything else found inside the project folder.
+    Other,
+}
+
+impl AssetKind {
+    /// Whether this is the variant omitted from the canonical encoding.
+    pub const fn is_default(&self) -> bool {
+        matches!(self, Self::Sample)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Sample => "sample",
+            Self::Analysis => "analysis",
+            Self::Preset => "preset",
+            Self::Backup => "backup",
+            Self::ProjectInfo => "project info",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl SampleEntry {
+    /// A plain sample entry — the shape every entry had before project
+    /// folders introduced [`Self::kind`] and [`Self::origin`].
+    pub fn new(path: impl Into<String>, hash: ContentHash, size: u64) -> Self {
+        Self {
+            path: path.into(),
+            hash,
+            size,
+            kind: AssetKind::Sample,
+            origin: None,
+        }
+    }
 }
 
 impl SampleManifest {
@@ -66,16 +142,51 @@ impl SampleManifest {
     }
 }
 
+/// Work out every file a commit of `snapshot` should store.
+///
+/// Dispatches on what the project is:
+///
+/// - **Native Auru** — the audio its clips reference, exactly as before
+///   project folders existed. `project_root` is not consulted.
+/// - **Ableton Live Set with a project folder** — the folder's contents plus
+///   everything referenced from outside it, gathered in.
+/// - **Anything else** — nothing. A loose `.als` has no folder to walk, and
+///   DAWproject already embeds its media inside the snapshot.
+pub fn plan_assets(
+    snapshot: &Value,
+    project_root: Option<&Path>,
+    policy: &BundlePolicy,
+) -> Vec<PlannedAsset> {
+    if crate::ableton::is_ableton_snapshot(snapshot) {
+        return match project_root {
+            Some(root) => crate::ableton::plan_assets_from_value(snapshot, root, policy).assets,
+            None => Vec::new(),
+        };
+    }
+    // Native: the manifest path stays the raw clip path, which keeps existing
+    // commits and their ids byte-identical.
+    sample_paths_in_snapshot(snapshot)
+        .into_iter()
+        .map(|path| PlannedAsset {
+            source: PathBuf::from(&path),
+            bundle_path: path,
+            kind: AssetKind::Sample,
+            origin: None,
+        })
+        .collect()
+}
+
 /// Collect the distinct sample file paths referenced by a native Auru project
 /// snapshot.
 ///
 /// Walks `channels[].clips[]` and picks out the `file_path` of every audio clip
 /// (`data.Audio.file_path`), mirroring how [`crate::diff`] navigates the
-/// snapshot. External formats preserve embedded resources inside their
-/// normalized snapshot and therefore intentionally produce an empty native
-/// sample manifest here. Empty paths are ignored. Returned sorted +
-/// de-duplicated so the resulting manifest is deterministic regardless of clip
-/// ordering.
+/// snapshot. Empty paths are ignored. Returned sorted + de-duplicated so the
+/// resulting manifest is deterministic regardless of clip ordering.
+///
+/// External formats have no `channels` array and yield nothing here — their
+/// assets are found by [`plan_assets`] instead, which understands project
+/// folders.
 pub fn sample_paths_in_snapshot(snapshot: &Value) -> BTreeSet<String> {
     let mut paths = BTreeSet::new();
     let Some(channels) = snapshot.get("channels").and_then(Value::as_array) else {
@@ -110,7 +221,116 @@ mod tests {
             path: path.into(),
             hash: ContentHash::of(bytes),
             size: bytes.len() as u64,
+            kind: AssetKind::default(),
+            origin: None,
         }
+    }
+
+    #[test]
+    fn a_sample_only_manifest_should_encode_exactly_as_before() {
+        // `kind` and `origin` were added for project folders. Both are skipped
+        // when they hold their pre-existing meaning, so a manifest of plain
+        // samples must encode to the same bytes it always did — otherwise
+        // every existing commit id would change and history would fork.
+        let mut manifest = SampleManifest::new();
+        manifest.insert(entry("samples/kick.wav", b"kick"));
+
+        let encoded =
+            String::from_utf8(manifest.canonical_encoding().expect("encode")).expect("valid utf-8");
+        assert_eq!(
+            encoded,
+            format!(
+                r#"{{"entries":[{{"hash":"{}","path":"samples/kick.wav","size":4}}]}}"#,
+                ContentHash::of(b"kick")
+            ),
+            "no `kind` or `origin` key may appear for a plain sample"
+        );
+    }
+
+    #[test]
+    fn project_folder_fields_should_appear_only_when_meaningful() {
+        let mut manifest = SampleManifest::new();
+        manifest.insert(SampleEntry {
+            path: "Samples/Imported/break.wav".into(),
+            hash: ContentHash::of(b"break"),
+            size: 5,
+            kind: AssetKind::Preset,
+            origin: Some("E:/lib/break.wav".into()),
+        });
+
+        let encoded =
+            String::from_utf8(manifest.canonical_encoding().expect("encode")).expect("valid utf-8");
+        assert!(encoded.contains(r#""kind":"preset""#), "{encoded}");
+        assert!(
+            encoded.contains(r#""origin":"E:/lib/break.wav""#),
+            "{encoded}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_written_before_project_folders_should_still_decode() {
+        // Entries in already-committed manifests carry neither new field.
+        // Keys are in canonical (alphabetical) order because that is how
+        // `canonical_encoding` wrote them.
+        let legacy = r#"{"entries":[{"hash":"$HASH","path":"samples/kick.wav","size":4}]}"#
+            .replace("$HASH", &ContentHash::of(b"kick").to_string());
+        let manifest: SampleManifest = serde_json::from_str(&legacy).expect("decode");
+
+        assert_eq!(manifest.entries[0].kind, AssetKind::Sample);
+        assert_eq!(manifest.entries[0].origin, None);
+        // And re-encoding it reproduces the original bytes.
+        assert_eq!(
+            manifest.canonical_encoding().expect("encode"),
+            legacy.as_bytes()
+        );
+    }
+
+    #[test]
+    fn plan_assets_should_reproduce_native_sample_paths() {
+        // The native path must be unaffected by project-folder support: same
+        // paths, same order, and the manifest key stays the raw clip path.
+        let snapshot = serde_json::json!({
+            "channels": [{ "clips": [
+                { "data": { "Audio": { "file_path": "/samples/snare.wav" } } },
+                { "data": { "Audio": { "file_path": "/samples/kick.wav" } } },
+            ]}]
+        });
+        let planned = plan_assets(&snapshot, None, &BundlePolicy::default());
+
+        let paths: Vec<&str> = planned
+            .iter()
+            .map(|asset| asset.bundle_path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["/samples/kick.wav", "/samples/snare.wav"]);
+        assert!(planned.iter().all(|asset| asset.kind == AssetKind::Sample));
+        assert!(planned.iter().all(|asset| asset.origin.is_none()));
+        assert!(
+            planned
+                .iter()
+                .all(|asset| asset.source.as_os_str() == asset.bundle_path.as_str())
+        );
+    }
+
+    #[test]
+    fn plan_assets_should_stay_empty_for_dawproject() {
+        // DAWproject embeds its media inside the snapshot already.
+        let snapshot = serde_json::json!({
+            "auru_pm_snapshot": 1,
+            "format": "dawproject",
+            "project": { "root": { "tag": "Project" } }
+        });
+        assert!(plan_assets(&snapshot, None, &BundlePolicy::default()).is_empty());
+    }
+
+    #[test]
+    fn plan_assets_should_stay_empty_for_a_live_set_with_no_folder() {
+        // A loose `.als` keeps behaving exactly as it did before.
+        let snapshot = serde_json::json!({
+            "auru_pm_snapshot": 1,
+            "format": "ableton-live-set",
+            "project": { "root": { "tag": "Ableton" } }
+        });
+        assert!(plan_assets(&snapshot, None, &BundlePolicy::default()).is_empty());
     }
 
     #[test]

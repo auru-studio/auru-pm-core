@@ -184,6 +184,36 @@ impl ProjectSnapshot {
         self.canonical_bytes
     }
 
+    /// Deserialize the external-format wrapper backing this snapshot.
+    ///
+    /// `Ok(None)` for native Auru, which stores its JSON unwrapped. Readers in
+    /// [`crate::ableton`] go through here rather than re-parsing the canonical
+    /// bytes themselves.
+    pub(crate) fn portable(&self) -> Result<Option<PortableSnapshot>> {
+        if self.format == ProjectFormat::Auru {
+            return Ok(None);
+        }
+        let snapshot: PortableSnapshot = serde_json::from_slice(&self.canonical_bytes)?;
+        snapshot.validate()?;
+        Ok(Some(snapshot))
+    }
+
+    /// Rebuild a snapshot from a wrapper whose tree has been edited.
+    ///
+    /// The one supported reason to edit a normalized tree is repointing an
+    /// Ableton `FileRef` at a gathered copy of its file on restore; see
+    /// [`crate::ableton::rewrite`]. Re-canonicalizing here means the result is
+    /// indistinguishable from a snapshot of the rewritten project.
+    pub(crate) fn from_portable(portable: PortableSnapshot) -> Result<Self> {
+        portable.validate()?;
+        let format = portable.format;
+        let value = serde_json::to_value(portable)?;
+        Ok(Self {
+            format,
+            canonical_bytes: canonical_json(value)?,
+        })
+    }
+
     /// Reconstruct source project bytes from this canonical snapshot.
     pub fn restore_bytes(&self) -> Result<Vec<u8>> {
         match self.format {
@@ -230,19 +260,24 @@ pub fn restore_project(snapshot_bytes: &[u8], path: &Path) -> Result<ProjectForm
     Ok(snapshot.format())
 }
 
+/// Wrapper the external formats normalize into.
+///
+/// Visible to the crate so the format-specific readers in [`crate::ableton`]
+/// can walk — and, on restore, rewrite — the XML tree without re-deriving it
+/// from raw JSON.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct PortableSnapshot {
-    auru_pm_snapshot: u32,
-    format: ProjectFormat,
-    project: XmlDocument,
+pub(crate) struct PortableSnapshot {
+    pub(crate) auru_pm_snapshot: u32,
+    pub(crate) format: ProjectFormat,
+    pub(crate) project: XmlDocument,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    metadata: Option<XmlDocument>,
+    pub(crate) metadata: Option<XmlDocument>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    resources: Vec<ArchiveResource>,
+    pub(crate) resources: Vec<ArchiveResource>,
 }
 
 impl PortableSnapshot {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.auru_pm_snapshot != SNAPSHOT_SCHEMA_VERSION {
             return Err(Error::ProjectFormat(format!(
                 "unsupported external snapshot schema {}; expected {}",
@@ -273,19 +308,19 @@ impl PortableSnapshot {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct ArchiveResource {
+pub(crate) struct ArchiveResource {
     /// Archive path doubles as the stable array identity for three-way merge.
-    id: String,
-    data: String,
+    pub(crate) id: String,
+    pub(crate) data: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct XmlDocument {
-    root: XmlElement,
+pub(crate) struct XmlDocument {
+    pub(crate) root: XmlElement,
 }
 
 impl XmlDocument {
-    fn parse(xml: &[u8], label: &str) -> Result<Self> {
+    pub(crate) fn parse(xml: &[u8], label: &str) -> Result<Self> {
         if xml.len() as u64 > MAX_XML_BYTES {
             return Err(Error::ProjectFormat(format!(
                 "{label} exceeds the {} MiB XML limit",
@@ -377,17 +412,17 @@ impl XmlDocument {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct XmlElement {
-    tag: String,
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct XmlElement {
+    pub(crate) tag: String,
     /// Duplicated from an `id`/`Id` attribute to give JSON array merge a
     /// stable identity. XML reconstruction uses the original attribute map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    id: Option<String>,
+    pub(crate) id: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    attributes: BTreeMap<String, String>,
+    pub(crate) attributes: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    children: Vec<XmlContent>,
+    pub(crate) children: Vec<XmlContent>,
 }
 
 impl XmlElement {
@@ -494,13 +529,116 @@ impl XmlElement {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
-enum XmlContent {
+pub(crate) enum XmlContent {
     Element(XmlElement),
     Text { text: String },
     Cdata { cdata: String },
     Comment { comment: String },
+}
+
+/// Navigation over the normalized tree.
+///
+/// Ableton encodes nearly every scalar as `<Tag Value="…" />`, so
+/// [`Self::child_value`] covers most reads. Tag alternatives matter because
+/// Live 12 renamed `MasterTrack` to `MainTrack` — see [`Self::child_any`].
+impl XmlElement {
+    /// Value of `key`, matched case-sensitively.
+    pub(crate) fn attribute(&self, key: &str) -> Option<&str> {
+        self.attributes.get(key).map(String::as_str)
+    }
+
+    /// Direct child elements in document order, skipping text and comments.
+    pub(crate) fn child_elements(&self) -> impl Iterator<Item = &Self> {
+        self.children.iter().filter_map(|child| match child {
+            XmlContent::Element(element) => Some(element),
+            _ => None,
+        })
+    }
+
+    /// First direct child element named `tag`.
+    pub(crate) fn child(&self, tag: &str) -> Option<&Self> {
+        self.child_elements().find(|element| element.tag == tag)
+    }
+
+    /// First direct child element matching any of `tags`, preferring earlier
+    /// entries. Use for tags Ableton has renamed across Live versions.
+    pub(crate) fn child_any(&self, tags: &[&str]) -> Option<&Self> {
+        tags.iter().find_map(|tag| self.child(tag))
+    }
+
+    /// The `Value` attribute of the direct child named `tag` — Ableton's
+    /// near-universal scalar shape.
+    pub(crate) fn child_value(&self, tag: &str) -> Option<&str> {
+        self.child(tag)?.attribute("Value")
+    }
+
+    /// Resolve a `/`-separated chain of direct child tags.
+    pub(crate) fn resolve(&self, path: &str) -> Option<&Self> {
+        path.split('/')
+            .try_fold(self, |element, tag| element.child(tag))
+    }
+
+    /// Direct child elements in document order, mutably.
+    pub(crate) fn child_elements_mut(&mut self) -> impl Iterator<Item = &mut Self> {
+        self.children.iter_mut().filter_map(|child| match child {
+            XmlContent::Element(element) => Some(element),
+            _ => None,
+        })
+    }
+
+    /// Set the `Value` attribute of the direct child named `tag`, adding the
+    /// child if the set does not already have one.
+    ///
+    /// Writing through this rather than by hand keeps the duplicated `id`
+    /// field consistent with the attribute map — see [`Self::from_start`] for
+    /// why that duplication exists.
+    pub(crate) fn set_child_value(&mut self, tag: &str, value: impl Into<String>) {
+        let value = value.into();
+        if let Some(child) = self.children.iter_mut().find_map(|child| match child {
+            XmlContent::Element(element) if element.tag == tag => Some(element),
+            _ => None,
+        }) {
+            child.attributes.insert("Value".to_owned(), value);
+            return;
+        }
+        let mut created = Self {
+            tag: tag.to_owned(),
+            id: None,
+            attributes: BTreeMap::new(),
+            children: Vec::new(),
+        };
+        created.attributes.insert("Value".to_owned(), value);
+        self.children.push(XmlContent::Element(created));
+    }
+
+    /// Depth-first traversal including `self`.
+    pub(crate) fn descendants(&self) -> Descendants<'_> {
+        Descendants { stack: vec![self] }
+    }
+}
+
+/// Depth-first iterator produced by [`XmlElement::descendants`].
+pub(crate) struct Descendants<'a> {
+    stack: Vec<&'a XmlElement>,
+}
+
+impl<'a> Iterator for Descendants<'a> {
+    type Item = &'a XmlElement;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let element = self.stack.pop()?;
+        // Push in reverse so siblings pop back in document order.
+        self.stack.extend(
+            element
+                .child_elements()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev(),
+        );
+        Some(element)
+    }
 }
 
 fn parse_auru(source: &[u8]) -> Result<Value> {

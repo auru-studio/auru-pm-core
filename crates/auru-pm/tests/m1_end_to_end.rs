@@ -63,6 +63,7 @@ async fn m1_first_take_roundtrips() {
         description: "rough draft of the chorus".into(),
         auru_version: "0.1.0".into(),
         format_version: 8,
+        metadata: None,
     };
     commit.id = compute_commit_id(&commit).unwrap();
     provider.put_commit(&commit).await.unwrap();
@@ -151,6 +152,7 @@ async fn m1_second_commit_chains_to_first() {
             description: String::new(),
             auru_version: "0.1.0".into(),
             format_version: 8,
+            metadata: None,
         };
         c.id = compute_commit_id(&c).unwrap();
         c
@@ -182,16 +184,16 @@ async fn m1_sample_manifest_blob_roundtrips() {
     let provider = FilesystemProvider::open(dir.path()).unwrap();
 
     let mut samples = SampleManifest::new();
-    samples.insert(SampleEntry {
-        path: "samples/kick.wav".into(),
-        hash: ContentHash::of(b"kick"),
-        size: 4,
-    });
-    samples.insert(SampleEntry {
-        path: "samples/snare.wav".into(),
-        hash: ContentHash::of(b"snare"),
-        size: 5,
-    });
+    samples.insert(SampleEntry::new(
+        "samples/kick.wav",
+        ContentHash::of(b"kick"),
+        4,
+    ));
+    samples.insert(SampleEntry::new(
+        "samples/snare.wav",
+        ContentHash::of(b"snare"),
+        5,
+    ));
 
     let bytes = samples.canonical_encoding().unwrap();
     let hash = samples.content_hash().unwrap();

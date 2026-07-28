@@ -6,6 +6,7 @@
 //! for the supported project formats. See the `auru-pm-v1` HTTP contract in
 //! [`spec.md`](./spec.md).
 
+pub mod ableton;
 pub mod canonical;
 pub mod cas;
 pub mod commit;
@@ -17,6 +18,7 @@ pub mod http;
 pub mod merge;
 pub mod oauth;
 pub mod project_format;
+pub mod project_info;
 pub mod provider;
 pub mod registry;
 pub mod sample_manifest;
@@ -24,6 +26,11 @@ pub mod sidecar;
 pub mod sync;
 pub mod token_store;
 
+pub use ableton::{
+    AbletonBundle, AbletonMetadata, AssetPlan, AssetRef, AssetSummary, BundlePolicy,
+    IntegrityProblem, KeyInfo, PathAlias, PlannedAsset, PluginFormat, PluginId, PluginRef,
+    RefClass, TimeSignature, TrackCounts, TrackKind, TrackSummary,
+};
 pub use auru_pm_protocol::WIRE_VERSION;
 pub use canonical::{canonical_encoding, compute_commit_id};
 pub use cas::{Cas, GcReport, collect_reachable};
@@ -42,6 +49,7 @@ pub use merge::{
 };
 pub use oauth::{DeviceCodeResponse, OAuthProgress, start_device_flow};
 pub use project_format::{ProjectFormat, ProjectSnapshot, restore_project, snapshot_project};
+pub use project_info::{PROJECT_INFO_SCHEMA, ProjectInfo};
 pub use provider::{
     AuthMethod, Capabilities, HeadAdvance, Member, PermSet, ProjectProvider, UserId,
 };
@@ -49,8 +57,8 @@ pub use registry::{
     AURU_REGISTRY_URL, RegistryEntry, get_or_fetch as fetch_registry, resolve_endpoint,
 };
 pub use sample_manifest::{SampleEntry, SampleManifest};
-pub use sidecar::{RemoteState, SIDECAR_SUFFIX, Sidecar, sidecar_path_for};
+pub use sidecar::{RemoteState, SIDECAR_SUFFIX, Sidecar, Stash, sidecar_path_for};
 pub use sync::{
-    MirrorResult, PushOutcome, drain_pending_pushes, push_with_conflict_resolutions,
-    push_with_freshness_check,
+    MirrorResult, PushOutcome, discard_stash, drain_pending_pushes, fetch_project_info,
+    push_with_conflict_resolutions, push_with_freshness_check, stashed_snapshot,
 };

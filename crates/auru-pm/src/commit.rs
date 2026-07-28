@@ -65,6 +65,17 @@ pub struct Commit {
     /// history UI uses this to know whether a snapshot needs migration before
     /// restore.
     pub format_version: u32,
+    /// Blob holding this commit's [`crate::ProjectInfo`] — a few kilobytes
+    /// describing the project's tempo, key, tracks and plugins.
+    ///
+    /// Lets a client show what a version *is* without fetching the snapshot,
+    /// which for a real Live Set is around 7 MB. Absent for formats whose
+    /// detail this crate does not read, and for commits written before
+    /// summaries existed; a reader that finds it missing falls back to the
+    /// snapshot. Omitted from the encoding when absent, so those older commits
+    /// keep the ids they were created with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ContentHash>,
 }
 
 /// Trimmed commit row used by the flat history UI.

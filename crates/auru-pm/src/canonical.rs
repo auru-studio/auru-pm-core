@@ -79,6 +79,7 @@ mod tests {
             description: String::new(),
             auru_version: "0.1.0".into(),
             format_version: 8,
+            metadata: None,
         }
     }
 

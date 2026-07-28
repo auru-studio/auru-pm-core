@@ -7,13 +7,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+use crate::ableton::BundlePolicy;
+use crate::ableton::validate::IntegrityProblem;
 use crate::canonical::compute_commit_id;
 use crate::commit::{AuthorIdentity, Commit, CommitId, TreeRef};
 use crate::hash::ContentHash;
 use crate::merge::{ConflictResolution, ConflictedField, MergeOutcome, merge3, resolve_conflicts};
+use crate::project_info::ProjectInfo;
 use crate::provider::{HeadAdvance, ProjectProvider};
-use crate::sample_manifest::{SampleEntry, SampleManifest, sample_paths_in_snapshot};
-use crate::sidecar::Sidecar;
+use crate::sample_manifest::{SampleEntry, SampleManifest, plan_assets};
+use crate::sidecar::{Sidecar, Stash};
 
 /// Per-mirror push result.
 pub struct MirrorResult {
@@ -37,6 +40,100 @@ pub enum PushOutcome {
         base: Value,
         conflicts: Vec<ConflictedField>,
     },
+    /// The merge produced no field conflicts, but the result is not a project
+    /// we are willing to hand back.
+    ///
+    /// This is the case a format-agnostic merge cannot see: both sides made
+    /// edits that are individually fine and jointly incoherent — most often
+    /// two people allocating the same modulation identity from Live's counter.
+    /// Nothing has been committed. The user's own work is safe in
+    /// [`crate::sidecar::Stash`] and reachable via [`stashed_snapshot`].
+    NeedsReview {
+        merged: Value,
+        problems: Vec<IntegrityProblem>,
+        stash: ContentHash,
+    },
+}
+
+/// Directory relative references resolve against.
+///
+/// The sidecar lives beside the project file — `sidecar_path_for` appends
+/// `-pm.json` to the whole filename — so its parent is the project directory,
+/// and for an Ableton project that directory is the project folder. Deriving
+/// it here rather than taking it as an argument keeps the push API unchanged.
+fn project_root_for(sidecar_path: &Path) -> Option<&Path> {
+    sidecar_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+}
+
+/// Store the pre-merge working state and record it in the sidecar.
+///
+/// The blob is very often already in the CAS — these are the same bytes the
+/// push is about to store — so this usually costs a hash and a small sidecar
+/// write. Failing to stash is not fatal to the push, but it is reported,
+/// because proceeding without a way back is worth knowing about.
+async fn stash_snapshot(
+    primary: &dyn ProjectProvider,
+    sidecar_path: &Path,
+    snapshot_bytes: &[u8],
+    base: Option<CommitId>,
+    reason: &str,
+) -> Result<ContentHash, String> {
+    let hash = ContentHash::of(snapshot_bytes);
+    primary
+        .put_blob(&hash, snapshot_bytes)
+        .await
+        .map_err(|e| format!("stash local snapshot: {e}"))?;
+    Sidecar::modify(sidecar_path, |sidecar| {
+        sidecar.stash = Some(Stash {
+            snapshot: hash,
+            created_at: now_epoch_secs(),
+            base,
+            reason: reason.to_owned(),
+        });
+    })
+    .map_err(|e| format!("record stash in sidecar: {e}"))?;
+    Ok(hash)
+}
+
+/// Fetch the snapshot held in the sidecar's stash, if there is one.
+///
+/// Lets a caller offer "put my version back" after a merge the user does not
+/// want to keep. Returns `Ok(None)` when nothing is stashed.
+pub async fn stashed_snapshot(
+    provider: &dyn ProjectProvider,
+    sidecar_path: &Path,
+) -> Result<Option<Vec<u8>>, String> {
+    let sidecar = Sidecar::load(sidecar_path).map_err(|e| format!("load sidecar: {e}"))?;
+    let Some(stash) = sidecar.stash else {
+        return Ok(None);
+    };
+    provider
+        .get_blob(&stash.snapshot)
+        .await
+        .map(Some)
+        .map_err(|e| format!("fetch stashed snapshot: {e}"))
+}
+
+/// Forget the stashed pre-merge state.
+///
+/// For when a person has looked at a merge and decided to keep it. A landed
+/// commit clears the stash on its own; this is for discarding one explicitly.
+/// The blob itself stays in the CAS until garbage collection runs.
+pub fn discard_stash(sidecar_path: &Path) -> Result<(), String> {
+    Sidecar::modify(sidecar_path, |sidecar| sidecar.stash = None)
+        .map(|_| ())
+        .map_err(|e| format!("clear stash: {e}"))
+}
+
+/// Format-specific integrity problems in a merged snapshot.
+///
+/// Only Ableton Live Sets are checked today — they are the format whose
+/// internal identity allocation a structural merge can silently corrupt. Every
+/// other format returns empty, so nothing else changes behaviour.
+fn integrity_problems(merged: &Value) -> Vec<IntegrityProblem> {
+    crate::ableton::validate_snapshot_value(merged)
 }
 
 fn now_epoch_secs() -> i64 {
@@ -46,30 +143,49 @@ fn now_epoch_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Read every sample file referenced by `snapshot` from disk, store its bytes
-/// in the CAS, and assemble the [`SampleManifest`] for the commit.
+/// Read every asset the project depends on from disk, store the bytes in the
+/// CAS, and assemble the [`SampleManifest`] for the commit.
 ///
-/// Best-effort on missing files: a sample whose path can't be read is logged
-/// and skipped rather than failing the whole commit. This keeps commits
-/// working when a project references a sample that has since moved, and when a
-/// 3-way merge pulls in a remote clip whose sample isn't on local disk (its
-/// blob already lives in the CAS from the remote's own push).
+/// What counts as an asset depends on the project:
 ///
-/// Returns the manifest plus the `(hash, bytes)` of every sample actually
+/// - Native Auru snapshots contribute the audio referenced by their clips.
+/// - An Ableton Live Set inside a project folder contributes the whole folder
+///   *plus* every file it references from outside — the sample library loop,
+///   the User Library rack — gathered in so the commit restores to a project
+///   that actually opens elsewhere. See [`crate::ableton::assets`].
+/// - A loose `.als` with no project folder, and DAWproject, contribute
+///   nothing: the first has no folder to walk, the second embeds its media in
+///   the snapshot already.
+///
+/// `project_root` is where relative references resolve from. It is derived
+/// from the sidecar's location, which sits beside the project file.
+///
+/// Best-effort on missing files: an asset that can't be read is logged and
+/// skipped rather than failing the whole commit. This keeps commits working
+/// when a project references a sample that has since moved, and when a 3-way
+/// merge pulls in a remote clip whose sample isn't on local disk (its blob
+/// already lives in the CAS from the remote's own push).
+///
+/// Returns the manifest plus the `(hash, bytes)` of every asset actually
 /// stored, so the mirror fan-out can replay the same blobs without touching
 /// disk again.
 async fn build_sample_manifest(
     primary: &dyn ProjectProvider,
     snapshot: &Value,
+    project_root: Option<&Path>,
+    policy: &BundlePolicy,
 ) -> Result<(SampleManifest, Vec<(ContentHash, Vec<u8>)>), String> {
     let mut manifest = SampleManifest::new();
     let mut blobs: Vec<(ContentHash, Vec<u8>)> = Vec::new();
 
-    for path in sample_paths_in_snapshot(snapshot) {
-        let bytes = match std::fs::read(&path) {
+    for asset in plan_assets(snapshot, project_root, policy) {
+        let bytes = match std::fs::read(&asset.source) {
             Ok(bytes) => bytes,
             Err(e) => {
-                eprintln!("[pm] skipping unreadable sample '{path}': {e}");
+                eprintln!(
+                    "[pm] skipping unreadable asset '{}': {e}",
+                    asset.source.display()
+                );
                 continue;
             }
         };
@@ -77,16 +193,68 @@ async fn build_sample_manifest(
         primary
             .put_blob(&hash, &bytes)
             .await
-            .map_err(|e| format!("put sample blob '{path}': {e}"))?;
+            .map_err(|e| format!("put asset blob '{}': {e}", asset.bundle_path))?;
         manifest.insert(SampleEntry {
-            path,
+            path: asset.bundle_path,
             hash,
             size: bytes.len() as u64,
+            kind: asset.kind,
+            origin: asset.origin,
         });
         blobs.push((hash, bytes));
     }
 
     Ok((manifest, blobs))
+}
+
+/// Derive and store the commit's project summary, returning its blob hash.
+///
+/// `Ok(None)` when the project has no summary to give. A failure to *derive*
+/// one is never fatal — a project we cannot fully read is still worth backing
+/// up, and the client falls back to the snapshot. A failure to *store* one is
+/// reported, because it would leave the commit pointing at a blob that is not
+/// there.
+async fn store_project_info(
+    primary: &dyn ProjectProvider,
+    snapshot_bytes: &[u8],
+) -> Result<Option<ContentHash>, String> {
+    let Ok(snapshot) = serde_json::from_slice::<Value>(snapshot_bytes) else {
+        return Ok(None);
+    };
+    let Some(info) = ProjectInfo::from_snapshot(&snapshot) else {
+        return Ok(None);
+    };
+    let Ok(bytes) = info.canonical_encoding() else {
+        return Ok(None);
+    };
+    let hash = ContentHash::of(&bytes);
+    primary
+        .put_blob(&hash, &bytes)
+        .await
+        .map_err(|e| format!("put project info blob: {e}"))?;
+    Ok(Some(hash))
+}
+
+/// Fetch the project summary a commit points at.
+///
+/// `Ok(None)` when the commit has no summary — a format this crate does not
+/// summarize, or a commit written before summaries existed — in which case the
+/// caller should read the snapshot instead. A summary written by a newer build
+/// than this one is also reported as absent rather than half-understood.
+pub async fn fetch_project_info(
+    provider: &dyn ProjectProvider,
+    commit: &Commit,
+) -> Result<Option<ProjectInfo>, String> {
+    let Some(hash) = commit.metadata else {
+        return Ok(None);
+    };
+    let bytes = provider
+        .get_blob(&hash)
+        .await
+        .map_err(|e| format!("fetch project info: {e}"))?;
+    let info: ProjectInfo =
+        serde_json::from_slice(&bytes).map_err(|e| format!("parse project info: {e}"))?;
+    Ok(info.is_readable().then_some(info))
 }
 
 /// Build a Commit, compute its id, push blobs + commit to `provider`, and
@@ -129,6 +297,12 @@ async fn write_commit_to_primary(
         samples: samples_hash,
     };
 
+    // Summary blob: what this version *is*, small enough for a client to fetch
+    // per project instead of pulling a multi-megabyte snapshot to show a
+    // tempo. Absent for formats whose detail this crate does not read, which
+    // keeps their commits byte-identical to before summaries existed.
+    let metadata = store_project_info(primary, snapshot_bytes).await?;
+
     // Placeholder id so we can call compute_commit_id.
     let placeholder_id = CommitId(crate::hash::ContentHash::ZERO);
     let mut commit = Commit {
@@ -141,6 +315,7 @@ async fn write_commit_to_primary(
         description: description.to_owned(),
         auru_version: env!("CARGO_PKG_VERSION").to_owned(),
         format_version: snapshot_format_version(snapshot_bytes),
+        metadata,
     };
 
     let real_id = compute_commit_id(&commit).map_err(|e| format!("compute commit id: {e}"))?;
@@ -316,6 +491,19 @@ async fn push_with_optional_resolutions(
             Some(local_id) => {
                 let remote_id = remote_head.ok_or("remote HEAD is None but differs from local")?;
 
+                // The remote moved, so local work is about to be reconciled
+                // with someone else's. Put the pre-merge state somewhere
+                // recoverable first — this is the only operation here that can
+                // leave a person worse off than before they started.
+                stash_snapshot(
+                    primary,
+                    sidecar_path,
+                    snapshot_bytes,
+                    local_head,
+                    "before merging with the latest version",
+                )
+                .await?;
+
                 // Fetch ancestor (our last known common point).
                 let ancestor_commit = primary
                     .get_commit(&local_id)
@@ -358,12 +546,35 @@ async fn push_with_optional_resolutions(
                             .map(|(_, resolution)| resolution.choice)
                             .collect::<Vec<_>>();
                         let merged = resolve_conflicts(base, &conflicts, &choices)?;
+                        // Resolving the fields a person was asked about can
+                        // still leave the set incoherent overall.
+                        let problems = integrity_problems(&merged);
+                        if !problems.is_empty() {
+                            let stash = ContentHash::of(snapshot_bytes);
+                            return Ok(PushOutcome::NeedsReview {
+                                merged,
+                                problems,
+                                stash,
+                            });
+                        }
                         let merged_bytes = serde_json::to_vec(&merged)
                             .map_err(|error| format!("serialize resolved snapshot: {error}"))?;
                         let parents = vec![local_id, remote_id];
                         (merged_bytes, parents, true, Some(remote_id))
                     }
                     MergeOutcome::Clean { merged } => {
+                        // "No field conflicts" is not the same as "a project
+                        // worth handing back". Check the merged result before
+                        // calling it clean.
+                        let problems = integrity_problems(&merged);
+                        if !problems.is_empty() {
+                            let stash = ContentHash::of(snapshot_bytes);
+                            return Ok(PushOutcome::NeedsReview {
+                                merged,
+                                problems,
+                                stash,
+                            });
+                        }
                         let merged_bytes = serde_json::to_vec(&merged)
                             .map_err(|e| format!("serialize merged snapshot: {e}"))?;
                         // Merge commit has two parents: local then remote.
@@ -375,11 +586,17 @@ async fn push_with_optional_resolutions(
         }
     };
 
-    // Resolve the sample set from the final snapshot, store each sample's
-    // bytes in the CAS, and build the manifest that the commit will point at.
+    // Resolve the asset set from the final snapshot, store each asset's bytes
+    // in the CAS, and build the manifest that the commit will point at.
     let final_snapshot: Value = serde_json::from_slice(&final_snapshot_bytes)
         .map_err(|e| format!("parse final snapshot: {e}"))?;
-    let (manifest, sample_blobs) = build_sample_manifest(primary, &final_snapshot).await?;
+    let (manifest, sample_blobs) = build_sample_manifest(
+        primary,
+        &final_snapshot,
+        project_root_for(sidecar_path),
+        &BundlePolicy::default(),
+    )
+    .await?;
 
     // Write to primary (may return Err on CAS race).
     let commit = write_commit_to_primary(
@@ -442,6 +659,9 @@ async fn push_with_optional_resolutions(
         if !failed_mirror_ids.is_empty() && !s.pending_pushes.contains(&commit_id) {
             s.pending_pushes.push(commit_id);
         }
+        // The work is committed and reachable through history now, so the
+        // pre-merge copy has nothing left to protect.
+        s.stash = None;
     })
     .map_err(|e| format!("save sidecar: {e}"))?;
 
@@ -646,7 +866,12 @@ mod tests {
         });
 
         let (manifest, blobs) = rt()
-            .block_on(build_sample_manifest(&provider, &snapshot))
+            .block_on(build_sample_manifest(
+                &provider,
+                &snapshot,
+                None,
+                &BundlePolicy::default(),
+            ))
             .unwrap();
 
         // Deduped to two entries, sorted by path.
@@ -688,7 +913,12 @@ mod tests {
         });
 
         let (manifest, blobs) = rt()
-            .block_on(build_sample_manifest(&provider, &snapshot))
+            .block_on(build_sample_manifest(
+                &provider,
+                &snapshot,
+                None,
+                &BundlePolicy::default(),
+            ))
             .unwrap();
 
         // The unreadable sample is dropped; the commit still gets a manifest
