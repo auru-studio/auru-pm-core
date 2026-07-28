@@ -1,0 +1,13 @@
+{
+  "primary": "local-folder://fixture-provider",
+  "local_head": "blake3:e4c1bdfe76c1b2eb8ff94702c18e449da75c67a5807c533396cc21abbe5e7875",
+  "remotes": {
+    "local-folder://fixture-provider": {
+      "remote_head": "blake3:e4c1bdfe76c1b2eb8ff94702c18e449da75c67a5807c533396cc21abbe5e7875",
+      "last_pulled": 1750000000
+    }
+  },
+  "pending_pushes": [
+    "blake3:82d51535bb4c207a05ed8b42bca6f671e2a4a9adf61c8ff5e952a151e68428f2"
+  ]
+}

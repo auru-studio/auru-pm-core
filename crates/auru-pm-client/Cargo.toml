@@ -1,0 +1,17 @@
+[package]
+name = "auru-pm-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Client API for Auru PM providers"
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+auru-pm.workspace = true
+auru-pm-protocol.workspace = true
+
+[lints]
+workspace = true
+

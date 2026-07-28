@@ -1,0 +1,33 @@
+[package]
+name = "auru-pm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Project management (versioning, sync, pluggable providers) for Auru and external DAW projects."
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+auru-pm-protocol.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+blake3.workspace = true
+flate2 = "1"
+keyring-core.workspace = true
+quick-xml = "0.37"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# tokio needed in regular deps for tokio::time::sleep in oauth.rs polling loop.
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+axum = "0.7"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "net"] }
+
+[lints]
+workspace = true

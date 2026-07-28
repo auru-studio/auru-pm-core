@@ -1,0 +1,18 @@
+{
+  "id": "blake3:e4c1bdfe76c1b2eb8ff94702c18e449da75c67a5807c533396cc21abbe5e7875",
+  "parents": [],
+  "tree": {
+    "snapshot": "blake3:a290684d05c3daaca55a68600c549796a9680eea216178b22fd0362766fd2495",
+    "samples": "blake3:8240e83ded7126c3610129e10ce2e1d00d485b9b1da3d0b98d0d5d1f7631b0c6"
+  },
+  "author": {
+    "display_name": "Oracle Author",
+    "provider_user_id": "oracle-user",
+    "provider_id": "local-folder://fixture-provider"
+  },
+  "timestamp": 1750000000,
+  "message": "Freeze migration fixture",
+  "description": "Deterministic PM state for egui-to-GPUI parity.",
+  "auru_version": "egui-oracle-v1",
+  "format_version": 8
+}

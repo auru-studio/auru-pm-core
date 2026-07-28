@@ -1,0 +1,16 @@
+[package]
+name = "auru-pm-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Wire types for the auru-pm-v1 HTTP protocol"
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+serde.workspace = true
+
+[lints]
+workspace = true
+
