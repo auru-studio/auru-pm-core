@@ -1,3 +1,4 @@
+mod automatic_backup;
 mod backend;
 mod catalog;
 mod menus;
@@ -26,6 +27,9 @@ use gpui_component::{
 };
 use gpui_platform::application;
 
+use crate::automatic_backup::{
+    AutomaticBackupReason, AutomaticBackupScheduler, ProjectObservation,
+};
 use crate::catalog::{
     AuthHint, CatalogState, ProviderAvailability, ProviderListing, fetch_first_party_catalog,
     load_provider_file, local_provider,
@@ -42,6 +46,7 @@ use crate::model::{
 };
 
 const OAUTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const AUTOMATIC_BACKUP_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const DISPLAY_FONT: &str = "New York";
 const MONO_FONT: &str = "SF Mono";
 const SIDEBAR_WIDTH: f32 = 320.0;
@@ -61,6 +66,23 @@ enum Overlay {
     None,
     ProviderPicker,
     Authenticate { provider_index: usize },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BackupStart {
+    Immediate,
+    AfterQuietPeriod { qualified_revision: SystemTime },
+}
+
+impl BackupStart {
+    fn accepts_prepared_revision(self, prepared_revision: Option<SystemTime>) -> bool {
+        match self {
+            Self::Immediate => true,
+            Self::AfterQuietPeriod { qualified_revision } => {
+                prepared_revision == Some(qualified_revision)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,6 +166,7 @@ struct ProjectManager {
     catalog_state: CatalogState,
     auth_phase: AuthPhase,
     automatic_backups: bool,
+    automatic_backup_scheduler: AutomaticBackupScheduler,
     verify_uploads: bool,
     /// How much history providers keep after successful backups.
     version_retention: VersionRetention,
@@ -306,6 +329,8 @@ impl ProjectManager {
                 provider.mark_connected();
             }
         }
+        let automatic_backup_scheduler =
+            AutomaticBackupScheduler::from_attempted_revisions(state.backup_attempts());
 
         Self {
             focus_handle,
@@ -322,6 +347,7 @@ impl ProjectManager {
             catalog_state,
             auth_phase: AuthPhase::Ready,
             automatic_backups: state.automatic_backups,
+            automatic_backup_scheduler,
             verify_uploads: state.verify_uploads,
             version_retention: VersionRetention::from_key(&state.version_retention),
             appearance: Appearance::from_key(&state.appearance),
@@ -838,7 +864,9 @@ impl ProjectManager {
         let project_name = project.name.clone();
 
         match action {
-            ProjectAction::Push => self.start_project_backup(index, window, cx),
+            ProjectAction::Push => {
+                self.start_project_backup(index, BackupStart::Immediate, window, cx);
+            }
             ProjectAction::Download => {
                 let Some(commit_id) = project.remote.as_ref().map(|remote| remote.head) else {
                     window.push_notification(
@@ -885,7 +913,13 @@ impl ProjectManager {
         }
     }
 
-    fn start_project_backup(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_project_backup(
+        &mut self,
+        index: usize,
+        start: BackupStart,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(project) = self.projects.get(index) else {
             return;
         };
@@ -927,16 +961,86 @@ impl ProjectManager {
         // than inventing a percentage.
         cx.notify();
 
-        let backup = cx.background_executor().spawn(async move {
-            backend::back_up(
-                provider,
-                project_path,
-                display_name,
-                retention_rule,
-                verify_uploads,
-            )
-        });
+        let preparation = cx
+            .background_executor()
+            .spawn(async move { backend::prepare_backup(project_path) });
         cx.spawn_in(window, async move |this, cx| {
+            let prepared = match preparation.await {
+                Ok(prepared) => prepared,
+                Err(message) => {
+                    _ = this.update_in(cx, |this, window, cx| {
+                        if let Some(project) = this
+                            .projects
+                            .iter_mut()
+                            .find(|project| project.id == project_id)
+                        {
+                            project.fail_transfer();
+                        }
+                        window.push_notification(
+                            Notification::error(message)
+                                .title(format!("Couldn't back up {project_name}")),
+                            cx,
+                        );
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let source_revision = prepared.source_revision();
+            if !start.accepts_prepared_revision(source_revision) {
+                // A save landed after the scheduler selected this project.
+                // Preparation is not publication, so leave the new revision
+                // unattempted and let it complete its own quiet period.
+                _ = this.update_in(cx, |this, _, cx| {
+                    if let Some(project) = this
+                        .projects
+                        .iter_mut()
+                        .find(|project| project.id == project_id)
+                    {
+                        project.fail_transfer();
+                    }
+                    cx.notify();
+                });
+                return;
+            }
+            let recorded = this
+                .update_in(cx, |this, window, cx| {
+                    // This durable write must finish before publication. The
+                    // prepared snapshot can include a save newer than the
+                    // revision observed when the transfer was first queued.
+                    if let Err(message) =
+                        this.record_backup_revision(&project_id, source_revision)
+                    {
+                        if let Some(project) = this
+                            .projects
+                            .iter_mut()
+                            .find(|project| project.id == project_id)
+                        {
+                            project.fail_transfer();
+                        }
+                        window.push_notification(
+                            Notification::error(message)
+                                .title(format!("Couldn't back up {project_name}")),
+                            cx,
+                        );
+                        cx.notify();
+                        return false;
+                    }
+                    true
+                })
+                .unwrap_or(false);
+            if !recorded {
+                return;
+            }
+            let backup = cx.background_executor().spawn(async move {
+                backend::back_up_prepared(
+                    provider,
+                    prepared,
+                    display_name,
+                    retention_rule,
+                    verify_uploads,
+                )
+            });
             let result = backup.await;
             _ = this.update_in(cx, |this, window, cx| {
                 let Some(project) = this
@@ -1030,6 +1134,105 @@ impl ProjectManager {
         .detach();
     }
 
+    fn record_backup_revision(
+        &mut self,
+        project_id: &str,
+        revision: Option<SystemTime>,
+    ) -> Result<(), String> {
+        self.automatic_backup_scheduler
+            .record_backup_attempt(project_id.to_owned(), revision);
+        self.state.record_backup_attempt(project_id, revision);
+        self.state
+            .save_checked()
+            .map_err(|error| format!("Record the project revision before uploading: {error}"))
+    }
+
+    /// Poll project modification times and enqueue revisions that have been
+    /// quiet for the configured automatic-backup window.
+    fn start_automatic_backup_watcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |entity, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(AUTOMATIC_BACKUP_POLL_INTERVAL)
+                    .await;
+                let keep_running = entity
+                    .update_in(cx, |manager, window, cx| {
+                        manager.poll_automatic_backups(SystemTime::now(), window, cx);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_running {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn poll_automatic_backups(
+        &mut self,
+        now: SystemTime,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.automatic_backups {
+            return;
+        }
+        for project in &mut self.projects {
+            project.refresh_local_file_state();
+        }
+
+        let observations: Vec<ProjectObservation> = self
+            .projects
+            .iter()
+            .filter_map(|project| {
+                let project_path = project.live_set.as_deref()?;
+                Some(ProjectObservation {
+                    project_id: project.id.clone(),
+                    modified_at: project.modified_at,
+                    backed_up_at: project.backed_up_at,
+                    backup_destination_ready: project.backed_up_at.is_some()
+                        && backend::primary_listing(&self.providers, project_path)
+                            .is_some_and(|provider| provider.is_connected()),
+                    // Downloaded is deliberately allowed here. A save made
+                    // during an upload can have an mtime older than the
+                    // sidecar completion time, while the scheduler's captured
+                    // revision still proves it needs another backup.
+                    backup_blocked: matches!(
+                        project.status,
+                        ProjectStatus::NotDownloaded
+                            | ProjectStatus::Syncing
+                            | ProjectStatus::OutOfSync(SyncDirection::UpstreamAhead)
+                            | ProjectStatus::Conflicted
+                    ),
+                })
+            })
+            .collect();
+        let ready = self.automatic_backup_scheduler.poll(now, observations);
+        for candidate in ready {
+            if let Some(index) = self
+                .projects
+                .iter()
+                .position(|project| project.id == candidate.project_id)
+            {
+                if candidate.reason == AutomaticBackupReason::SavedDuringPreviousBackup
+                    && self.projects[index].status == ProjectStatus::Downloaded
+                {
+                    self.projects[index].status =
+                        ProjectStatus::OutOfSync(SyncDirection::LocalAhead);
+                }
+                self.start_project_backup(
+                    index,
+                    BackupStart::AfterQuietPeriod {
+                        qualified_revision: candidate.qualified_revision,
+                    },
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
     fn back_up_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let pending: Vec<usize> = self
             .projects
@@ -1040,7 +1243,7 @@ impl ProjectManager {
             })
             .collect();
         for index in pending {
-            self.start_project_backup(index, window, cx);
+            self.start_project_backup(index, BackupStart::Immediate, window, cx);
         }
     }
 
@@ -3800,6 +4003,20 @@ mod cli_tests {
     }
 
     #[test]
+    fn an_automatic_backup_should_defer_a_revision_saved_during_preparation() {
+        let qualified_revision = UNIX_EPOCH + Duration::from_secs(300);
+        let saved_during_preparation = qualified_revision + Duration::from_secs(1);
+        let start = BackupStart::AfterQuietPeriod { qualified_revision };
+
+        assert!(start.accepts_prepared_revision(Some(qualified_revision)));
+        assert!(!start.accepts_prepared_revision(Some(saved_during_preparation)));
+        assert!(
+            BackupStart::Immediate.accepts_prepared_revision(Some(saved_during_preparation)),
+            "manual backups should still capture the latest stable save immediately"
+        );
+    }
+
+    #[test]
     fn usage_should_document_every_flag_that_exists() {
         assert!(USAGE.contains("--providers-file"));
         assert!(USAGE.contains("--help"));
@@ -4189,6 +4406,7 @@ fn main() {
                         cx.new(|cx| ProjectManager::new(options.clone(), window, cx));
                     view.update(cx, |manager, cx| {
                         manager.refresh_remote_projects(cx);
+                        manager.start_automatic_backup_watcher(window, cx);
                     });
                     cx.new(|cx| Root::new(view, window, cx))
                 },

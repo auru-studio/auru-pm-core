@@ -19,6 +19,32 @@ use serde::{Deserialize, Serialize};
 /// Bumped when the shape changes in a way older builds cannot read.
 pub const STATE_SCHEMA: u32 = 1;
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct FileRevision {
+    unix_seconds: u64,
+    nanoseconds: u32,
+}
+
+impl FileRevision {
+    fn from_system_time(time: SystemTime) -> Option<Self> {
+        let elapsed = time.duration_since(UNIX_EPOCH).ok()?;
+        Some(Self {
+            unix_seconds: elapsed.as_secs(),
+            nanoseconds: elapsed.subsec_nanos(),
+        })
+    }
+
+    fn to_system_time(self) -> Option<SystemTime> {
+        if self.nanoseconds >= 1_000_000_000 {
+            return None;
+        }
+        UNIX_EPOCH.checked_add(std::time::Duration::new(
+            self.unix_seconds,
+            self.nanoseconds,
+        ))
+    }
+}
+
 /// Everything Auru carries from one launch to the next.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -48,6 +74,12 @@ pub struct AppState {
     /// records it — a project folder is as old as the music inside it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub first_seen: BTreeMap<String, i64>,
+    /// Exact project revisions already handed to the backup coordinator.
+    ///
+    /// Persisted so a save made during an upload is still recognized after a
+    /// restart, even when the sidecar completion time is newer than that save.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    backup_attempts: BTreeMap<String, FileRevision>,
     /// Folders scanned for projects.
     pub watched_folders: Vec<PathBuf>,
     /// Folders used as backup destinations — an external drive, or a NAS share.
@@ -81,6 +113,7 @@ impl Default for AppState {
             version_retention: "everything".to_owned(),
             sort_order: "attention".to_owned(),
             first_seen: BTreeMap::new(),
+            backup_attempts: BTreeMap::new(),
             watched_folders: Vec::new(),
             local_providers: Vec::new(),
             connected_providers: Vec::new(),
@@ -91,6 +124,21 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn record_backup_attempt(&mut self, project_id: &str, modified_at: Option<SystemTime>) {
+        let Some(revision) = modified_at.and_then(FileRevision::from_system_time) else {
+            return;
+        };
+        self.backup_attempts.insert(project_id.to_owned(), revision);
+    }
+
+    pub fn backup_attempts(&self) -> impl Iterator<Item = (String, SystemTime)> + '_ {
+        self.backup_attempts
+            .iter()
+            .filter_map(|(project_id, revision)| {
+                Some((project_id.clone(), revision.to_system_time()?))
+            })
+    }
+
     /// Where the state file lives on this platform.
     ///
     /// `None` when the platform gives us nowhere to write, in which case the
@@ -146,12 +194,19 @@ impl AppState {
     /// Best-effort: a failure is reported, never fatal. A state with no origin
     /// — one built in memory — writes nowhere at all.
     pub fn save(&self) {
-        let Some(path) = self.origin.clone() else {
-            return;
-        };
-        if let Err(error) = self.save_to(&path) {
-            eprintln!("[auru-pm] couldn't save {}: {error}", path.display());
+        if let Err(error) = self.save_checked() {
+            eprintln!("[auru-pm] {error}");
         }
+    }
+
+    /// Save preferences while allowing an invariant-sensitive caller to stop
+    /// if the durable write fails.
+    pub fn save_checked(&self) -> Result<(), String> {
+        let Some(path) = self.origin.as_deref() else {
+            return Ok(());
+        };
+        self.save_to(path)
+            .map_err(|error| format!("couldn't save {}: {error}", path.display()))
     }
 
     /// Write via a temporary file and rename, so an interrupted save cannot
@@ -286,6 +341,8 @@ mod tests {
         state.watch(Path::new("/music/Ableton Projects"));
         state.add_project(Path::new("/elsewhere/One Off Project"));
         state.connect_provider("studio-nas");
+        let attempted_revision = UNIX_EPOCH + std::time::Duration::new(1_234, 567);
+        state.record_backup_attempt("project:/music/Song.dawproject", Some(attempted_revision));
         state.save_to(&path).expect("save");
 
         let loaded = AppState::load_from(&path);
@@ -299,6 +356,13 @@ mod tests {
         assert!(loaded.is_provider_connected("studio-nas"));
         assert_eq!(loaded.connected_providers, vec!["studio-nas"]);
         assert_eq!(loaded.primary_provider.as_deref(), Some("studio-nas"));
+        assert_eq!(
+            loaded.backup_attempts().collect::<Vec<_>>(),
+            vec![(
+                "project:/music/Song.dawproject".to_owned(),
+                attempted_revision
+            )]
+        );
     }
 
     #[test]

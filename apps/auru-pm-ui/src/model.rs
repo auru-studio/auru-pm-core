@@ -145,6 +145,27 @@ fn file_modified_at(path: &Path) -> Option<SystemTime> {
         .ok()
 }
 
+struct LocalFileState {
+    status: ProjectStatus,
+    modified_at: Option<SystemTime>,
+    backed_up_at: Option<SystemTime>,
+    last_activity: String,
+}
+
+fn local_file_state(project_file: &Path) -> LocalFileState {
+    let status = ProjectStatus::read_from_disk(project_file);
+    let modified_at = file_modified_at(project_file);
+    LocalFileState {
+        status,
+        modified_at,
+        backed_up_at: match status {
+            ProjectStatus::NeverBackedUp => None,
+            _ => file_modified_at(&sidecar_path_for(project_file)),
+        },
+        last_activity: describe_modified(modified_at),
+    }
+}
+
 fn provider_links_for(project_path: &Path) -> (Option<RemoteProjectRef>, BTreeMap<String, String>) {
     let Ok(sidecar) = Sidecar::load(&sidecar_path_for(project_path)) else {
         return (None, BTreeMap::new());
@@ -882,14 +903,7 @@ impl Project {
     pub fn read_from_disk(root: &Path) -> Option<Self> {
         let found = DiscoveredProject::detect(root).ok().flatten()?;
         let live_set = found.project_file().to_path_buf();
-        let status = ProjectStatus::read_from_disk(&live_set);
-        // Read once and reused for both the caption and the sort key, so the
-        // two can never disagree about when this project was last saved.
-        let modified_at = file_modified_at(&live_set);
-        let backed_up_at = match status {
-            ProjectStatus::NeverBackedUp => None,
-            _ => file_modified_at(&sidecar_path_for(&live_set)),
-        };
+        let local = local_file_state(&live_set);
         let (remote, provider_handles) = provider_links_for(&live_set);
 
         Some(Self {
@@ -910,17 +924,17 @@ impl Project {
             local_path: found.directory().display().to_string(),
             size: String::new(),
             format: found.format(),
-            status,
-            last_activity: describe_modified(modified_at),
-            safe_version: match status {
+            status: local.status,
+            last_activity: local.last_activity,
+            safe_version: match local.status {
                 ProjectStatus::NeverBackedUp => "not backed up yet".to_owned(),
                 _ => "backed up".to_owned(),
             },
             local_inventory: String::new(),
             versions: Vec::new(),
             sync_progress: 0.0,
-            modified_at,
-            backed_up_at,
+            modified_at: local.modified_at,
+            backed_up_at: local.backed_up_at,
             added_at: None,
             detail: None,
             missing_plugins: Vec::new(),
@@ -928,6 +942,31 @@ impl Project {
             remote,
             provider_handles,
         })
+    }
+
+    /// Refresh the cheap filesystem facts used by status and automatic backup.
+    ///
+    /// An upstream conflict or an active transfer carries more information
+    /// than modification times, so polling never overwrites those states.
+    pub fn refresh_local_file_state(&mut self) {
+        let Some(project_file) = self.live_set.as_deref() else {
+            return;
+        };
+        let local = local_file_state(project_file);
+        self.modified_at = local.modified_at;
+        self.last_activity = local.last_activity;
+        if matches!(
+            self.status,
+            ProjectStatus::NotDownloaded
+                | ProjectStatus::Syncing
+                | ProjectStatus::OutOfSync(SyncDirection::UpstreamAhead)
+                | ProjectStatus::Conflicted
+        ) {
+            return;
+        }
+
+        self.status = local.status;
+        self.backed_up_at = local.backed_up_at;
     }
 
     pub fn from_remote(seed: RemoteProjectSeed) -> Self {

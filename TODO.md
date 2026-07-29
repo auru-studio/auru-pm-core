@@ -45,6 +45,17 @@ described, it was read out of a real project rather than from documentation.
   asset manifest, project metadata, every referenced asset hash, and recorded
   asset sizes; a failed verification is reported as a warning without
   misreporting the already-successful upload as failed.
+- Automatic backups now poll local project modification times, wait until the
+  newest save has been quiet for five minutes, and delegate the revision to the
+  normal backup coordinator exactly once. Only projects with an existing
+  backup and their enrolled provider available are eligible, so discovering a
+  project still never uploads it without the user's first explicit backup
+  choice. The backend first prepares an immutable stable snapshot, and its
+  exact source revision is persisted before the coordinator can publish it.
+  If preparation sees a newer save than the one that qualified, publication
+  is deferred so that save receives its own full quiet window. A save made
+  during an upload likewise starts another quiet window even after a crash or
+  restart without duplicating a revision the backup included.
 - Production `DEMO` labels, routes, fake actions, and test-helper names were
   removed. The premature recovery route and custom-provider CTA were removed
   rather than claiming to work. The DAWproject oracle fixture still contains a
@@ -256,11 +267,14 @@ small synthetic regression instead.
   `POST /v1/projects/{handle}/retention`. The UI persists all three backup
   settings and reports unsupported providers or pruning failures separately
   from backup success.
-- **Automatic backups are still a preference without a scheduler.** The
-  setting now survives restarts, but nothing watches project files, waits for
-  the advertised five quiet minutes, or calls the backup coordinator. Until
-  that watcher exists, the switch must not be mistaken for automatic
-  protection.
+- **Resolved 2026-07-29:** automatic backups poll local project files in the
+  background, reset the five-minute quiet window after each new save, and call
+  the normal coordinator once per saved revision. Never-backed-up projects and
+  projects whose provider is unavailable remain manual, preserving the
+  promise that discovery alone never uploads work. Attempted revision
+  timestamps survive restarts, and the exact stable snapshot revision is
+  recorded before publication, so neither sidecar completion times nor a
+  crash between commit and UI completion can duplicate an in-flight revision.
 - **Resolved 2026-07-29:** “Verify every copy after upload” now re-reads the
   committed object graph through the selected provider and validates the
   commit, snapshot, manifest, metadata, every asset hash, and asset size. A

@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use auru_pm::{
     AuthorIdentity, CommitId, CommitSummary, ContentHash, FilesystemProvider, HistoryRange,
@@ -35,6 +36,23 @@ pub struct BackupReceipt {
     pub verification: BackupVerification,
 }
 
+/// An immutable project snapshot ready to hand to the backup coordinator.
+///
+/// Preparation is deliberately separate from publication so the UI can
+/// durably record the exact file revision before the coordinator commits it.
+#[derive(Debug)]
+pub struct PreparedBackup {
+    project_path: PathBuf,
+    snapshot: ProjectSnapshot,
+    source_revision: Option<SystemTime>,
+}
+
+impl PreparedBackup {
+    pub const fn source_revision(&self) -> Option<SystemTime> {
+        self.source_revision
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum BackupVerification {
     Skipped,
@@ -55,14 +73,29 @@ pub struct RemoteCatalogue {
     pub unavailable: usize,
 }
 
-/// Back up one project and return its refreshed history.
-pub fn back_up(
+/// Read one stable project revision without publishing it.
+pub fn prepare_backup(project_path: PathBuf) -> Result<PreparedBackup, String> {
+    let (snapshot, source_revision) = load_stable_snapshot(&project_path)?;
+    Ok(PreparedBackup {
+        project_path,
+        snapshot,
+        source_revision,
+    })
+}
+
+/// Back up one prepared project revision and return its refreshed history.
+pub fn back_up_prepared(
     listing: ProviderListing,
-    project_path: PathBuf,
+    prepared: PreparedBackup,
     display_name: String,
     retention_rule: Option<RetentionRule>,
     verify_uploads: bool,
 ) -> Result<BackupResult, String> {
+    let PreparedBackup {
+        project_path,
+        snapshot,
+        ..
+    } = prepared;
     runtime()?.block_on(async move {
         let provider = open_provider(&listing, &project_path).await?;
         let previous_history = if verify_uploads {
@@ -70,8 +103,6 @@ pub fn back_up(
         } else {
             Vec::new()
         };
-        let snapshot = ProjectSnapshot::load(&project_path)
-            .map_err(|error| format!("read {}: {error}", project_path.display()))?;
         if provider.capabilities().project_listing {
             provider
                 .put_project_profile(&ProjectProfile {
@@ -173,6 +204,47 @@ pub fn back_up(
             PushOutcome::NeedsReview { problems, .. } => BackupResult::NeedsReview(problems.len()),
         })
     })
+}
+
+#[cfg(test)]
+fn back_up(
+    listing: ProviderListing,
+    project_path: PathBuf,
+    display_name: String,
+    retention_rule: Option<RetentionRule>,
+    verify_uploads: bool,
+) -> Result<BackupResult, String> {
+    let prepared = prepare_backup(project_path)?;
+    back_up_prepared(
+        listing,
+        prepared,
+        display_name,
+        retention_rule,
+        verify_uploads,
+    )
+}
+
+fn load_stable_snapshot(path: &Path) -> Result<(ProjectSnapshot, Option<SystemTime>), String> {
+    const MAX_ATTEMPTS: usize = 3;
+    for _ in 0..MAX_ATTEMPTS {
+        let before = project_modified_at(path);
+        let snapshot = ProjectSnapshot::load(path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        let after = project_modified_at(path);
+        if before == after {
+            return Ok((snapshot, after));
+        }
+    }
+    Err(format!(
+        "{} kept changing while it was being read; wait for the save to finish and try again",
+        path.display()
+    ))
+}
+
+fn project_modified_at(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
 }
 
 async fn load_history_after_backup(
@@ -929,6 +1001,38 @@ mod tests {
             panic!("history failure should remain a verification warning");
         };
         assert!(error.contains("re-read backup history"), "{error}");
+    }
+
+    #[test]
+    fn a_prepared_backup_should_commit_the_revision_recorded_before_publication() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("Song.dawproject");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../crates/auru-pm/tests/fixtures/interchange/oracle-midi.dawproject"),
+            &project,
+        )
+        .expect("project");
+        let prepared = prepare_backup(project.clone()).expect("prepare stable project revision");
+        let prepared_revision = prepared.source_revision();
+        assert!(prepared_revision.is_some());
+
+        // Simulate another save arriving after the UI durably records the
+        // prepared revision but before the coordinator publishes it.
+        std::fs::write(&project, b"newer, incomplete save").expect("change working project");
+
+        let BackupResult::Committed(receipt) = back_up_prepared(
+            local_listing(&temp.path().join("Backups")),
+            prepared,
+            "Jake".to_owned(),
+            None,
+            false,
+        )
+        .expect("commit the already prepared revision") else {
+            panic!("prepared backup should commit");
+        };
+
+        assert!(!receipt.history.is_empty());
     }
 
     #[test]
