@@ -1,11 +1,11 @@
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use auru_pm::{
-    DiscoveredProject, PluginAvailability, PluginSearchPaths, ProjectFormat, ProjectInfo,
-    ProjectSnapshot, ResolvedPlugin, Sidecar, ableton, discovery, flstudio, plugin_registry,
-    sidecar_path_for,
+    CommitId, CommitSummary, DiscoveredProject, PluginAvailability, PluginSearchPaths,
+    ProjectFormat, ProjectInfo, ProjectSnapshot, ResolvedPlugin, Sidecar, ableton, discovery,
+    flstudio, plugin_registry, sidecar_path_for,
 };
 
 /// A folder Auru watches for projects.
@@ -168,6 +168,14 @@ fn describe_modified(modified: Option<SystemTime>) -> String {
         (days, _, _) if days < 365 => format!("saved {} months ago", days / 30),
         (days, _, _) => format!("saved {} years ago", days / 365),
     }
+}
+
+fn describe_epoch(timestamp: i64) -> String {
+    u64::try_from(timestamp)
+        .ok()
+        .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
+        .map(|time| describe_modified(Some(time)))
+        .unwrap_or_else(|| "date unknown".to_owned())
 }
 
 /// Human-readable byte count, in the units a musician thinks in.
@@ -340,7 +348,7 @@ pub fn import_project(kind: ImportKind, path: &Path) -> Result<Project, String> 
         local_inventory: detail
             .as_ref()
             .map_or_else(|| "ready to back up".to_owned(), ProjectDetail::files_line),
-        versions: &[],
+        versions: Vec::new(),
         sync_progress: 0.0,
         modified_at: file_modified_at(&project_file),
         // Just imported, so no backup exists yet by definition.
@@ -622,19 +630,16 @@ impl MissingPlugin {
 pub const PLUGIN_SETTINGS_REASSURANCE: &str = "Your settings for these are saved inside the project. They come back exactly as you \
      left them once the plugin is installed and authorized on this computer.";
 
-/// `UpstreamAhead` cannot occur until a provider is connected — nothing yet
-/// knows about a copy elsewhere — but the screens that present it are written
-/// and tested, so the variant stays rather than being reintroduced later.
-#[allow(dead_code)]
+/// Which side has work the other side has not seen.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncDirection {
     LocalAhead,
     UpstreamAhead,
 }
 
-/// `NotDownloaded` and `Conflicted` likewise await a connected provider: one
-/// means a copy exists that this machine does not have, the other that two
-/// copies disagree, and neither is knowable while backups are local-only.
+/// `NotDownloaded` still awaits provider project discovery: the current
+/// protocol can refresh a known project's head but cannot list a remote-only
+/// project on a new machine.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProjectStatus {
@@ -738,7 +743,7 @@ impl ProjectAction {
             Self::Open => "OPEN PROJECT",
             Self::Push => "↑  BACK UP CHANGES",
             Self::Pull => "↓  DOWNLOAD LATEST",
-            Self::ReviewConflicts => "CHOOSE WHAT TO KEEP",
+            Self::ReviewConflicts => "REVIEW CONFLICT",
             Self::None => "SYNCING…",
         }
     }
@@ -748,18 +753,18 @@ impl ProjectAction {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectVersion {
-    pub version: &'static str,
-    pub summary: &'static str,
-    pub created_at: &'static str,
+    pub id: CommitId,
+    pub version: String,
+    pub summary: String,
+    pub created_at: String,
 }
 
 #[derive(Debug)]
 pub struct Project {
-    /// Stable within a session. Stub projects use a fixed slug; imported ones
-    /// derive theirs from the project's location so adding the same project
-    /// twice replaces it rather than duplicating it.
+    /// Derived from the project's location so adding the same project twice
+    /// replaces it rather than duplicating it.
     pub id: String,
     pub name: String,
     pub file_name: String,
@@ -770,7 +775,7 @@ pub struct Project {
     pub last_activity: String,
     pub safe_version: String,
     pub local_inventory: String,
-    pub versions: &'static [ProjectVersion],
+    pub versions: Vec<ProjectVersion>,
     /// What the project is, read from its latest commit's summary. `None`
     /// until that summary has been fetched, or for a format Auru does not
     /// read detail from.
@@ -842,7 +847,7 @@ impl Project {
                 _ => "backed up".to_owned(),
             },
             local_inventory: String::new(),
-            versions: &[],
+            versions: Vec::new(),
             sync_progress: 0.0,
             modified_at,
             backed_up_at,
@@ -922,7 +927,7 @@ impl Project {
             ProjectStatus::NeverBackedUp => "only on this computer".to_owned(),
             ProjectStatus::NotDownloaded => "on Auru Cloud only".to_owned(),
             ProjectStatus::Downloaded => self.last_activity.clone(),
-            ProjectStatus::Syncing => "syncing · 64%".to_owned(),
+            ProjectStatus::Syncing => "backing up…".to_owned(),
             ProjectStatus::OutOfSync(SyncDirection::LocalAhead) => {
                 format!("changes waiting · {}", self.last_activity)
             }
@@ -986,24 +991,67 @@ impl Project {
         true
     }
 
-    /// Move a transfer along. Returns whether anything changed.
-    pub fn advance_transfer(&mut self, fraction: f32) -> bool {
-        if self.status != ProjectStatus::Syncing {
-            return false;
-        }
-        let next = (self.sync_progress + fraction).clamp(0.0, 1.0);
-        let changed = (next - self.sync_progress).abs() > f32::EPSILON;
-        self.sync_progress = next;
-        changed
-    }
-
-    pub fn finish_transfer(&mut self) {
+    pub fn finish_transfer(&mut self, history: Vec<CommitSummary>) {
         if self.status == ProjectStatus::Syncing {
             self.status = ProjectStatus::Downloaded;
             self.sync_progress = 1.0;
             self.last_activity = "backed up · just now".to_owned();
-            self.local_inventory = "all files · just downloaded".to_owned();
+            self.backed_up_at = Some(SystemTime::now());
+            self.apply_history(history);
         }
+    }
+
+    pub fn fail_transfer(&mut self) {
+        if self.status != ProjectStatus::Syncing {
+            return;
+        }
+        self.status = self
+            .live_set
+            .as_deref()
+            .map(ProjectStatus::read_from_disk)
+            .unwrap_or(ProjectStatus::OutOfSync(SyncDirection::LocalAhead));
+        self.sync_progress = 0.0;
+    }
+
+    pub fn apply_history(&mut self, history: Vec<CommitSummary>) {
+        self.reconcile_remote_head(history.first().map(|commit| commit.id));
+        let total = history.len();
+        self.versions = history
+            .into_iter()
+            .enumerate()
+            .map(|(index, commit)| ProjectVersion {
+                id: commit.id,
+                version: format!("v{}", total.saturating_sub(index)),
+                summary: if commit.message.trim().is_empty() {
+                    "Saved version".to_owned()
+                } else {
+                    commit.message
+                },
+                created_at: describe_epoch(commit.timestamp),
+            })
+            .collect();
+        if let Some(latest) = self.versions.first() {
+            self.safe_version = latest.created_at.clone();
+        }
+    }
+
+    fn reconcile_remote_head(&mut self, remote_head: Option<CommitId>) {
+        let Some(project_path) = self.live_set.as_deref() else {
+            return;
+        };
+        let Ok(sidecar) = Sidecar::load(&sidecar_path_for(project_path)) else {
+            return;
+        };
+        if remote_head.is_none() || remote_head == sidecar.local_head {
+            return;
+        }
+        self.status = if ProjectStatus::read_from_disk(project_path)
+            == ProjectStatus::OutOfSync(SyncDirection::LocalAhead)
+        {
+            ProjectStatus::Conflicted
+        } else {
+            ProjectStatus::OutOfSync(SyncDirection::UpstreamAhead)
+        };
     }
 
     /// How full the row's backup bar should be, 0.0–1.0.
@@ -1207,7 +1255,7 @@ mod tests {
     /// then shows what the Ableton reader actually produces, so the two cannot
     /// drift apart unnoticed. Shaped after a real drum-and-bass project — 175 BPM
     /// in C Phrygian, hosting Serum and Ozone.
-    const DEMO_LIVE_SET: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+    const TEST_LIVE_SET: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <Ableton MajorVersion="5" MinorVersion="12.0_12049" Creator="Ableton Live 12.0.25">
       <LiveSet>
         <MainTrack><DeviceChain><Mixer>
@@ -1417,7 +1465,7 @@ mod tests {
     fn write_project_folder_at(project: &Path) {
         let gzipped = ProjectSnapshot::from_source_bytes(
             ProjectFormat::AbletonLiveSet,
-            DEMO_LIVE_SET.as_bytes(),
+            TEST_LIVE_SET.as_bytes(),
         )
         .expect("normalize")
         .restore_bytes()
@@ -1430,7 +1478,7 @@ mod tests {
     fn write_project_folder(root: &Path) -> std::path::PathBuf {
         let gzipped = ProjectSnapshot::from_source_bytes(
             ProjectFormat::AbletonLiveSet,
-            DEMO_LIVE_SET.as_bytes(),
+            TEST_LIVE_SET.as_bytes(),
         )
         .expect("normalize")
         .restore_bytes()
@@ -1736,7 +1784,7 @@ mod tests {
     }
 
     #[test]
-    fn a_transfer_should_fill_the_bar_and_not_overfill_it() {
+    fn a_transfer_should_show_only_confirmed_completion() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("Song Project");
         write_project_folder_at(&root);
@@ -1744,13 +1792,10 @@ mod tests {
 
         assert!(project.begin_transfer());
         assert_eq!(project.backup_progress(), 0.0);
-        assert!(project.advance_transfer(0.5));
-        assert!((project.backup_progress() - 0.5).abs() < f32::EPSILON);
-        project.advance_transfer(5.0);
-        assert_eq!(project.backup_progress(), 1.0);
 
-        project.finish_transfer();
+        project.finish_transfer(Vec::new());
         assert_eq!(project.status, ProjectStatus::Downloaded);
+        assert_eq!(project.backup_progress(), 1.0);
         assert!(!project.backup_bar_is_prominent(), "backed up is quiet");
     }
 
@@ -1798,7 +1843,7 @@ mod tests {
             last_activity: String::new(),
             safe_version: String::new(),
             local_inventory: String::new(),
-            versions: &[],
+            versions: Vec::new(),
             sync_progress: 0.0,
             modified_at: None,
             backed_up_at: None,

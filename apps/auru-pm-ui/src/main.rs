@@ -1,3 +1,4 @@
+mod backend;
 mod catalog;
 mod menus;
 mod model;
@@ -7,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
-use auru_pm::{AURU_REGISTRY_URL, AuthMethod};
+use auru_pm::{AURU_REGISTRY_URL, AuthMethod, OAuthProgress};
 use gpui::{
     Anchor, AnyElement, App, Bounds, Context, Div, ElementId, Entity, FocusHandle, FontWeight,
     Hsla, InteractiveElement, Interactivity, IntoElement, ParentElement, Render, RenderOnce,
@@ -39,11 +40,7 @@ use crate::model::{
     SyncDirection, WatchedFolder, format_bytes, import_project, load_library, sort_projects,
 };
 
-const TRANSFER_DURATION: Duration = Duration::from_millis(1_500);
-/// How many times a simulated transfer reports progress.
-const TRANSFER_STEPS: u32 = 30;
-const TRANSFER_STEP: Duration =
-    Duration::from_millis(TRANSFER_DURATION.as_millis() as u64 / TRANSFER_STEPS as u64);
+const OAUTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DISPLAY_FONT: &str = "New York";
 const MONO_FONT: &str = "SF Mono";
 const SIDEBAR_WIDTH: f32 = 320.0;
@@ -56,30 +53,27 @@ const WAVEFORM_HEIGHTS: [f32; 30] = [
 enum Route {
     Library,
     Onboarding,
-    Recovery,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProviderEntryPoint {
-    Settings,
-    Recovery,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Overlay {
     None,
     ProviderPicker,
-    Authenticate {
-        provider_index: usize,
-        entry_point: ProviderEntryPoint,
-    },
+    Authenticate { provider_index: usize },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum AuthPhase {
     Ready,
     Waiting,
-    Complete,
+    DeviceCode {
+        user_code: String,
+        verification_uri: String,
+    },
+    Complete {
+        detail: String,
+    },
+    Failed(String),
 }
 
 /// How much version history to keep.
@@ -172,6 +166,11 @@ impl ProjectManager {
 
         // The name someone chose last time, if they have been here before.
         let display_name_seed = state.display_name.clone();
+        let initial_route = if display_name_seed.trim().is_empty() {
+            Route::Onboarding
+        } else {
+            Route::Library
+        };
 
         let display_name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Alice, Bob, or Charlie"));
@@ -232,10 +231,13 @@ impl ProjectManager {
                     match catalog {
                         Ok(mut providers) => {
                             for provider in &mut providers {
-                                if this.providers.iter().any(|current| {
-                                    current.entry.id == provider.entry.id
-                                        && current.availability == ProviderAvailability::Connected
-                                }) {
+                                if this.state.is_provider_connected(&provider.entry.id)
+                                    || this.providers.iter().any(|current| {
+                                        current.entry.id == provider.entry.id
+                                            && current.availability
+                                                == ProviderAvailability::Connected
+                                    })
+                                {
                                     provider.mark_connected();
                                 }
                             }
@@ -265,10 +267,16 @@ impl ProjectManager {
         let local: Vec<ProviderListing> = state
             .local_providers
             .iter()
-            .map(|path| local_provider(path))
+            .map(|path| {
+                let mut provider = local_provider(path);
+                if state.is_provider_connected(&provider.entry.id) {
+                    provider.mark_connected();
+                }
+                provider
+            })
             .collect();
 
-        let (providers, catalog_state) = match file_providers {
+        let (mut providers, catalog_state) = match file_providers {
             Some(mut providers) => {
                 providers.extend(local);
                 (providers, CatalogState::FromFile)
@@ -278,13 +286,18 @@ impl ProjectManager {
             // actually connect to, and they have no way to tell which.
             None => (local, CatalogState::Loading),
         };
+        for provider in &mut providers {
+            if state.is_provider_connected(&provider.entry.id) {
+                provider.mark_connected();
+            }
+        }
 
         Self {
             focus_handle,
             projects,
             selected_project: 0,
             list_scroll: UniformListScrollHandle::default(),
-            route: Route::Library,
+            route: initial_route,
             overlay: Overlay::None,
             display_name: state.display_name.clone(),
             display_name_input,
@@ -588,7 +601,9 @@ impl ProjectManager {
             };
 
             _ = this.update_in(cx, |this, window, cx| {
-                let listing = local_provider(&path);
+                let mut listing = local_provider(&path);
+                listing.mark_connected();
+                let provider_id = listing.entry.id.clone();
                 let name = listing.entry.name.clone();
 
                 // Adding the same folder twice replaces rather than duplicates:
@@ -604,6 +619,7 @@ impl ProjectManager {
                 }
 
                 this.state.add_local_provider(&path);
+                this.state.connect_provider(&provider_id);
                 this.state.save();
 
                 window.push_notification(
@@ -803,53 +819,36 @@ impl ProjectManager {
         let project_name = project.name.clone();
 
         match action {
-            ProjectAction::Download | ProjectAction::Push | ProjectAction::Pull => {
-                let Some(project) = self.projects.get_mut(index) else {
+            ProjectAction::Push => self.start_project_backup(index, window, cx),
+            ProjectAction::Download => window.push_notification(
+                Notification::warning(
+                    "This provider does not expose a project-listing endpoint yet, so Auru \
+                     cannot discover a remote-only project safely.",
+                )
+                .title("Download is not available yet"),
+                cx,
+            ),
+            ProjectAction::Pull => {
+                let Some(commit_id) = project.versions.first().map(|version| version.id) else {
+                    window.push_notification(
+                        Notification::warning("Refresh this project's history and try again.")
+                            .title("Latest version is not loaded yet"),
+                        cx,
+                    );
                     return;
                 };
-                if !project.begin_transfer() {
-                    return;
-                }
-                cx.notify();
-
-                cx.spawn(async move |this, cx| {
-                    // Stepped rather than one long sleep so the row's bar
-                    // actually moves. A bar that jumps from empty to done
-                    // tells you less than no bar at all.
-                    for _ in 0..TRANSFER_STEPS {
-                        cx.background_executor().timer(TRANSFER_STEP).await;
-                        let still_running = this
-                            .update(cx, |this, cx| {
-                                let Some(project) = this.projects.get_mut(index) else {
-                                    return false;
-                                };
-                                let advanced =
-                                    project.advance_transfer(1.0 / TRANSFER_STEPS as f32);
-                                if advanced {
-                                    cx.notify();
-                                }
-                                advanced
-                            })
-                            .unwrap_or(false);
-                        if !still_running {
-                            return;
-                        }
-                    }
-                    _ = this.update(cx, |this, cx| {
-                        if let Some(project) = this.projects.get_mut(index) {
-                            project.finish_transfer();
-                            cx.notify();
-                        }
-                    });
-                })
-                .detach();
+                self.restore_version(index, commit_id, window, cx);
             }
             ProjectAction::Open => {
-                window.push_notification(
-                    Notification::info("The native DAW launch hook will replace this demo action.")
-                        .title(format!("{project_name} is ready")),
-                    cx,
-                );
+                let Some(path) = project.live_set.as_deref() else {
+                    return;
+                };
+                if let Err(message) = backend::open_project(path) {
+                    window.push_notification(
+                        Notification::error(message).title(format!("Couldn't open {project_name}")),
+                        cx,
+                    );
+                }
             }
             ProjectAction::ReviewConflicts => {
                 window.push_notification(
@@ -864,31 +863,113 @@ impl ProjectManager {
         }
     }
 
-    fn back_up_all(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        let mut syncing = Vec::new();
-        for (index, project) in self.projects.iter_mut().enumerate() {
-            if project.status.action() == ProjectAction::Push && project.begin_transfer() {
-                syncing.push(index);
-            }
-        }
-
-        if syncing.is_empty() {
+    fn start_project_backup(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.get(index) else {
+            return;
+        };
+        let Some(project_path) = project.live_set.clone() else {
+            window.push_notification(
+                Notification::error("The project file is not on this computer.")
+                    .title("Can't back up this project"),
+                cx,
+            );
+            return;
+        };
+        let Some(provider) = self.backup_destination_for(&project_path) else {
+            self.overlay = Overlay::ProviderPicker;
+            window.push_notification(
+                Notification::warning("Connect a provider or add a local backup folder first.")
+                    .title("Choose where backups live"),
+                cx,
+            );
+            cx.notify();
+            return;
+        };
+        let project_id = project.id.clone();
+        let project_name = project.name.clone();
+        let display_name = self.display_name.clone();
+        let Some(project) = self.projects.get_mut(index) else {
+            return;
+        };
+        if !project.begin_transfer() {
             return;
         }
+        // Completion comes only from the real coordinator. The core does not
+        // expose byte-level progress yet, so the UI stays indeterminate rather
+        // than inventing a percentage.
         cx.notify();
 
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(TRANSFER_DURATION).await;
-            _ = this.update(cx, |this, cx| {
-                for index in syncing {
-                    if let Some(project) = this.projects.get_mut(index) {
-                        project.finish_transfer();
+        let backup = cx
+            .background_executor()
+            .spawn(async move { backend::back_up(provider, project_path, display_name) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = backup.await;
+            _ = this.update_in(cx, |this, window, cx| {
+                let Some(project) = this
+                    .projects
+                    .iter_mut()
+                    .find(|project| project.id == project_id)
+                else {
+                    return;
+                };
+                match result {
+                    Ok(backend::BackupResult::Committed(history)) => {
+                        project.finish_transfer(history);
+                        window.push_notification(
+                            Notification::success("Project bytes and history were stored.")
+                                .title(format!("{project_name} backed up")),
+                            cx,
+                        );
+                    }
+                    Ok(backend::BackupResult::NeedsResolution(conflicts)) => {
+                        project.status = ProjectStatus::Conflicted;
+                        project.sync_progress = 0.0;
+                        window.push_notification(
+                            Notification::warning(format!(
+                                "{conflicts} conflicting field(s) need a choice before anything is committed."
+                            ))
+                            .title(format!("{project_name} needs review")),
+                            cx,
+                        );
+                    }
+                    Ok(backend::BackupResult::NeedsReview(problems)) => {
+                        project.status = ProjectStatus::Conflicted;
+                        project.sync_progress = 0.0;
+                        window.push_notification(
+                            Notification::warning(format!(
+                                "The merged project has {problems} integrity problem(s); your local copy is stashed safely."
+                            ))
+                            .title(format!("{project_name} needs review")),
+                            cx,
+                        );
+                    }
+                    Err(message) => {
+                        project.fail_transfer();
+                        window.push_notification(
+                            Notification::error(message)
+                                .title(format!("Couldn't back up {project_name}")),
+                            cx,
+                        );
                     }
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    fn back_up_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pending: Vec<usize> = self
+            .projects
+            .iter()
+            .enumerate()
+            .filter_map(|(index, project)| {
+                (project.status.action() == ProjectAction::Push).then_some(index)
+            })
+            .collect();
+        for index in pending {
+            self.start_project_backup(index, window, cx);
+        }
     }
 
     /// Open the settings window, or bring it forward if it is already open.
@@ -943,6 +1024,8 @@ impl ProjectManager {
         }
 
         self.display_name = display_name;
+        self.state.display_name = self.display_name.clone();
+        self.state.save();
         self.route = Route::Library;
         window.push_notification(
             Notification::success("Your local profile is ready. No account was created.")
@@ -952,37 +1035,51 @@ impl ProjectManager {
         cx.notify();
     }
 
+    fn mark_provider_connected(&mut self, provider_index: usize) -> Option<String> {
+        let provider = self.providers.get_mut(provider_index)?;
+        provider.mark_connected();
+        let provider_id = provider.entry.id.clone();
+        let provider_name = provider.entry.name.clone();
+        self.state.connect_provider(&provider_id);
+        self.state.save();
+        Some(provider_name)
+    }
+
+    fn backup_destination_for(&self, project_path: &std::path::Path) -> Option<ProviderListing> {
+        backend::primary_listing(&self.providers, project_path)
+            .or_else(|| {
+                self.state.primary_provider.as_ref().and_then(|primary| {
+                    self.providers
+                        .iter()
+                        .find(|provider| provider.entry.id == *primary && provider.is_connected())
+                        .cloned()
+                })
+            })
+            .or_else(|| backend::default_listing(&self.providers))
+    }
+
     fn select_provider(
         &mut self,
         provider_index: usize,
-        entry_point: ProviderEntryPoint,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(provider) = self.providers.get(provider_index) else {
             return;
         };
+        let requires_authentication = provider.requires_authentication();
+        let fallback_name = provider.entry.name.clone();
 
-        if provider.requires_authentication() {
+        if requires_authentication {
             self.credential_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
             self.auth_phase = AuthPhase::Ready;
-            self.overlay = Overlay::Authenticate {
-                provider_index,
-                entry_point,
-            };
+            self.overlay = Overlay::Authenticate { provider_index };
         } else {
-            let provider_name = provider.entry.name.clone();
-            if let Some(provider) = self.providers.get_mut(provider_index) {
-                provider.mark_connected();
-            }
-            self.overlay = match entry_point {
-                ProviderEntryPoint::Settings => Overlay::None,
-                ProviderEntryPoint::Recovery => Overlay::None,
-            };
-            if entry_point == ProviderEntryPoint::Recovery {
-                self.route = Route::Library;
-            }
+            let provider_name = self
+                .mark_provider_connected(provider_index)
+                .unwrap_or(fallback_name);
+            self.overlay = Overlay::None;
             window.push_notification(
                 Notification::success("No sign-in was requested by this provider.")
                     .title(format!("{provider_name} connected")),
@@ -1001,8 +1098,11 @@ impl ProjectManager {
         let Some(provider) = self.providers.get(provider_index) else {
             return;
         };
+        let auth_method = provider.preferred_auth_method();
+        let provider_id = provider.entry.id.clone();
+        let endpoint = provider.entry.endpoint.clone();
 
-        if provider.preferred_auth_method() == AuthMethod::Pat
+        if auth_method == AuthMethod::Pat
             && self.credential_input.read(cx).value().trim().is_empty()
         {
             window.push_notification(
@@ -1013,53 +1113,141 @@ impl ProjectManager {
             return;
         }
 
-        self.auth_phase = AuthPhase::Waiting;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(TRANSFER_DURATION).await;
-            _ = this.update(cx, |this, cx| {
-                this.auth_phase = AuthPhase::Complete;
+        match auth_method {
+            AuthMethod::Pat => {
+                let token = self.credential_input.read(cx).value().trim().to_owned();
+                match auru_pm::token_store::store_provider_token(&provider_id, &token) {
+                    Ok(()) => {
+                        self.auth_phase = AuthPhase::Complete {
+                            detail: "The token is stored securely and will be checked on the first project request."
+                                .to_owned(),
+                        };
+                    }
+                    Err(error) => {
+                        self.auth_phase =
+                            AuthPhase::Failed(format!("Couldn't store the token: {error}"));
+                    }
+                }
                 cx.notify();
-            });
-        })
-        .detach();
+            }
+            AuthMethod::OAuthDeviceCode => {
+                self.auth_phase = AuthPhase::Waiting;
+                cx.notify();
+                let receiver = auru_pm::start_device_flow(endpoint, "auru-pm-desktop".to_owned());
+                cx.spawn(async move |this, cx| {
+                    loop {
+                        match receiver.try_recv() {
+                            Ok(OAuthProgress::DeviceCode(code)) => {
+                                _ = this.update(cx, |this, cx| {
+                                    this.auth_phase = AuthPhase::DeviceCode {
+                                        user_code: code.user_code,
+                                        verification_uri: code
+                                            .verification_uri_complete
+                                            .unwrap_or(code.verification_uri),
+                                    };
+                                    cx.notify();
+                                });
+                            }
+                            Ok(OAuthProgress::Pending) => {}
+                            Ok(OAuthProgress::Token(token)) => {
+                                let stored = auru_pm::token_store::store_provider_token(
+                                    &provider_id,
+                                    &token,
+                                );
+                                _ = this.update(cx, |this, cx| {
+                                    this.auth_phase = match stored {
+                                        Ok(()) => AuthPhase::Complete {
+                                            detail: "The provider confirmed this device."
+                                                .to_owned(),
+                                        },
+                                        Err(error) => AuthPhase::Failed(format!(
+                                            "Signed in, but couldn't store the token: {error}"
+                                        )),
+                                    };
+                                    cx.notify();
+                                });
+                                return;
+                            }
+                            Ok(OAuthProgress::Expired) => {
+                                _ = this.update(cx, |this, cx| {
+                                    this.auth_phase = AuthPhase::Failed(
+                                        "The sign-in code expired. Start again for a new one."
+                                            .to_owned(),
+                                    );
+                                    cx.notify();
+                                });
+                                return;
+                            }
+                            Ok(OAuthProgress::AccessDenied) => {
+                                _ = this.update(cx, |this, cx| {
+                                    this.auth_phase = AuthPhase::Failed(
+                                        "The provider declined this sign-in.".to_owned(),
+                                    );
+                                    cx.notify();
+                                });
+                                return;
+                            }
+                            Ok(OAuthProgress::Error(error)) => {
+                                _ = this.update(cx, |this, cx| {
+                                    this.auth_phase = AuthPhase::Failed(error);
+                                    cx.notify();
+                                });
+                                return;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                cx.background_executor().timer(OAUTH_POLL_INTERVAL).await;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                _ = this.update(cx, |this, cx| {
+                                    this.auth_phase = AuthPhase::Failed(
+                                        "The provider ended sign-in unexpectedly.".to_owned(),
+                                    );
+                                    cx.notify();
+                                });
+                                return;
+                            }
+                        }
+                    }
+                })
+                .detach();
+            }
+            AuthMethod::None => {
+                if self.mark_provider_connected(provider_index).is_some() {
+                    self.auth_phase = AuthPhase::Complete {
+                        detail: "This provider does not require sign-in.".to_owned(),
+                    };
+                }
+                cx.notify();
+            }
+        }
     }
 
     fn finish_provider_auth(
         &mut self,
         provider_index: usize,
-        entry_point: ProviderEntryPoint,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(provider) = self.providers.get_mut(provider_index) else {
+        let detail = match &self.auth_phase {
+            AuthPhase::Complete { detail } => detail.clone(),
+            _ => "The provider is configured on this device.".to_owned(),
+        };
+        let Some(provider_name) = self.mark_provider_connected(provider_index) else {
             return;
         };
-        provider.mark_connected();
-        let provider_name = provider.entry.name.clone();
 
-        match entry_point {
-            ProviderEntryPoint::Settings => self.overlay = Overlay::None,
-            ProviderEntryPoint::Recovery => {
-                self.overlay = Overlay::None;
-                self.route = Route::Library;
-            }
-        }
+        self.overlay = Overlay::None;
         self.auth_phase = AuthPhase::Ready;
         window.push_notification(
-            Notification::success("The provider confirmed this device.")
-                .title(format!("Signed in to {provider_name}")),
+            Notification::success(detail).title(format!("{provider_name} configured")),
             cx,
         );
         cx.notify();
     }
 
-    fn cancel_provider_auth(&mut self, entry_point: ProviderEntryPoint, cx: &mut Context<Self>) {
+    fn cancel_provider_auth(&mut self, cx: &mut Context<Self>) {
         self.auth_phase = AuthPhase::Ready;
-        self.overlay = match entry_point {
-            ProviderEntryPoint::Settings => Overlay::ProviderPicker,
-            ProviderEntryPoint::Recovery => Overlay::None,
-        };
+        self.overlay = Overlay::ProviderPicker;
         cx.notify();
     }
 
@@ -1072,6 +1260,7 @@ impl ProjectManager {
     fn select_project(&mut self, index: usize, cx: &mut Context<Self>) {
         self.selected_project = index;
         cx.notify();
+        self.load_project_history(index, cx);
 
         let Some(project) = self.projects.get(index) else {
             return;
@@ -1095,6 +1284,113 @@ impl ProjectManager {
                 if let Some(project) = this.projects.iter_mut().find(|p| p.id == id) {
                     project.apply_detail(loaded);
                     cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn load_project_history(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.get(index) else {
+            return;
+        };
+        if !project.versions.is_empty() {
+            return;
+        }
+        let Some(project_path) = project.live_set.clone() else {
+            return;
+        };
+        let Some(provider) = backend::primary_listing(&self.providers, &project_path) else {
+            return;
+        };
+        let project_id = project.id.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { backend::history(provider, project_path) });
+        cx.spawn(async move |this, cx| {
+            let Ok(history) = task.await else {
+                return;
+            };
+            _ = this.update(cx, |this, cx| {
+                if let Some(project) = this
+                    .projects
+                    .iter_mut()
+                    .find(|project| project.id == project_id)
+                {
+                    project.apply_history(history);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn restore_version(
+        &mut self,
+        index: usize,
+        commit_id: auru_pm::CommitId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.projects.get(index) else {
+            return;
+        };
+        let Some(project_path) = project.live_set.clone() else {
+            return;
+        };
+        let Some(provider) = backend::primary_listing(&self.providers, &project_path) else {
+            window.push_notification(
+                Notification::error("The provider for this history is not configured.")
+                    .title("Can't restore this version"),
+                cx,
+            );
+            return;
+        };
+        let project_name = project.name.clone();
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Restore into this folder".into()),
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(destination) = paths.into_iter().next() else {
+                return;
+            };
+            let task = cx.background_executor().spawn(async move {
+                backend::restore(provider, project_path, commit_id, destination)
+            });
+            let result = task.await;
+            _ = this.update_in(cx, |_, window, cx| match result {
+                Ok(report) => {
+                    let detail = if report.unavailable == 0 {
+                        format!(
+                            "{} captured file(s) restored to {}",
+                            report.files_written,
+                            report.project_file.display()
+                        )
+                    } else {
+                        format!(
+                            "Restored to {} · {} file(s) unavailable",
+                            report.project_file.display(),
+                            report.unavailable
+                        )
+                    };
+                    window.push_notification(
+                        Notification::success(detail).title(format!("{project_name} restored")),
+                        cx,
+                    );
+                }
+                Err(message) => {
+                    window.push_notification(
+                        Notification::error(message)
+                            .title(format!("Couldn't restore {project_name}")),
+                        cx,
+                    );
                 }
             });
         })
@@ -1273,7 +1569,7 @@ impl ProjectManager {
             .flex_col()
             .bg(bg())
             .child(div().flex().min_h_0().flex_1().child(sidebar).child(detail))
-            .child(self.render_demo_bar(cx))
+            .child(self.render_shortcuts_bar(cx))
             .into_any_element()
     }
 
@@ -1710,6 +2006,7 @@ impl ProjectManager {
                     .iter()
                     .enumerate()
                     .map(|(version_index, version)| {
+                        let commit_id = version.id;
                         div()
                             .flex()
                             .min_h(px(36.0))
@@ -1746,14 +2043,8 @@ impl ProjectManager {
                                             .cursor_pointer()
                                             .text_color(green())
                                             .hover(|this| this.text_color(bright()))
-                                            .on_click(cx.listener(|_, _, window, cx| {
-                                                window.push_notification(
-                                            Notification::info(
-                                                "Restore is simulated; no files were changed.",
-                                            )
-                                            .title("Version selected"),
-                                            cx,
-                                        );
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.restore_version(index, commit_id, window, cx);
                                             }))
                                             .child("RESTORE"),
                                     ),
@@ -1802,18 +2093,35 @@ impl ProjectManager {
                     .px_8()
                     .text_size(px(9.0))
                     .text_color(faint())
-                    .child("VIEW FULL HISTORY →")
+                    .child("SHOWING UP TO 50 VERSIONS")
                     .child(
                         div()
+                            .id(format!("open-project-footer-{}", project.id))
                             .cursor_pointer()
                             .hover(|this| this.text_color(bright()))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let Some(path) = this
+                                    .projects
+                                    .get(index)
+                                    .and_then(|project| project.live_set.as_deref())
+                                else {
+                                    return;
+                                };
+                                if let Err(message) = backend::open_project(path) {
+                                    window.push_notification(
+                                        Notification::error(message)
+                                            .title("Couldn't open the project"),
+                                        cx,
+                                    );
+                                }
+                            }))
                             .child(project.open_label()),
                     ),
             )
             .into_any_element()
     }
 
-    fn render_demo_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_shortcuts_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
             .flex()
             .h(px(28.0))
@@ -1825,45 +2133,18 @@ impl ProjectManager {
             .px_5()
             .text_size(px(8.0))
             .text_color(faint())
-            .child("[ SHORTCUTS ]")
+            .child("[ LIBRARY ]")
             .child(
-                div()
-                    .flex()
-                    .gap_6()
-                    .child(
-                        div()
-                            .id("demo-onboarding")
-                            .cursor_pointer()
-                            .hover(|this| this.text_color(bright()))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.route = Route::Onboarding;
-                                this.overlay = Overlay::None;
-                                cx.notify();
-                            }))
-                            .child("▶ FIRST-RUN SETUP"),
-                    )
-                    .child(
-                        div()
-                            .id("demo-recovery")
-                            .cursor_pointer()
-                            .hover(|this| this.text_color(bright()))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.route = Route::Recovery;
-                                this.overlay = Overlay::None;
-                                cx.notify();
-                            }))
-                            .child("⚡ RECOVERY MODE"),
-                    )
-                    .child(
-                        div()
-                            .id("demo-reset")
-                            .cursor_pointer()
-                            .hover(|this| this.text_color(bright()))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.reload_library(window, cx);
-                            }))
-                            .child("↺ REFRESH"),
-                    ),
+                div().flex().gap_6().child(
+                    div()
+                        .id("shortcut-refresh")
+                        .cursor_pointer()
+                        .hover(|this| this.text_color(bright()))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.reload_library(window, cx);
+                        }))
+                        .child("↺ REFRESH"),
+                ),
             )
             .into_any_element()
     }
@@ -1976,151 +2257,11 @@ impl ProjectManager {
                                                 this.route = Route::Library;
                                                 cx.notify();
                                             }))
-                                            .child("← BACK TO DEMO"),
+                                            .child("← BACK TO LIBRARY"),
                                     )
                                     .child(continue_button),
                             ),
                     ),
-            )
-            .into_any_element()
-    }
-
-    fn render_recovery(&self, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .bg(bg())
-            .child(
-                div()
-                    .flex()
-                    .w(px(520.0))
-                    .flex_col()
-                    .items_center()
-                    .gap_4()
-                    .child(
-                        div()
-                            .text_size(px(9.0))
-                            .text_color(faint())
-                            .child("AURU PM"),
-                    )
-                    .child(
-                        div()
-                            .text_center()
-                            .font_family(DISPLAY_FONT)
-                            .text_size(px(40.0))
-                            .line_height(relative(1.12))
-                            .text_color(bright())
-                            .child("Your music,\noff your hardware."),
-                    )
-                    .child(
-                        div()
-                            .mb_2()
-                            .text_center()
-                            .text_size(px(10.0))
-                            .line_height(relative(1.6))
-                            .text_color(dim())
-                            .child(
-                                "Choose the provider that holds your library. Auru PM signs in only when that provider asks for authentication.",
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .w_full()
-                            .flex_col()
-                            .gap_2()
-                            .border_1()
-                            .border_color(line())
-                            .bg(panel())
-                            .p_4()
-                            .child(section_label("[ SIGN IN WITH A PROVIDER ]"))
-                            .children(
-                                self.providers
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(_, provider)| provider.requires_authentication())
-                                    .map(|(index, provider)| {
-                                        self.render_recovery_provider(index, provider, cx)
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .pt_2()
-                                    .text_size(px(8.0))
-                                    .text_color(faint())
-                                    .child(format!(
-                                        "{} · {AURU_REGISTRY_URL}",
-                                        self.catalog_state.label()
-                                    )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("recovery-back")
-                            .mt_2()
-                            .cursor_pointer()
-                            .text_size(px(8.0))
-                            .text_color(faint())
-                            .hover(|this| this.text_color(bright()))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.route = Route::Library;
-                                cx.notify();
-                            }))
-                            .child("[ DEMO ] BACK TO LIBRARY"),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_recovery_provider(
-        &self,
-        index: usize,
-        provider: &ProviderListing,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let name = provider.entry.name.clone();
-        div()
-            .id(format!("recovery-provider-{}", provider.entry.id))
-            .flex()
-            .min_h(px(58.0))
-            .cursor_pointer()
-            .items_center()
-            .justify_between()
-            .gap_4()
-            .border_1()
-            .border_color(line())
-            .px_4()
-            .hover(|this| this.border_color(green()).bg(selection()))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.select_provider(index, ProviderEntryPoint::Recovery, window, cx);
-            }))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .font_family(DISPLAY_FONT)
-                            .text_size(px(15.0))
-                            .text_color(bright())
-                            .child(name),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(8.0))
-                            .text_color(faint())
-                            .child(provider.detail.clone()),
-                    ),
-            )
-            .child(
-                div()
-                    .text_size(px(8.0))
-                    .text_color(green())
-                    .child("SIGN IN →"),
             )
             .into_any_element()
     }
@@ -2310,7 +2451,7 @@ impl ProjectManager {
                         this.overlay = Overlay::ProviderPicker;
                         cx.notify();
                     }))
-                    .child("＋ ADD ANOTHER PROVIDER — CURATED OR CUSTOM URL…"),
+                    .child("＋ ADD ANOTHER PROVIDER FROM THE CATALOG…"),
             )
             .into_any_element()
     }
@@ -2374,38 +2515,15 @@ impl ProjectManager {
             )
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_4()
                     .border_t_1()
                     .border_color(line())
                     .pt_4()
+                    .text_size(px(9.0))
+                    .line_height(relative(1.5))
+                    .text_color(faint())
                     .child(
-                        div()
-                            .min_w_0()
-                            .text_size(px(9.0))
-                            .text_color(dim())
-                            .child("Signing in on a new machine? Pull your library down."),
-                    )
-                    .child(
-                        div()
-                            .id("recover-another-device")
-                            .flex_shrink_0()
-                            .cursor_pointer()
-                            .border_1()
-                            .border_color(line())
-                            .px_4()
-                            .py_2()
-                            .text_size(px(8.0))
-                            .text_color(dim())
-                            .hover(|this| this.border_color(green()).text_color(green()))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.overlay = Overlay::None;
-                                this.route = Route::Recovery;
-                                cx.notify();
-                            }))
-                            .child("RECOVER ANOTHER DEVICE"),
+                        "NEW-MACHINE RECOVERY REQUIRES PROVIDER PROJECT DISCOVERY. \
+                         THIS PROTOCOL DOES NOT EXPOSE IT YET.",
                     ),
             )
             .into_any_element()
@@ -2533,7 +2651,7 @@ impl ProjectManager {
                     .cursor_pointer()
                     .hover(|this| this.border_color(green()).bg(selection()))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.select_provider(index, ProviderEntryPoint::Settings, window, cx);
+                        this.select_provider(index, window, cx);
                     }));
             }
             row.into_any_element()
@@ -2637,30 +2755,6 @@ impl ProjectManager {
                     )
                     .child(
                         div()
-                            .id("add-custom-provider")
-                            .flex()
-                            .h(px(44.0))
-                            .cursor_pointer()
-                            .items_center()
-                            .border_1()
-                            .border_color(line())
-                            .px_4()
-                            .text_size(px(8.0))
-                            .text_color(faint())
-                            .hover(|this| this.border_color(green()).text_color(green()))
-                            .on_click(cx.listener(|_, _, window, cx| {
-                                window.push_notification(
-                                    Notification::info(
-                                        "Custom URL validation will use the provider health metadata.",
-                                    )
-                                    .title("Add a custom provider"),
-                                    cx,
-                                );
-                            }))
-                            .child("＋ ADD A CUSTOM PROVIDER URL"),
-                    )
-                    .child(
-                        div()
                             .id("add-local-provider")
                             .flex()
                             .h(px(44.0))
@@ -2682,12 +2776,7 @@ impl ProjectManager {
         overlay_backdrop(panel)
     }
 
-    fn render_authentication(
-        &self,
-        provider_index: usize,
-        entry_point: ProviderEntryPoint,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_authentication(&self, provider_index: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(provider) = self.providers.get(provider_index) else {
             return overlay_backdrop(
                 div()
@@ -2701,7 +2790,7 @@ impl ProjectManager {
         };
         let auth_method = provider.preferred_auth_method();
 
-        let phase_content = match self.auth_phase {
+        let phase_content = match &self.auth_phase {
             AuthPhase::Ready => {
                 let mut content = div().flex().flex_col().gap_4().child(
                     div()
@@ -2714,43 +2803,7 @@ impl ProjectManager {
                         .child(AuthHint::for_method(&auth_method).detail),
                 );
 
-                if auth_method == AuthMethod::OAuthDeviceCode {
-                    content = content.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .border_1()
-                            .border_color(line())
-                            .bg(bg())
-                            .p_4()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_size(px(8.0))
-                                            .text_color(faint())
-                                            .child("DEVICE CODE"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(16.0))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(bright())
-                                            .child("AURU-M7K2"),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(8.0))
-                                    .text_color(green())
-                                    .child("PROVIDER-HOSTED SIGN-IN"),
-                            ),
-                    );
-                } else if auth_method == AuthMethod::Pat {
+                if auth_method == AuthMethod::Pat {
                     content = content.child(
                         div()
                             .flex()
@@ -2812,10 +2865,82 @@ impl ProjectManager {
                         .text_size(px(8.0))
                         .line_height(relative(1.5))
                         .text_color(faint())
-                        .child("The simulated provider is confirming this device."),
+                        .child("Requesting a sign-in code from the provider."),
                 )
                 .into_any_element(),
-            AuthPhase::Complete => div()
+            AuthPhase::DeviceCode {
+                user_code,
+                verification_uri,
+            } => {
+                let url = verification_uri.clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .line_height(relative(1.6))
+                            .text_color(dim())
+                            .child(
+                                "Open the provider's sign-in page and enter this code. \
+                                 This window will update when the provider confirms you.",
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .border_1()
+                            .border_color(line())
+                            .bg(bg())
+                            .p_4()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_size(px(8.0))
+                                            .text_color(faint())
+                                            .child("DEVICE CODE"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(18.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(bright())
+                                            .child(user_code.clone()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("open-provider-sign-in")
+                                    .cursor_pointer()
+                                    .text_size(px(8.0))
+                                    .text_color(green())
+                                    .hover(|this| this.text_color(bright()))
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.open_url(&url);
+                                    }))
+                                    .child("OPEN SIGN-IN PAGE  ↗"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(8.0))
+                            .text_color(faint())
+                            .child(Spinner::new().xsmall().color(green()))
+                            .child("WAITING FOR PROVIDER CONFIRMATION…"),
+                    )
+                    .into_any_element()
+            }
+            AuthPhase::Complete { detail } => div()
                 .flex()
                 .flex_col()
                 .items_center()
@@ -2838,7 +2963,15 @@ impl ProjectManager {
                         .font_family(DISPLAY_FONT)
                         .text_size(px(24.0))
                         .text_color(bright())
-                        .child("This device is connected."),
+                        .child("Provider configured."),
+                )
+                .child(
+                    div()
+                        .text_center()
+                        .text_size(px(8.0))
+                        .line_height(relative(1.5))
+                        .text_color(faint())
+                        .child(detail.clone()),
                 )
                 .child(
                     div()
@@ -2855,13 +2988,45 @@ impl ProjectManager {
                         .text_color(bg())
                         .hover(|this| this.bg(green().opacity(0.82)))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.finish_provider_auth(provider_index, entry_point, window, cx);
+                            this.finish_provider_auth(provider_index, window, cx);
                         }))
-                        .child(if entry_point == ProviderEntryPoint::Recovery {
-                            "RESTORE MY LIBRARY →"
-                        } else {
-                            "RETURN TO SETTINGS →"
-                        }),
+                        .child("RETURN TO SETTINGS →"),
+                )
+                .into_any_element(),
+            AuthPhase::Failed(message) => div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(
+                    div()
+                        .border_1()
+                        .border_color(red())
+                        .bg(red().opacity(0.08))
+                        .p_4()
+                        .text_size(px(9.0))
+                        .line_height(relative(1.5))
+                        .text_color(bright())
+                        .child(message.clone()),
+                )
+                .child(
+                    div()
+                        .id("retry-provider-auth")
+                        .flex()
+                        .h(px(42.0))
+                        .cursor_pointer()
+                        .items_center()
+                        .justify_center()
+                        .border_1()
+                        .border_color(green())
+                        .text_size(px(9.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(green())
+                        .hover(|this| this.bg(green().opacity(0.08)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.auth_phase = AuthPhase::Ready;
+                            cx.notify();
+                        }))
+                        .child("TRY AGAIN"),
                 )
                 .into_any_element(),
         };
@@ -2894,8 +3059,8 @@ impl ProjectManager {
                                 .cursor_pointer()
                                 .text_color(faint())
                                 .hover(|this| this.text_color(bright()))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.cancel_provider_auth(entry_point, cx);
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cancel_provider_auth(cx);
                                 }))
                                 .child("×"),
                         ),
@@ -2932,16 +3097,14 @@ impl Render for ProjectManager {
         let content = match self.route {
             Route::Library => self.render_library(cx),
             Route::Onboarding => self.render_onboarding(cx),
-            Route::Recovery => self.render_recovery(cx),
         };
 
         let overlay = match self.overlay {
             Overlay::None => None,
             Overlay::ProviderPicker => Some(self.render_provider_picker(cx)),
-            Overlay::Authenticate {
-                provider_index,
-                entry_point,
-            } => Some(self.render_authentication(provider_index, entry_point, cx)),
+            Overlay::Authenticate { provider_index } => {
+                Some(self.render_authentication(provider_index, cx))
+            }
         };
 
         div()

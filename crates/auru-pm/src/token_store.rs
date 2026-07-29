@@ -7,6 +7,7 @@
 use crate::error::{Error, Result};
 
 const SERVICE: &str = "auru-pm";
+const PROVIDER_ACCOUNT: &str = "__provider__";
 
 fn account_key(provider_id: &str, project_id: &str) -> String {
     // Use a slash separator; provider IDs (URLs) never contain raw slashes
@@ -47,4 +48,23 @@ pub fn delete_token(provider_id: &str, project_id: &str) -> Result<()> {
         Err(keyring_core::Error::NoEntry) => Ok(()),
         Err(e) => Err(kring(e)),
     }
+}
+
+/// Store an account-wide token for a provider.
+///
+/// Device-code OAuth and most PAT providers authenticate the person, not one
+/// project. Project-scoped tokens still use [`store_token`]; clients can try a
+/// project token first and fall back to this account token.
+pub fn store_provider_token(provider_id: &str, token: &str) -> Result<()> {
+    store_token(provider_id, PROVIDER_ACCOUNT, token)
+}
+
+/// Load an account-wide provider token.
+pub fn load_provider_token(provider_id: &str) -> Result<Option<String>> {
+    load_token(provider_id, PROVIDER_ACCOUNT)
+}
+
+/// Delete an account-wide provider token.
+pub fn delete_provider_token(provider_id: &str) -> Result<()> {
+    delete_token(provider_id, PROVIDER_ACCOUNT)
 }

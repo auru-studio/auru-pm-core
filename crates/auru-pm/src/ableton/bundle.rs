@@ -116,26 +116,24 @@ impl PathAlias {
         }
     }
 
-    /// Read aliases from `AURU_ABLETON_PATH_ALIASES`.
+    /// Read aliases from `AURU_PATH_ALIASES`.
     ///
-    /// Format is `from=to`, separated by the platform path separator:
+    /// Format is `from=to`; separate multiple mappings with `;`:
     ///
     /// ```text
-    /// AURU_ABLETON_PATH_ALIASES='E:/Music Production=/mnt/ssd/Music Production'
+    /// AURU_PATH_ALIASES='E:/Music Production=/mnt/ssd/Music Production'
     /// ```
+    ///
+    /// `AURU_ABLETON_PATH_ALIASES` remains a fallback for existing setups.
+    /// The neutral name is used first because the same aliases resolve paths
+    /// recorded by Ableton, FL Studio, and future DAW adapters.
     pub fn from_environment() -> Vec<Self> {
-        let Ok(raw) = std::env::var("AURU_ABLETON_PATH_ALIASES") else {
+        let raw = std::env::var("AURU_PATH_ALIASES")
+            .or_else(|_| std::env::var("AURU_ABLETON_PATH_ALIASES"));
+        let Ok(raw) = raw else {
             return Vec::new();
         };
-        raw.split([';', ':'].as_ref())
-            .filter_map(|entry| {
-                // Split on the first `=`; a Windows prefix contains a colon,
-                // so `=` is the only safe separator within an entry.
-                let (from, to) = entry.split_once('=')?;
-                let (from, to) = (from.trim(), to.trim());
-                (!from.is_empty() && !to.is_empty()).then(|| Self::new(from, to))
-            })
-            .collect()
+        parse_path_aliases(&raw)
     }
 
     /// Apply this alias to `path`, if it matches.
@@ -147,6 +145,40 @@ impl PathAlias {
         let rest = path[from.len()..].trim_start_matches(['/', '\\']);
         Some(self.to.join(to_native_relative(rest)))
     }
+}
+
+fn parse_path_aliases(raw: &str) -> Vec<PathAlias> {
+    // `:` was the original Unix separator, despite Windows source paths also
+    // containing one. Preserve multi-entry values written in that form, but
+    // never split a drive prefix before its mapping's `=`.
+    let mut entries = Vec::new();
+    for semicolon_entry in raw.split(';') {
+        let mut start = 0;
+        let mut saw_equals = false;
+        for (index, character) in semicolon_entry.char_indices() {
+            match character {
+                '=' => saw_equals = true,
+                ':' if saw_equals && semicolon_entry[index + 1..].contains('=') => {
+                    entries.push(&semicolon_entry[start..index]);
+                    start = index + 1;
+                    saw_equals = false;
+                }
+                _ => {}
+            }
+        }
+        entries.push(&semicolon_entry[start..]);
+    }
+
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            // Split on the first `=`; a Windows prefix contains a colon,
+            // so `=` is the only safe separator within an entry.
+            let (from, to) = entry.split_once('=')?;
+            let (from, to) = (from.trim(), to.trim());
+            (!from.is_empty() && !to.is_empty()).then(|| PathAlias::new(from, to))
+        })
+        .collect()
 }
 
 /// An Ableton project folder on disk.
@@ -1071,8 +1103,20 @@ mod tests {
     fn path_aliases_should_parse_from_the_environment_format() {
         // Parsed directly rather than through the env var, so the test does
         // not depend on process-global state.
-        let alias = PathAlias::new("E:/Music Production", "/mnt/ssd/Music Production");
-        assert_eq!(alias.from, "E:/Music Production");
-        assert_eq!(alias.to, PathBuf::from("/mnt/ssd/Music Production"));
+        let aliases =
+            parse_path_aliases("E:/Music Production=/mnt/ssd/Music Production;D:\\Packs=/packs");
+        assert_eq!(aliases.len(), 2);
+        assert_eq!(aliases[0].from, "E:/Music Production");
+        assert_eq!(aliases[0].to, PathBuf::from("/mnt/ssd/Music Production"));
+        assert_eq!(aliases[1].from, "D:\\Packs");
+        assert_eq!(aliases[1].to, PathBuf::from("/packs"));
+    }
+
+    #[test]
+    fn legacy_colon_separated_path_aliases_should_still_parse() {
+        let aliases = parse_path_aliases("/old=/new:/another=/elsewhere");
+        assert_eq!(aliases.len(), 2);
+        assert_eq!(aliases[0], PathAlias::new("/old", "/new"));
+        assert_eq!(aliases[1], PathAlias::new("/another", "/elsewhere"));
     }
 }

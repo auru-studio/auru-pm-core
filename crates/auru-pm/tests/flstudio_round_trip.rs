@@ -26,7 +26,7 @@ fn utf16(text: &str) -> Vec<u8> {
 }
 
 /// A project exercising every kind of payload a real one contains.
-fn demo_project() -> Vec<u8> {
+fn fixture_project() -> Vec<u8> {
     Stream {
         header: Header {
             format: 0,
@@ -53,7 +53,7 @@ fn demo_project() -> Vec<u8> {
 
 #[test]
 fn a_project_should_be_recognised_by_its_contents_and_its_extension() {
-    let source = demo_project();
+    let source = fixture_project();
     assert_eq!(
         ProjectFormat::from_path(std::path::Path::new("Song.flp")),
         Some(ProjectFormat::FlStudio)
@@ -69,7 +69,7 @@ fn a_project_should_be_recognised_by_its_contents_and_its_extension() {
 fn commit_and_restore_should_return_the_original_bytes() {
     // No registration name in this project, so there is nothing to redact and
     // the result must be identical — the plain statement of the contract.
-    let source = demo_project();
+    let source = fixture_project();
     let snapshot =
         ProjectSnapshot::from_source_bytes(ProjectFormat::FlStudio, &source).expect("snapshot");
 
@@ -84,7 +84,7 @@ fn commit_and_restore_should_return_the_original_bytes() {
 fn a_snapshot_should_survive_the_trip_through_the_content_store() {
     // What actually happens on a push and pull: the canonical bytes are what
     // is stored, and the project is rebuilt from those alone.
-    let source = demo_project();
+    let source = fixture_project();
     let snapshot =
         ProjectSnapshot::from_source_bytes(ProjectFormat::FlStudio, &source).expect("snapshot");
 
@@ -100,7 +100,7 @@ fn round_trip_should_differ_only_in_the_redacted_reg_name() {
     // The single deliberate exception to byte-exactness. The registration name
     // identifies the FL licence holder and travels with every copy of a shared
     // project, so it is emptied on commit; FL writes a fresh one on save.
-    let mut stream = Stream::decode(&demo_project()).expect("decode");
+    let mut stream = Stream::decode(&fixture_project()).expect("decode");
     stream
         .events
         .insert(1, Event::new(EVENT_REG_NAME, utf16("ez:57h2vAv0@>=B>C;8")));
@@ -144,7 +144,7 @@ fn round_trip_should_differ_only_in_the_redacted_reg_name() {
 fn restoring_to_the_wrong_extension_should_be_refused() {
     // Writing a `.flp` where an `.als` is expected produces a file no DAW can
     // open, and the mistake would only surface when someone tried to work.
-    let snapshot = ProjectSnapshot::from_source_bytes(ProjectFormat::FlStudio, &demo_project())
+    let snapshot = ProjectSnapshot::from_source_bytes(ProjectFormat::FlStudio, &fixture_project())
         .expect("snapshot");
     let temp = tempfile::tempdir().expect("tempdir");
     assert!(
@@ -163,7 +163,7 @@ fn restoring_to_the_wrong_extension_should_be_refused() {
 fn a_truncated_project_should_be_refused_rather_than_committed() {
     // A desynchronised parse yields plausible nonsense; committing that would
     // store a corrupt project under a hash that claims to be the real one.
-    let mut source = demo_project();
+    let mut source = fixture_project();
     source.truncate(source.len() / 2);
     assert!(ProjectSnapshot::from_source_bytes(ProjectFormat::FlStudio, &source).is_err());
 }

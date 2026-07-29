@@ -49,6 +49,15 @@ pub struct Sidecar {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary: Option<String>,
 
+    /// Provider-scoped opaque project handles, keyed by provider id.
+    ///
+    /// A handle must survive local folder renames and mount-point changes.
+    /// Keeping it beside the project also means a project and its PM state can
+    /// move to another machine together without opening a second remote
+    /// history under a path-derived name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub provider_handles: std::collections::BTreeMap<String, String>,
+
     /// The commit id the local working state was last synced to.
     /// Compared against the primary's HEAD on open to decide whether
     /// a pull is needed.
@@ -186,6 +195,10 @@ mod tests {
 
         let mut sidecar = Sidecar {
             primary: Some("local-folder://foo".into()),
+            provider_handles: std::collections::BTreeMap::from([(
+                "local-folder://foo".into(),
+                "opaque-project-handle".into(),
+            )]),
             local_head: Some(head),
             ..Sidecar::default()
         };
@@ -201,6 +214,10 @@ mod tests {
 
         let loaded = Sidecar::load(&path).unwrap();
         assert_eq!(loaded, sidecar);
+        assert_eq!(
+            loaded.provider_handles.get("local-folder://foo"),
+            Some(&"opaque-project-handle".to_owned())
+        );
     }
 
     #[test]

@@ -651,6 +651,10 @@ async fn push_with_optional_resolutions(
 
     // Update sidecar: advance local_head, record remote state, queue failures.
     Sidecar::modify(sidecar_path, |s| {
+        // The successful destination becomes the source of truth for history
+        // and restore on this machine. Recording it here keeps every caller
+        // honest; a UI should not have to duplicate coordinator bookkeeping.
+        s.primary = Some(primary_id.to_owned());
         s.local_head = Some(commit_id);
         let state = s.remotes.entry(primary_id.to_owned()).or_default();
         state.remote_head = Some(commit_id);

@@ -150,6 +150,8 @@ impl SampleManifest {
 ///   project folders existed. `project_root` is not consulted.
 /// - **Ableton Live Set with a project folder** — the folder's contents plus
 ///   everything referenced from outside it, gathered in.
+/// - **FL Studio** — every sample referenced by the event stream, gathered
+///   into a `Samples/` folder for a self-contained restore.
 /// - **Anything else** — nothing. A loose `.als` has no folder to walk, and
 ///   DAWproject already embeds its media inside the snapshot.
 pub fn plan_assets(
@@ -163,6 +165,9 @@ pub fn plan_assets(
             None => Vec::new(),
         };
     }
+    if snapshot_format(snapshot) == Some(crate::ProjectFormat::FlStudio) {
+        return flstudio_assets_from_value(snapshot, policy);
+    }
     // Native: the manifest path stays the raw clip path, which keeps existing
     // commits and their ids byte-identical.
     sample_paths_in_snapshot(snapshot)
@@ -174,6 +179,39 @@ pub fn plan_assets(
             origin: None,
         })
         .collect()
+}
+
+fn snapshot_format(snapshot: &Value) -> Option<crate::ProjectFormat> {
+    serde_json::from_value(snapshot.get("format")?.clone()).ok()
+}
+
+/// Rebuild the redacted FL event stream carried by the canonical snapshot,
+/// then pass it through the same planner used for a project file on disk.
+///
+/// Planning remains best-effort like the Ableton path: a snapshot that cannot
+/// be reconstructed contributes no assets rather than making the project
+/// impossible to commit.
+fn flstudio_assets_from_value(snapshot: &Value, policy: &BundlePolicy) -> Vec<PlannedAsset> {
+    let source = serde_json::to_vec(snapshot)
+        .ok()
+        .and_then(|bytes| crate::ProjectSnapshot::from_canonical_bytes(&bytes).ok())
+        .and_then(|snapshot| snapshot.restore_bytes().ok());
+    let Some(source) = source else {
+        return Vec::new();
+    };
+    crate::flstudio::plan_bundle_assets(&source, &policy.path_aliases)
+        .map(|plan| {
+            plan.assets
+                .into_iter()
+                .map(|asset| PlannedAsset {
+                    source: asset.source,
+                    bundle_path: asset.bundle_path,
+                    kind: asset.kind,
+                    origin: Some(asset.origin),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Collect the distinct sample file paths referenced by a native Auru project
@@ -331,6 +369,51 @@ mod tests {
             "project": { "root": { "tag": "Ableton" } }
         });
         assert!(plan_assets(&snapshot, None, &BundlePolicy::default()).is_empty());
+    }
+
+    #[test]
+    fn plan_assets_should_dispatch_fl_projects_to_their_asset_planner() {
+        use crate::flstudio::events::{Event, Header, Stream};
+        use crate::flstudio::refs::EVENT_SAMPLE_PATH;
+        use crate::{ProjectFormat, ProjectSnapshot};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sample = temp.path().join("Kick.wav");
+        std::fs::write(&sample, b"audio").expect("write sample");
+
+        let mut encoded_path = Vec::new();
+        for unit in sample.to_string_lossy().encode_utf16() {
+            encoded_path.extend_from_slice(&unit.to_le_bytes());
+        }
+        encoded_path.extend_from_slice(&[0, 0]);
+        let source = Stream {
+            header: Header {
+                format: 0,
+                channels: 1,
+                ppq: 96,
+            },
+            events: vec![
+                Event::new(
+                    crate::flstudio::events::EVENT_VERSION,
+                    b"20.5.0.1142\0".to_vec(),
+                ),
+                Event::new(EVENT_SAMPLE_PATH, encoded_path),
+            ],
+        }
+        .encode();
+        let snapshot = ProjectSnapshot::from_source_bytes(ProjectFormat::FlStudio, &source)
+            .expect("normalize FL project");
+        let value: Value = serde_json::from_slice(snapshot.as_bytes()).expect("snapshot JSON");
+
+        let planned = plan_assets(&value, None, &BundlePolicy::default());
+
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].source, sample);
+        assert_eq!(planned[0].bundle_path, "Samples/Kick.wav");
+        assert_eq!(
+            planned[0].origin.as_deref(),
+            Some(sample.to_string_lossy().as_ref())
+        );
     }
 
     #[test]

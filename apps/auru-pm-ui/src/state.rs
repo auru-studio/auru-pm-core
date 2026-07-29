@@ -57,6 +57,14 @@ pub struct AppState {
     /// would eventually have Auru back a project up into itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_providers: Vec<PathBuf>,
+    /// Provider catalogue ids this machine has authenticated or explicitly
+    /// approved for no-auth access.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connected_providers: Vec<String>,
+    /// Default destination for a project's first backup. Once a project has a
+    /// sidecar, that project's own `primary` takes precedence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_provider: Option<String>,
     /// Projects added individually, outside any watched folder.
     pub projects: Vec<PathBuf>,
 }
@@ -75,6 +83,8 @@ impl Default for AppState {
             first_seen: BTreeMap::new(),
             watched_folders: Vec::new(),
             local_providers: Vec::new(),
+            connected_providers: Vec::new(),
+            primary_provider: None,
             projects: Vec::new(),
         }
     }
@@ -191,6 +201,25 @@ impl AppState {
         }
     }
 
+    pub fn connect_provider(&mut self, provider_id: &str) {
+        if !self
+            .connected_providers
+            .iter()
+            .any(|known| known == provider_id)
+        {
+            self.connected_providers.push(provider_id.to_owned());
+        }
+        if self.primary_provider.is_none() {
+            self.primary_provider = Some(provider_id.to_owned());
+        }
+    }
+
+    pub fn is_provider_connected(&self, provider_id: &str) -> bool {
+        self.connected_providers
+            .iter()
+            .any(|known| known == provider_id)
+    }
+
     /// Record when a project was first seen, and return that time.
     ///
     /// Called for every project on every library load, so a project keeps the
@@ -253,6 +282,7 @@ mod tests {
         };
         state.watch(Path::new("/music/Ableton Projects"));
         state.add_project(Path::new("/elsewhere/One Off Project"));
+        state.connect_provider("studio-nas");
         state.save_to(&path).expect("save");
 
         let loaded = AppState::load_from(&path);
@@ -260,6 +290,8 @@ mod tests {
         assert_eq!(loaded.appearance, "day");
         assert_eq!(loaded.watched_folders.len(), 1);
         assert_eq!(loaded.projects.len(), 1);
+        assert!(loaded.is_provider_connected("studio-nas"));
+        assert_eq!(loaded.primary_provider.as_deref(), Some("studio-nas"));
     }
 
     #[test]

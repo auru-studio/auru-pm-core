@@ -6,7 +6,7 @@
 
 use auru_pm::{
     AuthorIdentity, Cas, FilesystemProvider, ProjectProvider, ProjectSnapshot, PushOutcome,
-    collect_reachable, fetch_project_info, push_with_freshness_check, sidecar_path_for,
+    Sidecar, collect_reachable, fetch_project_info, push_with_freshness_check, sidecar_path_for,
 };
 use tempfile::TempDir;
 
@@ -60,6 +60,14 @@ async fn commit_project(
         panic!("a first commit cannot conflict");
     };
 
+    assert_eq!(
+        Sidecar::load(&sidecar)
+            .expect("load sidecar")
+            .primary
+            .as_deref(),
+        Some(provider.provider_id().as_str()),
+        "the coordinator records which provider now owns the history"
+    );
     let commit = provider.get_commit(&commit_id).await.expect("get commit");
     (root, provider, commit)
 }

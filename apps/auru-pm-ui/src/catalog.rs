@@ -149,6 +149,10 @@ impl ProviderListing {
         self.availability = ProviderAvailability::Connected;
     }
 
+    pub fn is_connected(&self) -> bool {
+        self.availability == ProviderAvailability::Connected
+    }
+
     /// What signing in to this provider will involve.
     pub fn auth_hint(&self) -> AuthHint {
         AuthHint::for_method(&self.preferred_auth_method())
@@ -237,10 +241,7 @@ impl ProviderListing {
 
     /// The folder behind a local destination.
     ///
-    /// The bridge to `FilesystemProvider` once pushing is wired up; until then
-    /// nothing in the app constructs a provider, so this has no caller outside
-    /// its tests. Kept because it is where that wiring attaches.
-    #[allow(dead_code)]
+    /// The bridge to `FilesystemProvider`.
     pub fn local_path(&self) -> Option<PathBuf> {
         self.entry
             .id
@@ -560,4 +561,3 @@ mod live_fetch {
         }
     }
 }
-

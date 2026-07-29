@@ -19,6 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider_id = "local-folder://fixture-provider".to_owned();
     let sidecar = Sidecar {
         primary: Some(provider_id.clone()),
+        provider_handles: BTreeMap::new(),
         local_head: Some(commit.id),
         remotes: BTreeMap::from([(
             provider_id,

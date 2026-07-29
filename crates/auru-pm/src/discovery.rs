@@ -1,13 +1,14 @@
 //! Finding projects on disk, whatever DAW made them.
 //!
-//! The two formats Auru reads have incompatible ideas of what a project *is*,
+//! The supported formats have incompatible ideas of what a project *is*,
 //! and the difference cannot be papered over:
 //!
 //! - An **Ableton** project is a folder. Whatever is inside belongs to it, so
 //!   the scan treats it as a leaf and never descends further.
-//! - An **FL Studio** project is a single `.flp` file with no folder of its
-//!   own. The directory containing it is not the project — one examined during
-//!   design sat in a downloads dump beside a thousand unrelated images.
+//! - **FL Studio**, **DAWproject**, and native **Auru** projects are standalone
+//!   files. The directory containing one is not the project — an `.flp`
+//!   examined during design sat in a downloads dump beside a thousand
+//!   unrelated images.
 //!
 //! Callers should not have to know which they are holding, so this module is
 //! the one place that does. Everything above it works in terms of
@@ -28,8 +29,11 @@ use crate::project_format::ProjectFormat;
 pub enum DiscoveredProject {
     /// A Live Set inside its project folder.
     Ableton(AbletonBundle),
-    /// A `.flp`, which stands alone.
-    FlStudio { project_file: PathBuf },
+    /// A project whose file is the whole project.
+    Standalone {
+        project_file: PathBuf,
+        format: ProjectFormat,
+    },
 }
 
 impl DiscoveredProject {
@@ -39,9 +43,10 @@ impl DiscoveredProject {
     /// Accepts a folder or a file, because both are things a person may
     /// reasonably drag in.
     pub fn detect(path: &Path) -> Result<Option<Self>> {
-        if is_flp(path) {
-            return Ok(Some(Self::FlStudio {
+        if let Some(format) = standalone_format(path) {
+            return Ok(Some(Self::Standalone {
                 project_file: path.to_path_buf(),
+                format,
             }));
         }
         Ok(AbletonBundle::detect(path)?.map(Self::Ableton))
@@ -51,7 +56,7 @@ impl DiscoveredProject {
     pub fn project_file(&self) -> &Path {
         match self {
             Self::Ableton(bundle) => bundle.live_set(),
-            Self::FlStudio { project_file } => project_file,
+            Self::Standalone { project_file, .. } => project_file,
         }
     }
 
@@ -64,7 +69,7 @@ impl DiscoveredProject {
     pub fn directory(&self) -> &Path {
         match self {
             Self::Ableton(bundle) => bundle.root(),
-            Self::FlStudio { project_file } => {
+            Self::Standalone { project_file, .. } => {
                 project_file.parent().unwrap_or_else(|| Path::new("."))
             }
         }
@@ -81,7 +86,7 @@ impl DiscoveredProject {
     pub const fn format(&self) -> ProjectFormat {
         match self {
             Self::Ableton(_) => ProjectFormat::AbletonLiveSet,
-            Self::FlStudio { .. } => ProjectFormat::FlStudio,
+            Self::Standalone { format, .. } => *format,
         }
     }
 
@@ -120,7 +125,7 @@ pub fn scan_for_projects(root: &Path, options: &ScanOptions) -> Vec<DiscoveredPr
     found
 }
 
-/// One walk finding both formats.
+/// One walk finding every supported format.
 ///
 /// Deliberately a single pass. Walking twice — once for folders, once for
 /// files — doubles the directory reads on a tree that is mostly sample packs,
@@ -152,19 +157,22 @@ fn scan_into(dir: &Path, depth: usize, options: &ScanOptions, found: &mut Vec<Di
     let mut directories = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if is_flp(&path) {
-            files.push(path);
+        if let Some(format) = standalone_format(&path) {
+            files.push((path, format));
         } else if is_scannable(&path) {
             directories.push(path);
         }
     }
-    files.sort();
+    files.sort_by(|(left, _), (right, _)| left.cmp(right));
     directories.sort();
 
     found.extend(
         files
             .into_iter()
-            .map(|project_file| DiscoveredProject::FlStudio { project_file }),
+            .map(|(project_file, format)| DiscoveredProject::Standalone {
+                project_file,
+                format,
+            }),
     );
     for child in directories {
         scan_into(&child, depth + 1, options, found);
@@ -199,15 +207,11 @@ fn is_scannable(path: &Path) -> bool {
     !name.eq_ignore_ascii_case("Backup")
 }
 
-fn is_flp(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case(flstudio_extension()))
-        && path.is_file()
-}
-
-const fn flstudio_extension() -> &'static str {
-    ProjectFormat::FlStudio.extension()
+fn standalone_format(path: &Path) -> Option<ProjectFormat> {
+    let format = ProjectFormat::from_path(path)?;
+    path.is_file()
+        .then_some(format)
+        .filter(|format| *format != ProjectFormat::AbletonLiveSet)
 }
 
 /// Read a project's headline detail, whatever format it is.
@@ -315,6 +319,22 @@ mod tests {
         assert_eq!(formats.len(), 2);
         assert!(formats.contains(&ProjectFormat::AbletonLiveSet));
         assert!(formats.contains(&ProjectFormat::FlStudio));
+    }
+
+    #[test]
+    fn a_scan_should_offer_dawproject_and_native_projects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("Open Exchange.dawproject"), b"fixture").expect("write");
+        fs::write(temp.path().join("Native.auru"), b"{}").expect("write");
+
+        let formats: Vec<ProjectFormat> = scan_for_projects(temp.path(), &ScanOptions::default())
+            .iter()
+            .map(DiscoveredProject::format)
+            .collect();
+
+        assert_eq!(formats.len(), 2);
+        assert!(formats.contains(&ProjectFormat::Dawproject));
+        assert!(formats.contains(&ProjectFormat::Auru));
     }
 
     #[test]

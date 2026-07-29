@@ -38,8 +38,10 @@ Auth methods (declared in `/v1/health`):
 Every endpoint that targets a project takes a `{handle}` path segment.
 Handles are provider-scoped and opaque to the client — e.g. the hosted
 provider uses `user/song-name`, a self-hosted server might use a UUID.
-The handle, alongside the provider id, is stored in the `.auru` project
-file's `project_management.known_providers` list.
+The handle, alongside the provider id, is stored in the project's PM sidecar
+under `provider_handles`. Keeping it out of the DAW file lets the same rule
+work for native and third-party project formats, while allowing the project
+and sidecar to move together without changing remote identity.
 
 ## Hash format
 

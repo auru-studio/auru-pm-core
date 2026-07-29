@@ -8,70 +8,81 @@ Verified against the tree on 2026-07-29. Items marked **verified** were
 confirmed by running code, not by reading it. Where a version or file format is
 described, it was read out of a real project rather than from documentation.
 
+## Implemented 2026-07-29
+
+- The desktop app now constructs per-project `FilesystemProvider` and
+  `HttpProvider` instances, calls `push_with_freshness_check` off the UI thread,
+  records the successful primary in the sidecar, and reports real completion
+  or conflict outcomes. The timer-based backup simulation is gone.
+- FL Studio commits now dispatch through `flstudio::plan_bundle_assets`; a
+  regression test proves a canonical FL snapshot produces a sample manifest.
+- Provider connections persist. PATs and OAuth tokens are stored in the OS
+  keychain, and OAuth uses the real device-code progress stream.
+- Provider-scoped project handles persist in the sidecar, so moving a project
+  and its sidecar does not create a second remote history.
+- Recent versions come from `list_history`, and Restore now fetches the selected
+  commit into a new folder without overwriting the working project. Native,
+  DAWproject, Ableton, and FL restore paths are wired; FL restore materialises
+  and repoints captured samples.
+- The operating system's registered DAW now handles Open Project.
+- Provider catalogue fetching uses `AURU_REGISTRY_URL`; the old stub catalogue
+  is gone.
+- Discovery now includes `.dawproject` and native `.auru` files.
+- `AURU_PATH_ALIASES` is the DAW-neutral environment variable;
+  `AURU_ABLETON_PATH_ALIASES` remains a compatibility fallback.
+- Production `DEMO` labels, routes, fake actions, and test-helper names were
+  removed. The premature recovery route and custom-provider CTA were removed
+  rather than claiming to work. The DAWproject oracle fixture still contains a
+  clip named `Demo`; that is inert test data inside the archive, not product UI.
+
 ---
 
-## 1. Blocking — nothing can actually be backed up
+## 1. Blocking — remaining product-loop gaps
 
-The whole product promise is unmet: the core can commit, merge, and restore,
-and is well tested doing so, but no path from the UI reaches it.
+Backup, local/known-project history, and restore are now reachable. The
+remaining blocker is discovering projects that exist only on a provider.
 
-### 1.1 The backup button is a timer, not a backup — **verified**
+### 1.1 Backup button — **resolved 2026-07-29**
 
-`back_up_all` ([main.rs:785](apps/auru-pm-ui/src/main.rs:785)) marks projects
-as syncing, waits `TRANSFER_DURATION`, and marks them done. No provider is
-contacted and no bytes move. The same is true of the per-project
-`↑ BACK UP CHANGES` action.
+Both single-project and Back Up All actions now run the real coordinator in the
+background. The row is marked in-flight until that operation returns; no timer
+advances it.
 
-Everything it needs already exists and is tested:
-`push_with_freshness_check` ([sync.rs:400](crates/auru-pm/src/sync.rs:400)),
-`FilesystemProvider`, `HttpProvider`, the integrity gate, and the stash-based
-conflict path.
+### 1.2 FL Studio sample commits — **resolved 2026-07-29**
 
-**Needed:** wire the UI action to `push_with_freshness_check`, run it off the
-UI thread, and drive the progress bar from real transfer state instead of a
-timer.
+`sample_manifest::plan_assets` reconstructs the FL stream and dispatches to
+`flstudio::plan_bundle_assets`. The UI backup/restore integration test proves
+the sample blob is captured, materialised, and repointed.
 
-### 1.2 FL Studio commits would store zero samples — **verified**
+### 1.3 Restore — **resolved for known projects 2026-07-29**
 
-`sample_manifest::plan_assets`
-([sample_manifest.rs:155](crates/auru-pm/src/sample_manifest.rs:155)) branches
-on Ableton and falls through to the native clip-path walk. An FL snapshot has
-no native clips, so it plans **0 assets** — confirmed by probe. Committing an FL
-project today would store the `.flp` and none of its audio, which is precisely
-the bug the Ableton work fixed, reproduced for FL.
+Recent-history rows restore their commit into a new folder. Recovery on a
+second machine remains blocked by the provider protocol having no project-list
+endpoint; see 4.
 
-`flstudio::plan_bundle_assets` exists and is tested; it is simply not called
-from the commit path.
+### 1.4 Provider construction — **resolved 2026-07-29**
 
-**Needed:** dispatch to it in `plan_assets`, and add a manifest test per format
-so a third DAW cannot repeat this.
-
-### 1.3 Restore is not reachable from the UI
-
-`ableton::restore_bundle` and `flstudio::restore::repoint` / `write_asset` are
-implemented and tested. Nothing in `apps/auru-pm-ui` calls either, so a project
-can never be brought back onto a second machine — the other half of the promise.
-
-### 1.4 No provider is ever constructed
-
-The UI never builds a `FilesystemProvider` or `HttpProvider`, never reads a
-sidecar's `primary`, and never writes one. Provider selection in Settings is
-display-only.
+The UI constructs both provider types, reads a project's sidecar primary,
+persists the primary after a successful commit, and persists each provider's
+opaque project handle. Adding a local folder connects it and makes it the
+default destination immediately.
 
 ---
 
 ## 2. Authentication and providers
 
-### 2.1 The provider catalogue is stubbed
+### 2.1 Provider catalogue — **resolved 2026-07-29**
 
-`stub_provider_catalog` ([catalog.rs:249](apps/auru-pm-ui/src/catalog.rs:249))
-supplies the list unless `--providers-file` is passed. There is no live fetch
-from `AURU_REGISTRY_URL` in the running app.
+The app fetches `AURU_REGISTRY_URL` in the background with a 24-hour cache;
+`--providers-file` remains the explicit override.
 
-### 2.2 OAuth and token storage are unwired
+### 2.2 OAuth and token storage — **resolved 2026-07-29**
 
-`oauth::start_device_flow` and the `token_store` module are implemented; no UI
-code references either. The Add-Provider flow collects a token and discards it.
+PAT and device-code OAuth tokens are stored as provider-account credentials in
+the OS keychain. Project-scoped credentials remain supported by the core.
+OAuth completion is confirmed by the provider. The protocol has no
+provider-wide PAT validation endpoint, so PAT copy now says honestly that the
+token will be checked by the first project request.
 
 ### 2.3 The reference server has no authentication
 
@@ -165,8 +176,8 @@ restores, but:
   vendored, the same class of gap as 1.2.
 - No plugin inventory.
 - No structured diff — falls through to the format-agnostic summary.
-- Not offered by discovery: `scan_for_projects` finds Ableton folders and
-  `.flp` files only, so a `.dawproject` can be added by hand but never found.
+- **Resolved 2026-07-29:** discovery now offers `.dawproject` files (and native
+  `.auru` files) alongside Ableton and FL projects.
 
 ### 3.4 Native `.auru` format
 
@@ -179,25 +190,31 @@ restores, but:
 
 ## 4. UI gaps
 
-- **Version history is always empty.** `Project.versions` is `&'static []` at
-  every construction site; `[ RECENT VERSIONS ]` and `VIEW FULL HISTORY →`
-  render against nothing. `list_history` exists on every provider.
-- **`syncing · 64%` is hardcoded** ([model.rs:925](apps/auru-pm-ui/src/model.rs:925)).
+- **Resolved 2026-07-29:** recent version history is populated from
+  `list_history`, and each row carries the real commit id used by Restore.
+- **Resolved 2026-07-29:** the hardcoded `syncing · 64%` value and timer-driven
+  progress were removed.
 - **Version retention does nothing.** The setting persists and is documented as
   display-only ([main.rs:146](apps/auru-pm-ui/src/main.rs:146)); no pruning runs.
   `Cas` GC (`collect_reachable`, `GcReport`) exists and is unused by the app.
 - **Onboarding is one step, not the designed three.** The provider-connection
   and folder-selection steps from `auru-pm-claude-design` are not built.
-- **Recovery mode is a route with no implementation behind it.**
-- **`SyncDirection::UpstreamAhead`, `ProjectStatus::{NotDownloaded, Conflicted}`
-  are `#[allow(dead_code)]`** — unreachable until a provider is connected. Their
-  screens are written; nothing can produce the states.
+- **New-machine recovery is not representable in the protocol.** Providers can
+  read history for a known project handle but cannot list a person's projects.
+  The premature Recovery route and promise to restore a whole library were
+  removed. Add a provider project-list endpoint before rebuilding this UI.
+- **`ProjectStatus::Conflicted` is now reachable** from a real coordinator
+  outcome, but the field-by-field resolver is still only a notification.
+  `SyncDirection::UpstreamAhead` is produced when refreshing a known project's
+  history, and Download Latest restores that head to a new folder.
+  `ProjectStatus::NotDownloaded` still needs provider project listing.
 - **Project status is inferred from modification time.** `ProjectStatus::read_from_disk`
   compares the project's mtime against the sidecar's, so it means "you have saved
   since your last backup" rather than "the contents differ". Documented, and
   errs toward offering a no-op backup — the harmless direction.
-- **Sorting by Last Modified (Remote) falls back to alphabetical**, because no
-  project has a backup time until 1.1 lands.
+- **Resolved for backups made by this app:** Last Modified (Remote) uses the
+  sidecar modification time after a successful backup. Remote refresh still
+  needs provider discovery.
 - **The FL import flow and detail page have never been used.** They compile,
   are unit-tested, and the app launches, but no one has clicked through them.
 
@@ -207,9 +224,8 @@ restores, but:
 
 - **Compressed uploads are never negotiated in practice.** `Capabilities::compressed_uploads`
   is implemented on both sides and defaults to false; no deployed provider sets it.
-- **`AURU_ABLETON_PATH_ALIASES` is still Ableton-named** although FL uses the
-  same mechanism. Plan called for a DAW-neutral `AURU_PATH_ALIASES` with the old
-  name kept as an alias; not yet done.
+- **Resolved 2026-07-29:** `AURU_PATH_ALIASES` is the primary name and
+  `AURU_ABLETON_PATH_ALIASES` remains a fallback.
 - **Path aliases have no UI.** Resolving a project saved on another machine
   requires setting an environment variable, which no musician will do. This is
   the difference between "your samples were found" and "10 files could not be
