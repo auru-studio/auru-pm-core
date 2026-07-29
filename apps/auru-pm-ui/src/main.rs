@@ -108,6 +108,47 @@ enum Overlay {
     ConflictResolver,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OverlayHost {
+    Main,
+    Settings,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OverlayState {
+    host: OverlayHost,
+    overlay: Overlay,
+}
+
+impl Default for OverlayState {
+    fn default() -> Self {
+        Self {
+            host: OverlayHost::Main,
+            overlay: Overlay::None,
+        }
+    }
+}
+
+impl OverlayState {
+    fn show(&mut self, host: OverlayHost, overlay: Overlay) {
+        debug_assert_ne!(overlay, Overlay::None);
+        self.host = host;
+        self.overlay = overlay;
+    }
+
+    fn replace(&mut self, overlay: Overlay) {
+        self.overlay = overlay;
+    }
+
+    fn clear(&mut self) {
+        self.overlay = Overlay::None;
+    }
+
+    fn visible_for(self, host: OverlayHost) -> Option<Overlay> {
+        (self.host == host && self.overlay != Overlay::None).then_some(self.overlay)
+    }
+}
+
 struct PendingConflict {
     project_id: String,
     project_name: String,
@@ -205,7 +246,7 @@ struct ProjectManager {
     list_scroll: UniformListScrollHandle,
     route: Route,
     onboarding_step: OnboardingStep,
-    overlay: Overlay,
+    overlay: OverlayState,
     display_name: String,
     display_name_input: Entity<InputState>,
     search_input: Entity<InputState>,
@@ -395,7 +436,7 @@ impl ProjectManager {
             list_scroll: UniformListScrollHandle::default(),
             route: initial_route,
             onboarding_step: OnboardingStep::Profile,
-            overlay: Overlay::None,
+            overlay: OverlayState::default(),
             display_name: state.display_name.clone(),
             display_name_input,
             search_input,
@@ -1084,7 +1125,8 @@ impl ProjectManager {
                     .as_ref()
                     .is_some_and(|pending| pending.project_id == project.id)
                 {
-                    self.overlay = Overlay::ConflictResolver;
+                    self.overlay
+                        .show(OverlayHost::Main, Overlay::ConflictResolver);
                     cx.notify();
                 } else {
                     window.push_notification(
@@ -1119,7 +1161,8 @@ impl ProjectManager {
             return;
         };
         let Some(provider) = self.backup_destination_for(&project_path) else {
-            self.overlay = Overlay::ProviderPicker;
+            self.overlay
+                .show(OverlayHost::Main, Overlay::ProviderPicker);
             window.push_notification(
                 Notification::warning("Connect a provider or add a local backup folder first.")
                     .title("Choose where backups live"),
@@ -1296,7 +1339,8 @@ impl ProjectManager {
                             choices: vec![ConflictChoice::Local; conflict_count],
                             backup: conflict,
                         });
-                        this.overlay = Overlay::ConflictResolver;
+                        this.overlay
+                            .show(OverlayHost::Main, Overlay::ConflictResolver);
                         window.push_notification(
                             Notification::warning(format!(
                                 "{conflict_count} conflicting field(s) need a choice before anything is committed."
@@ -1577,6 +1621,7 @@ impl ProjectManager {
     fn select_provider(
         &mut self,
         provider_index: usize,
+        overlay_host: OverlayHost,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1590,12 +1635,15 @@ impl ProjectManager {
             self.credential_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
             self.auth_phase = AuthPhase::Ready;
-            self.overlay = Overlay::Authenticate { provider_index };
+            self.overlay.show(
+                overlay_host,
+                Overlay::Authenticate { provider_index },
+            );
         } else {
             let provider_name = self
                 .mark_provider_connected(provider_index)
                 .unwrap_or(fallback_name);
-            self.overlay = Overlay::None;
+            self.overlay.clear();
             window.push_notification(
                 Notification::success("No sign-in was requested by this provider.")
                     .title(format!("{provider_name} connected")),
@@ -1807,7 +1855,7 @@ impl ProjectManager {
             return;
         };
 
-        self.overlay = Overlay::None;
+        self.overlay.clear();
         self.auth_phase = AuthPhase::Ready;
         self.refresh_remote_projects(cx);
         window.push_notification(
@@ -1819,7 +1867,7 @@ impl ProjectManager {
 
     fn cancel_provider_auth(&mut self, cx: &mut Context<Self>) {
         self.auth_phase = AuthPhase::Ready;
-        self.overlay = Overlay::ProviderPicker;
+        self.overlay.replace(Overlay::ProviderPicker);
         cx.notify();
     }
 
@@ -2131,7 +2179,7 @@ impl ProjectManager {
         sort_projects(&mut self.projects, sort_order);
         self.selected_project = 0;
         self.route = Route::Library;
-        self.overlay = Overlay::None;
+        self.overlay.clear();
         self.refresh_remote_projects(cx);
 
         let found = self.projects.len();
@@ -2384,7 +2432,7 @@ impl ProjectManager {
             .cursor_pointer()
             .items_center()
             .gap_3()
-            .border_1()
+            .border_l_2()
             .border_color(if selected { color } else { bg() })
             .bg(if selected { selection() } else { bg() })
             .px_5()
@@ -2945,7 +2993,8 @@ impl ProjectManager {
                                 .text_color(green())
                                 .hover(|this| this.bg(selection()))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.overlay = Overlay::ProviderPicker;
+                                    this.overlay
+                                        .show(OverlayHost::Main, Overlay::ProviderPicker);
                                     cx.notify();
                                 }))
                                 .child(if connected == 0 {
@@ -3297,7 +3346,9 @@ impl ProjectManager {
                 self.providers
                     .iter()
                     .enumerate()
-                    .map(|(index, provider)| self.render_settings_provider(index, provider)),
+                    .map(|(index, provider)| {
+                        self.render_settings_provider(index, provider, cx)
+                    }),
             )
             .child(
                 div()
@@ -3313,7 +3364,8 @@ impl ProjectManager {
                     .text_color(faint())
                     .hover(|this| this.border_color(green()).text_color(green()))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.overlay = Overlay::ProviderPicker;
+                        this.overlay
+                            .show(OverlayHost::Settings, Overlay::ProviderPicker);
                         cx.notify();
                     }))
                     .child("＋ ADD ANOTHER PROVIDER FROM THE CATALOG…"),
@@ -3443,9 +3495,15 @@ impl ProjectManager {
             .into_any_element()
     }
 
-    fn render_settings_provider(&self, _index: usize, provider: &ProviderListing) -> AnyElement {
+    fn render_settings_provider(
+        &self,
+        index: usize,
+        provider: &ProviderListing,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let connected = provider.availability == ProviderAvailability::Connected;
-        div()
+        let mut row = div()
+            .id(format!("settings-provider-{}", provider.entry.id))
             .flex()
             .min_h(px(54.0))
             .items_center()
@@ -3504,8 +3562,18 @@ impl ProjectManager {
                     .text_size(px(8.0))
                     .text_color(if connected { green() } else { faint() })
                     .child(provider.availability.label()),
-            )
-            .into_any_element()
+            );
+
+        if !connected {
+            row = row
+                .cursor_pointer()
+                .hover(|this| this.border_color(green()).bg(selection()))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.select_provider(index, OverlayHost::Settings, window, cx);
+                }));
+        }
+
+        row.into_any_element()
     }
 
     fn render_conflict_resolver(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -3579,7 +3647,7 @@ impl ProjectManager {
                                 .text_color(faint())
                                 .hover(|this| this.text_color(bright()))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.overlay = Overlay::None;
+                                    this.overlay.clear();
                                     cx.notify();
                                 }))
                                 .child("×"),
@@ -3685,7 +3753,7 @@ impl ProjectManager {
                                 .text_color(faint())
                                 .hover(|this| this.text_color(bright()))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.overlay = Overlay::None;
+                                    this.overlay.clear();
                                     cx.notify();
                                 }))
                                 .child("NOT NOW"),
@@ -3728,7 +3796,7 @@ impl ProjectManager {
             project.status = ProjectStatus::Syncing;
             project.sync_progress = 0.0;
         }
-        self.overlay = Overlay::None;
+        self.overlay.clear();
         cx.notify();
 
         let resolution = cx
@@ -3771,7 +3839,8 @@ impl ProjectManager {
                             choices: vec![ConflictChoice::Local; count],
                             backup: conflict,
                         });
-                        this.overlay = Overlay::ConflictResolver;
+                        this.overlay
+                            .show(OverlayHost::Main, Overlay::ConflictResolver);
                         window.push_notification(
                             Notification::warning(
                                 "The provider changed again. Review the refreshed fields.",
@@ -3822,7 +3891,11 @@ impl ProjectManager {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render_provider_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_provider_picker(
+        &self,
+        overlay_host: OverlayHost,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let provider_rows = self.providers.iter().enumerate().map(|(index, provider)| {
             let connected = provider.availability == ProviderAvailability::Connected;
             let requires_auth = provider.requires_authentication();
@@ -3878,7 +3951,7 @@ impl ProjectManager {
                     .cursor_pointer()
                     .hover(|this| this.border_color(green()).bg(selection()))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.select_provider(index, window, cx);
+                        this.select_provider(index, overlay_host, window, cx);
                     }));
             }
             row.into_any_element()
@@ -3912,7 +3985,8 @@ impl ProjectManager {
                             .text_color(faint())
                             .hover(|this| this.text_color(bright()))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.open_settings(cx);
+                                this.overlay.clear();
+                                cx.notify();
                             }))
                             .child("×"),
                     ),
@@ -4312,6 +4386,33 @@ impl ProjectManager {
 
         overlay_backdrop(panel)
     }
+
+    fn render_overlay(
+        &self,
+        overlay_host: OverlayHost,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        match self.overlay.visible_for(overlay_host)? {
+            Overlay::None => None,
+            Overlay::ProviderPicker => Some(self.render_provider_picker(overlay_host, cx)),
+            Overlay::Authenticate { provider_index } => {
+                Some(self.render_authentication(provider_index, cx))
+            }
+            Overlay::ConflictResolver => Some(self.render_conflict_resolver(cx)),
+        }
+    }
+
+    fn settings_window_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let content = self.settings_component(cx);
+        let overlay = self.render_overlay(OverlayHost::Settings, cx);
+
+        div()
+            .relative()
+            .size_full()
+            .child(content)
+            .children(overlay)
+            .into_any_element()
+    }
 }
 
 impl Render for ProjectManager {
@@ -4321,14 +4422,7 @@ impl Render for ProjectManager {
             Route::Onboarding => self.render_onboarding(cx),
         };
 
-        let overlay = match self.overlay {
-            Overlay::None => None,
-            Overlay::ProviderPicker => Some(self.render_provider_picker(cx)),
-            Overlay::Authenticate { provider_index } => {
-                Some(self.render_authentication(provider_index, cx))
-            }
-            Overlay::ConflictResolver => Some(self.render_conflict_resolver(cx)),
-        };
+        let overlay = self.render_overlay(OverlayHost::Main, cx);
 
         div()
             .track_focus(&self.focus_handle)
@@ -4550,6 +4644,47 @@ mod cli_tests {
 
     fn parse(args: &[&str]) -> Startup {
         Options::from_args(args.iter().map(|arg| (*arg).to_owned()))
+    }
+
+    #[test]
+    fn settings_provider_overlays_should_only_render_in_settings() {
+        let mut overlay = OverlayState::default();
+        overlay.show(OverlayHost::Settings, Overlay::ProviderPicker);
+
+        assert_eq!(
+            overlay.visible_for(OverlayHost::Settings),
+            Some(Overlay::ProviderPicker)
+        );
+        assert_eq!(overlay.visible_for(OverlayHost::Main), None);
+    }
+
+    #[test]
+    fn provider_authentication_should_stay_with_the_window_that_opened_it() {
+        let mut overlay = OverlayState::default();
+        overlay.show(OverlayHost::Settings, Overlay::ProviderPicker);
+        overlay.replace(Overlay::Authenticate { provider_index: 2 });
+
+        assert_eq!(
+            overlay.visible_for(OverlayHost::Settings),
+            Some(Overlay::Authenticate { provider_index: 2 })
+        );
+        assert_eq!(overlay.visible_for(OverlayHost::Main), None);
+
+        overlay.replace(Overlay::ProviderPicker);
+        assert_eq!(
+            overlay.visible_for(OverlayHost::Settings),
+            Some(Overlay::ProviderPicker)
+        );
+    }
+
+    #[test]
+    fn clearing_an_overlay_should_hide_it_from_its_window() {
+        let mut overlay = OverlayState::default();
+        overlay.show(OverlayHost::Main, Overlay::ConflictResolver);
+        overlay.clear();
+
+        assert_eq!(overlay.visible_for(OverlayHost::Main), None);
+        assert_eq!(overlay.visible_for(OverlayHost::Settings), None);
     }
 
     #[test]
@@ -5004,7 +5139,7 @@ impl Render for SettingsWindow {
             .font_family(MONO_FONT)
             .bg(bg())
             .text_color(ink())
-            .child(manager.update(cx, |manager, cx| manager.settings_component(cx)))
+            .child(manager.update(cx, |manager, cx| manager.settings_window_content(cx)))
     }
 }
 
