@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::hash::ContentHash;
 use crate::provider::{
     Capabilities, HeadAdvance, Member, PermSet, ProjectProfile, ProjectProvider, ProviderProject,
-    UserId,
+    RetentionReport, RetentionRoots, RetentionRule, UserId,
 };
 
 /// Gzip `bytes`, or `None` if the encoder failed — in which case the caller
@@ -460,6 +460,32 @@ impl ProjectProvider for HttpProvider {
             .map_err(|error| Error::Network(error.to_string()))?;
         check_resp(resp).await?;
         Ok(())
+    }
+
+    async fn prune_history(
+        &self,
+        rule: RetentionRule,
+        protected: &RetentionRoots,
+    ) -> Result<RetentionReport> {
+        if !self.caps.history_retention {
+            return Err(Error::Unsupported("history retention"));
+        }
+        let request = auru_pm_protocol::RetentionRequest {
+            rule,
+            protected_commits: protected.commits.clone(),
+            protected_blobs: protected.blobs.clone(),
+        };
+        let resp = self
+            .client
+            .post(self.project_url("retention"))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|error| Error::Network(error.to_string()))?;
+        let resp = check_resp(resp).await?;
+        resp.json()
+            .await
+            .map_err(|error| Error::Other(format!("prune_history parse: {error}")))
     }
 
     async fn list_members(&self) -> Result<Vec<Member>> {

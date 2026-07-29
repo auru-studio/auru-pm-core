@@ -278,6 +278,9 @@ mod tests {
         let mut state = AppState {
             display_name: "Jake".to_owned(),
             appearance: "day".to_owned(),
+            automatic_backups: false,
+            verify_uploads: false,
+            version_retention: "last-fifty".to_owned(),
             ..AppState::default()
         };
         state.watch(Path::new("/music/Ableton Projects"));
@@ -288,9 +291,13 @@ mod tests {
         let loaded = AppState::load_from(&path);
         assert_eq!(loaded.display_name, "Jake");
         assert_eq!(loaded.appearance, "day");
+        assert!(!loaded.automatic_backups);
+        assert!(!loaded.verify_uploads);
+        assert_eq!(loaded.version_retention, "last-fifty");
         assert_eq!(loaded.watched_folders.len(), 1);
         assert_eq!(loaded.projects.len(), 1);
         assert!(loaded.is_provider_connected("studio-nas"));
+        assert_eq!(loaded.connected_providers, vec!["studio-nas"]);
         assert_eq!(loaded.primary_provider.as_deref(), Some("studio-nas"));
     }
 

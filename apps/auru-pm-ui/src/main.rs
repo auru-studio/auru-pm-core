@@ -6,9 +6,9 @@ mod state;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use auru_pm::{AURU_REGISTRY_URL, AuthMethod, OAuthProgress};
+use auru_pm::{AURU_REGISTRY_URL, AuthMethod, OAuthProgress, RetentionRule};
 use gpui::{
     Anchor, AnyElement, App, Bounds, Context, Div, ElementId, Entity, FocusHandle, FontWeight,
     Hsla, InteractiveElement, Interactivity, IntoElement, ParentElement, Render, RenderOnce,
@@ -77,11 +77,7 @@ enum AuthPhase {
     Failed(String),
 }
 
-/// How much version history to keep.
-///
-/// Nothing prunes yet — this records the intent so the setting is real state
-/// rather than a decorative control, and so whatever implements pruning has a
-/// value to read.
+/// How much version history to keep after each successful backup.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum VersionRetention {
     #[default]
@@ -116,6 +112,17 @@ impl VersionRetention {
             .find(|option| option.key() == key)
             .unwrap_or_default()
     }
+
+    fn rule_at(self, now: i64) -> Option<RetentionRule> {
+        const YEAR_SECONDS: i64 = 365 * 24 * 60 * 60;
+        match self {
+            Self::Everything => None,
+            Self::LastYear => Some(RetentionRule::Since {
+                timestamp: now.saturating_sub(YEAR_SECONDS),
+            }),
+            Self::LastFifty => Some(RetentionRule::Latest { count: 50 }),
+        }
+    }
 }
 
 struct ProjectManager {
@@ -138,7 +145,7 @@ struct ProjectManager {
     auth_phase: AuthPhase,
     automatic_backups: bool,
     verify_uploads: bool,
-    /// How much history to keep. Display-only for now — nothing prunes yet.
+    /// How much history providers keep after successful backups.
     version_retention: VersionRetention,
     appearance: Appearance,
     /// What Auru remembers between launches.
@@ -314,9 +321,9 @@ impl ProjectManager {
             providers,
             catalog_state,
             auth_phase: AuthPhase::Ready,
-            automatic_backups: true,
-            verify_uploads: true,
-            version_retention: VersionRetention::Everything,
+            automatic_backups: state.automatic_backups,
+            verify_uploads: state.verify_uploads,
+            version_retention: VersionRetention::from_key(&state.version_retention),
             appearance: Appearance::from_key(&state.appearance),
             state,
             settings_window: None,
@@ -903,6 +910,11 @@ impl ProjectManager {
         let project_id = project.id.clone();
         let project_name = project.name.clone();
         let display_name = self.display_name.clone();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or_default();
+        let retention_rule = self.version_retention.rule_at(now);
         let Some(project) = self.projects.get_mut(index) else {
             return;
         };
@@ -914,9 +926,9 @@ impl ProjectManager {
         // than inventing a percentage.
         cx.notify();
 
-        let backup = cx
-            .background_executor()
-            .spawn(async move { backend::back_up(provider, project_path, display_name) });
+        let backup = cx.background_executor().spawn(async move {
+            backend::back_up(provider, project_path, display_name, retention_rule)
+        });
         cx.spawn_in(window, async move |this, cx| {
             let result = backup.await;
             _ = this.update_in(cx, |this, window, cx| {
@@ -928,10 +940,31 @@ impl ProjectManager {
                     return;
                 };
                 match result {
-                    Ok(backend::BackupResult::Committed(history)) => {
-                        project.finish_transfer(history);
+                    Ok(backend::BackupResult::Committed(receipt)) => {
+                        let detail = if let Some(warning) = receipt.retention_warning {
+                            format!("Project bytes and history were stored. {warning}.")
+                        } else if let Some(report) = receipt
+                            .retention
+                            .filter(|report| report.versions_removed > 0)
+                        {
+                            if report.bytes_freed > 0 {
+                                format!(
+                                    "Project stored. Removed {} old version(s) and freed {}.",
+                                    report.versions_removed,
+                                    format_bytes(report.bytes_freed)
+                                )
+                            } else {
+                                format!(
+                                    "Project stored. Removed {} old version(s).",
+                                    report.versions_removed
+                                )
+                            }
+                        } else {
+                            "Project bytes and history were stored.".to_owned()
+                        };
+                        project.finish_transfer(receipt.history);
                         window.push_notification(
-                            Notification::success("Project bytes and history were stored.")
+                            Notification::success(detail)
                                 .title(format!("{project_name} backed up")),
                             cx,
                         );
@@ -2481,7 +2514,11 @@ impl ProjectManager {
                             "Back up automatically after changes",
                             switch(
                                 |this| this.automatic_backups,
-                                |this, value| this.automatic_backups = value,
+                                |this, value| {
+                                    this.automatic_backups = value;
+                                    this.state.automatic_backups = value;
+                                    this.state.save();
+                                },
                             ),
                         )
                         .description("Waits for five quiet minutes, then copies in the background")
@@ -2492,7 +2529,11 @@ impl ProjectManager {
                             "Verify every copy after upload",
                             switch(
                                 |this| this.verify_uploads,
-                                |this, value| this.verify_uploads = value,
+                                |this, value| {
+                                    this.verify_uploads = value;
+                                    this.state.verify_uploads = value;
+                                    this.state.save();
+                                },
                             ),
                         )
                         .description(
@@ -2520,12 +2561,17 @@ impl ProjectManager {
                                 move |value: SharedString, cx: &mut App| {
                                     write_handle.update(cx, |this, cx| {
                                         this.version_retention = VersionRetention::from_key(&value);
+                                        this.state.version_retention =
+                                            this.version_retention.key().to_owned();
+                                        this.state.save();
                                         cx.notify();
                                     });
                                 },
                             )
                         })
-                        .description("How much history to keep")
+                        .description(
+                            "Applied after each successful backup; removed versions cannot be restored",
+                        )
                         .keywords(["history", "versions", "prune"]),
                     ),
             );
@@ -3702,6 +3748,21 @@ mod cli_tests {
         assert_eq!(
             VersionRetention::from_key("something-else"),
             VersionRetention::Everything
+        );
+    }
+
+    #[test]
+    fn retention_options_should_translate_to_provider_rules() {
+        assert_eq!(VersionRetention::Everything.rule_at(2_000_000_000), None);
+        assert_eq!(
+            VersionRetention::LastFifty.rule_at(2_000_000_000),
+            Some(auru_pm::RetentionRule::Latest { count: 50 })
+        );
+        assert_eq!(
+            VersionRetention::LastYear.rule_at(2_000_000_000),
+            Some(auru_pm::RetentionRule::Since {
+                timestamp: 1_968_464_000
+            })
         );
     }
 

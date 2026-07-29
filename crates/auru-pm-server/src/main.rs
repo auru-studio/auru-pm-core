@@ -11,7 +11,10 @@ use std::env;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use auru_pm_protocol::{ProjectProfile, ProjectsResponse, ProviderProject, WIRE_VERSION};
+use auru_pm_protocol::{
+    ProjectProfile, ProjectsResponse, ProviderProject, RetentionReport, RetentionRequest,
+    WIRE_VERSION,
+};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -34,6 +37,7 @@ struct Db {
 #[derive(Default)]
 struct StoredProject {
     head: Option<String>,
+    history_floor: Option<String>,
     profile: Option<ProjectProfile<String>>,
     updated_at: i64,
 }
@@ -74,7 +78,8 @@ async fn get_health() -> impl IntoResponse {
             "auth_methods": ["none"],
             // Blob uploads may arrive gzipped; the decompression layer on the
             // router unwraps them before the handler sees the body.
-            "compressed_uploads": true
+            "compressed_uploads": true,
+            "history_retention": true
         }
     }))
 }
@@ -206,6 +211,10 @@ async fn get_history(
         .projects
         .get(&handle)
         .and_then(|project| project.head.clone());
+    let floor = db
+        .projects
+        .get(&handle)
+        .and_then(|project| project.history_floor.clone());
 
     while let Some(id) = cursor {
         let commit_val = match db.commits.get(&id) {
@@ -233,6 +242,9 @@ async fn get_history(
         } else if Some(&id) == q.before.as_ref() {
             started = true;
         }
+        if Some(&id) == floor.as_ref() {
+            break;
+        }
         // Walk first parent.
         cursor = commit_val
             .get("parents")
@@ -243,6 +255,65 @@ async fn get_history(
     }
 
     Json(json!({ "commits": out }))
+}
+
+async fn post_retention(
+    State(db): State<SharedDb>,
+    Path(handle): Path<String>,
+    Json(request): Json<RetentionRequest<String, String>>,
+) -> Response {
+    let mut db = db.lock().unwrap();
+    let Some(project) = db.projects.get(&handle) else {
+        return not_found(&format!("project {handle}"));
+    };
+    let mut cursor = project.head.clone();
+    let current_floor = project.history_floor.clone();
+    let mut history = Vec::new();
+    while let Some(id) = cursor {
+        let Some(commit) = db.commits.get(&id) else {
+            break;
+        };
+        let timestamp = commit
+            .get("timestamp")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        history.push((id.clone(), timestamp));
+        if Some(&id) == current_floor.as_ref() {
+            break;
+        }
+        cursor = commit
+            .get("parents")
+            .and_then(Value::as_array)
+            .and_then(|parents| parents.first())
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+    }
+
+    let retained_len = request
+        .rule
+        .retained_prefix_len(history.iter().map(|(_, timestamp)| *timestamp));
+    let Some(new_floor) = retained_len
+        .checked_sub(1)
+        .and_then(|index| history.get(index))
+        .map(|(id, _)| id.clone())
+    else {
+        return Json(RetentionReport::default()).into_response();
+    };
+    let versions_removed = history.len().saturating_sub(retained_len);
+    db.projects
+        .get_mut(&handle)
+        .expect("project was checked above")
+        .history_floor = Some(new_floor);
+
+    Json(RetentionReport {
+        versions_removed: versions_removed as u64,
+        // The development server has a process-global CAS. A production
+        // provider can reclaim objects asynchronously once no project needs
+        // them; this conformance server only enforces the history boundary.
+        objects_removed: 0,
+        bytes_freed: 0,
+    })
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -301,6 +372,7 @@ async fn main() {
         .route("/v1/projects/:handle/commits", post(post_commit))
         .route("/v1/projects/:handle/commits/:id", get(get_commit))
         .route("/v1/projects/:handle/history", get(get_history))
+        .route("/v1/projects/:handle/retention", post(post_retention))
         .route("/v1/blobs/has", post(post_blobs_has))
         .route("/v1/blobs/:hash", put(put_blob).get(get_blob))
         // Unwrap `Content-Encoding: gzip` request bodies before they reach a
@@ -318,4 +390,57 @@ async fn main() {
     axum::serve(listener, app)
         .await
         .expect("HTTP server should run until shutdown");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use auru_pm_protocol::RetentionRule;
+
+    #[tokio::test]
+    async fn retention_should_move_the_project_history_floor() {
+        let db: SharedDb = Arc::new(Mutex::new(Db::default()));
+        {
+            let mut db = db.lock().unwrap();
+            db.commits
+                .insert("first".into(), json!({ "parents": [], "timestamp": 100 }));
+            db.commits.insert(
+                "second".into(),
+                json!({ "parents": ["first"], "timestamp": 200 }),
+            );
+            db.commits.insert(
+                "third".into(),
+                json!({ "parents": ["second"], "timestamp": 300 }),
+            );
+            db.projects.insert(
+                "song".into(),
+                StoredProject {
+                    head: Some("third".into()),
+                    ..StoredProject::default()
+                },
+            );
+        }
+
+        let response = post_retention(
+            State(db.clone()),
+            Path("song".into()),
+            Json(RetentionRequest {
+                rule: RetentionRule::Latest { count: 2 },
+                protected_commits: Vec::new(),
+                protected_blobs: Vec::new(),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            db.lock()
+                .unwrap()
+                .projects
+                .get("song")
+                .and_then(|project| project.history_floor.as_deref())
+                .map(str::to_owned),
+            Some("second".to_owned())
+        );
+    }
 }

@@ -86,6 +86,7 @@ Public. Returns provider metadata.
     "permissions": true,
     "branches": false,
     "server_side_merge": false,
+    "history_retention": true,
     "auth_methods": ["oauth_device_code"]
   }
 }
@@ -180,6 +181,46 @@ Response: array of [`CommitSummary`](./commit.rs).
 ```json
 { "commits": [ { "id": "blake3:...", "parents": [...], "author": {...}, ... } ] }
 ```
+
+### `POST /v1/projects/{handle}/retention` *(capability: `history_retention`)*
+
+Permanently moves the oldest visible-history boundary. HEAD is always kept.
+Keeping every version means not calling this endpoint; removed versions cannot
+be restored by changing a later preference.
+
+Keep the newest version count:
+
+```json
+{
+  "rule": { "policy": "latest", "count": 50 },
+  "protected_commits": ["blake3:..."],
+  "protected_blobs": ["blake3:..."]
+}
+```
+
+Or keep the connected newest-first prefix through the oldest commit at or
+after a Unix timestamp:
+
+```json
+{
+  "rule": { "policy": "since", "timestamp": 1722225600 },
+  "protected_commits": [],
+  "protected_blobs": []
+}
+```
+
+The protected roots carry in-flight client work such as queued mirror commits
+and a pre-merge stash. Providers must preserve them even when they are older
+than the new visible-history boundary.
+
+Response:
+
+```json
+{ "versions_removed": 12, "objects_removed": 35, "bytes_freed": 1048576 }
+```
+
+`objects_removed` and `bytes_freed` may be zero when the provider uses a grace
+period or asynchronous garbage collection.
 
 ### `POST /v1/blobs/has`
 

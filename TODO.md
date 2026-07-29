@@ -34,6 +34,12 @@ described, it was read out of a real project rather than from documentation.
 - Discovery now includes `.dawproject` and native `.auru` files.
 - `AURU_PATH_ALIASES` is the DAW-neutral environment variable;
   `AURU_ABLETON_PATH_ALIASES` remains a compatibility fallback.
+- Version retention now runs after successful backups. Filesystem and HTTP
+  providers expose a capability-gated retention operation; local repositories
+  truncate visible history and garbage-collect unreachable commit and project
+  objects, while hosted providers can enforce and collect with their own grace
+  policy. The desktop persists the preference and reports pruning failures
+  without misreporting the already-successful backup as failed.
 - Production `DEMO` labels, routes, fake actions, and test-helper names were
   removed. The premature recovery route and custom-provider CTA were removed
   rather than claiming to work. The DAWproject oracle fixture still contains a
@@ -200,9 +206,25 @@ restores, but:
   `list_history`, and each row carries the real commit id used by Restore.
 - **Resolved 2026-07-29:** the hardcoded `syncing · 64%` value and timer-driven
   progress were removed.
-- **Version retention does nothing.** The setting persists and is documented as
-  display-only ([main.rs:146](apps/auru-pm-ui/src/main.rs:146)); no pruning runs.
-  `Cas` GC (`collect_reachable`, `GcReport`) exists and is unused by the app.
+- **Resolved 2026-07-29:** version retention is applied after every successful
+  backup. “Last 50” and “last year” move a permanent provider-side history
+  boundary; filesystem providers also garbage-collect unreachable commit,
+  snapshot, metadata, manifest, and sample objects after a one-hour safety
+  window. Merge ancestry, queued mirror commits, and stashed blobs are explicit
+  GC roots, and HEAD publication is locked against collection. HTTP providers
+  negotiate the `history_retention` capability and use
+  `POST /v1/projects/{handle}/retention`. The UI persists all three backup
+  settings and reports unsupported providers or pruning failures separately
+  from backup success.
+- **Automatic backups are still a preference without a scheduler.** The
+  setting now survives restarts, but nothing watches project files, waits for
+  the advertised five quiet minutes, or calls the backup coordinator. Until
+  that watcher exists, the switch must not be mistaken for automatic
+  protection.
+- **“Verify every copy after upload” does not re-read uploads.** The preference
+  now survives restarts, and providers validate hashes at their normal trust
+  boundaries, but the desktop does not perform the explicit post-upload
+  download-and-compare pass promised by the setting copy.
 - **Onboarding is one step, not the designed three.** The provider-connection
   and folder-selection steps from `auru-pm-claude-design` are not built.
 - **Resolved 2026-07-29:** the `project_listing` capability adds

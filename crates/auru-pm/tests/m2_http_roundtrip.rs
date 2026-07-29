@@ -18,8 +18,8 @@ use serde_json::{Value, json};
 
 use auru_pm::{
     AuthorIdentity, Commit, CommitId, ContentHash, HeadAdvance, HistoryRange, HttpAccount,
-    HttpProvider, ProjectFormat, ProjectProfile, ProjectProvider, RemoteState, SampleManifest,
-    Sidecar, TreeRef, compute_commit_id, sidecar_path_for,
+    HttpProvider, ProjectFormat, ProjectProfile, ProjectProvider, RemoteState, RetentionRule,
+    SampleManifest, Sidecar, TreeRef, compute_commit_id, sidecar_path_for,
 };
 use tempfile::TempDir;
 
@@ -35,6 +35,7 @@ struct Db {
 #[derive(Default, Clone)]
 struct StoredProject {
     head: Option<String>,
+    history_floor: Option<String>,
     profile: Option<ProjectProfile>,
     updated_at: i64,
 }
@@ -53,6 +54,7 @@ async fn health() -> impl IntoResponse {
             "project_listing": true,
             "members": false, "permissions": false,
             "branches": false, "server_side_merge": false,
+            "history_retention": true,
             "auth_methods": ["none"]
         }
     }))
@@ -181,6 +183,10 @@ async fn list_history(
         .projects
         .get(&handle)
         .and_then(|project| project.head.clone());
+    let floor = db
+        .projects
+        .get(&handle)
+        .and_then(|project| project.history_floor.clone());
     while let Some(id) = cursor {
         let raw = match db.commits.get(&id) {
             Some(v) => v.clone(),
@@ -202,6 +208,9 @@ async fn list_history(
         } else if Some(&id) == q.before.as_ref() {
             started = true;
         }
+        if Some(&id) == floor.as_ref() {
+            break;
+        }
         cursor = raw
             .get("parents")
             .and_then(Value::as_array)
@@ -210,6 +219,71 @@ async fn list_history(
             .map(str::to_owned);
     }
     Json(json!({ "commits": out }))
+}
+
+async fn retain_history(
+    State(db): State<Shared>,
+    Path(handle): Path<String>,
+    Json(request): Json<RetentionBody>,
+) -> Response {
+    let mut db = db.lock().unwrap();
+    let Some(project) = db.projects.get(&handle) else {
+        return err_resp(StatusCode::NOT_FOUND, "not_found", "project");
+    };
+    let mut cursor = project.head.clone();
+    let floor = project.history_floor.clone();
+    let mut history = Vec::new();
+    while let Some(id) = cursor {
+        let Some(commit) = db.commits.get(&id) else {
+            break;
+        };
+        history.push((
+            id.clone(),
+            commit
+                .get("timestamp")
+                .and_then(Value::as_i64)
+                .unwrap_or_default(),
+        ));
+        if Some(&id) == floor.as_ref() {
+            break;
+        }
+        cursor = commit
+            .get("parents")
+            .and_then(Value::as_array)
+            .and_then(|parents| parents.first())
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+    }
+    let retained_len = request
+        .rule
+        .retained_prefix_len(history.iter().map(|(_, timestamp)| *timestamp));
+    let Some(new_floor) = retained_len
+        .checked_sub(1)
+        .and_then(|index| history.get(index))
+        .map(|(id, _)| id.clone())
+    else {
+        return Json(json!({
+            "versions_removed": 0,
+            "objects_removed": 0,
+            "bytes_freed": 0
+        }))
+        .into_response();
+    };
+    db.projects
+        .get_mut(&handle)
+        .expect("project exists")
+        .history_floor = Some(new_floor);
+    Json(json!({
+        "versions_removed": history.len().saturating_sub(retained_len),
+        "objects_removed": 0,
+        "bytes_freed": 0
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct RetentionBody {
+    rule: RetentionRule,
 }
 
 #[derive(Deserialize)]
@@ -249,6 +323,7 @@ fn make_app(db: Shared) -> Router {
         .route("/v1/projects/:h/commits", post(post_commit))
         .route("/v1/projects/:h/commits/:id", get(get_commit))
         .route("/v1/projects/:h/history", get(list_history))
+        .route("/v1/projects/:h/retention", post(retain_history))
         .route("/v1/blobs/has", post(blobs_has))
         .route("/v1/blobs/:hash", put(put_blob).get(get_blob))
         .with_state(db)
@@ -530,4 +605,19 @@ async fn m2_two_commit_history() {
         .unwrap();
     assert_eq!(limited.len(), 1);
     assert_eq!(limited[0].message, "take 2");
+
+    let report = provider
+        .prune_history(
+            RetentionRule::Latest { count: 1 },
+            &auru_pm::RetentionRoots::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.versions_removed, 1);
+    let retained = provider
+        .list_history(HistoryRange::default())
+        .await
+        .unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].message, "take 2");
 }

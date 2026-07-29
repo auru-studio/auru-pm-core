@@ -13,6 +13,19 @@ pub type ProjectProfile = auru_pm_protocol::ProjectProfile<ProjectFormat>;
 /// One project returned by a provider account catalogue.
 pub type ProviderProject = auru_pm_protocol::ProviderProject<CommitId, ProjectFormat>;
 
+/// Destructive history policy applied by a provider.
+pub type RetentionRule = auru_pm_protocol::RetentionRule;
+
+/// Result of applying a [`RetentionRule`].
+pub type RetentionReport = auru_pm_protocol::RetentionReport;
+
+/// Provider objects protected from retention by active client workflows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RetentionRoots {
+    pub commits: Vec<CommitId>,
+    pub blobs: Vec<ContentHash>,
+}
+
 /// What a provider can do beyond the dumb-core surface.
 ///
 /// The "dumb core" — blob CAS, commit log, HEAD pointer — is always
@@ -42,6 +55,9 @@ pub struct Capabilities {
     /// `Accept-Encoding` in the ordinary way.
     #[serde(default)]
     pub compressed_uploads: bool,
+    /// Whether the provider can enforce destructive history-retention rules.
+    #[serde(default)]
+    pub history_retention: bool,
 }
 
 /// Authentication scheme advertised by a provider via `/v1/health`.
@@ -158,6 +174,21 @@ pub trait ProjectProvider: Send + Sync {
     /// this as an idempotent upsert for the current project handle.
     async fn put_project_profile(&self, _profile: &ProjectProfile) -> Result<()> {
         Err(Error::Unsupported("project listing"))
+    }
+
+    /// Permanently remove history older than `rule` permits.
+    ///
+    /// Available iff `capabilities().history_retention`. HEAD is never
+    /// removed. Implementations may retain newly orphaned objects for a grace
+    /// period, but removed versions must disappear from [`Self::list_history`]
+    /// before this call returns. `protected` carries queued or stashed client
+    /// work that must survive even when it falls outside that visible history.
+    async fn prune_history(
+        &self,
+        _rule: RetentionRule,
+        _protected: &RetentionRoots,
+    ) -> Result<RetentionReport> {
+        Err(Error::Unsupported("history retention"))
     }
 
     //

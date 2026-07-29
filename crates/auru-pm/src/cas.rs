@@ -45,7 +45,7 @@ use flate2::write::GzEncoder;
 
 use crate::error::{Error, Result};
 use crate::hash::ContentHash;
-use crate::provider::ProjectProvider;
+use crate::provider::{ProjectProvider, RetentionRoots};
 use crate::sample_manifest::SampleManifest;
 
 /// Marks a stored blob as framed. Chosen to be improbable as the opening
@@ -341,44 +341,76 @@ fn walk_bytes(dir: &Path) -> u64 {
 ///
 /// Blobs not returned by this function are candidates for GC.
 pub async fn collect_reachable(provider: &dyn ProjectProvider) -> Result<HashSet<ContentHash>> {
+    collect_reachable_with_roots(provider, &RetentionRoots::default()).await
+}
+
+/// [`collect_reachable`] plus client-owned roots outside visible history.
+///
+/// Callers running destructive GC should use this form when queued mirror
+/// commits or a pre-merge stash may still depend on provider objects.
+pub async fn collect_reachable_with_roots(
+    provider: &dyn ProjectProvider,
+    protected: &RetentionRoots,
+) -> Result<HashSet<ContentHash>> {
     use crate::commit::HistoryRange;
 
-    let mut reachable: HashSet<ContentHash> = HashSet::new();
+    let mut visible_history = Vec::new();
 
-    // Fetch the entire history (no limit — we need every commit).
-    let history = provider
-        .list_history(HistoryRange {
-            limit: None,
-            before: None,
-        })
-        .await?;
-
-    for summary in &history {
-        let commit = match provider.get_commit(&summary.id).await {
-            Ok(c) => c,
-            Err(_) => continue,
+    // `limit: None` means the provider's default page size, not unbounded.
+    // Follow exclusive cursors until the provider returns an empty page.
+    let mut before = None;
+    let mut seen_pages = HashSet::new();
+    loop {
+        let history = provider
+            .list_history(HistoryRange {
+                limit: Some(100),
+                before,
+            })
+            .await?;
+        let Some(next_before) = history.last().map(|summary| summary.id) else {
+            break;
         };
 
-        // Snapshot blob.
+        for summary in &history {
+            if !seen_pages.insert(summary.id) {
+                return Err(Error::Other(format!(
+                    "provider repeated commit {} while paging history",
+                    summary.id.0
+                )));
+            }
+        }
+        visible_history.extend(history);
+        before = Some(next_before);
+    }
+
+    let floor = visible_history.last().map(|summary| summary.id);
+    let mut reachable: HashSet<ContentHash> = protected.blobs.iter().copied().collect();
+    let mut pending: Vec<_> = visible_history
+        .iter()
+        .map(|summary| summary.id)
+        .chain(protected.commits.iter().copied())
+        .collect();
+    let mut seen_commits = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen_commits.insert(id) {
+            continue;
+        }
+        let commit = provider.get_commit(&id).await?;
+        if Some(id) != floor {
+            pending.extend(commit.parents.iter().copied());
+        }
+
         reachable.insert(commit.tree.snapshot);
-
-        // Sample-manifest blob.
         reachable.insert(commit.tree.samples);
-
-        // Project-summary blob, when the commit has one. Missing this would
-        // have collection quietly strip every project's tempo and key.
         if let Some(metadata) = commit.metadata {
             reachable.insert(metadata);
         }
 
-        // Individual sample blobs listed in the manifest.
-        if let Ok(manifest_bytes) = provider.get_blob(&commit.tree.samples).await {
-            if let Ok(manifest) = serde_json::from_slice::<SampleManifest>(&manifest_bytes) {
-                for entry in &manifest.entries {
-                    reachable.insert(entry.hash);
-                }
-            }
-        }
+        // Fail closed. This set authorizes deletion, so an unreadable manifest
+        // means collection cannot safely continue.
+        let manifest_bytes = provider.get_blob(&commit.tree.samples).await?;
+        let manifest = serde_json::from_slice::<SampleManifest>(&manifest_bytes)?;
+        reachable.extend(manifest.entries.iter().map(|entry| entry.hash));
     }
 
     Ok(reachable)
@@ -393,6 +425,10 @@ fn hash_to_hex(hash: &ContentHash) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canonical::compute_commit_id;
+    use crate::commit::{AuthorIdentity, Commit, CommitId, TreeRef};
+    use crate::filesystem::FilesystemProvider;
+    use crate::provider::{HeadAdvance, ProjectProvider};
     use tempfile::TempDir;
 
     #[test]
@@ -406,6 +442,55 @@ mod tests {
         cas.put(&hash, payload).unwrap();
         assert!(cas.has(&hash));
         assert_eq!(cas.get(&hash).unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn reachability_should_page_through_more_than_the_provider_default() {
+        let dir = TempDir::new().unwrap();
+        let provider = FilesystemProvider::open(dir.path()).unwrap();
+        let sample_manifest = serde_json::to_vec(&SampleManifest::default()).unwrap();
+        let samples = ContentHash::of(&sample_manifest);
+        provider.put_blob(&samples, &sample_manifest).await.unwrap();
+        let mut parent = None;
+        let mut oldest_snapshot = None;
+
+        for index in 0..101 {
+            let snapshot_bytes = format!("snapshot {index}").into_bytes();
+            let snapshot = ContentHash::of(&snapshot_bytes);
+            provider.put_blob(&snapshot, &snapshot_bytes).await.unwrap();
+            oldest_snapshot.get_or_insert(snapshot);
+            let mut commit = Commit {
+                id: CommitId(ContentHash::ZERO),
+                parents: parent.into_iter().collect(),
+                tree: TreeRef { snapshot, samples },
+                author: AuthorIdentity {
+                    display_name: "Test".into(),
+                    provider_user_id: "test".into(),
+                    provider_id: "filesystem".into(),
+                    email: None,
+                },
+                timestamp: index,
+                message: format!("version {index}"),
+                description: String::new(),
+                auru_version: "test".into(),
+                format_version: 8,
+                metadata: None,
+            };
+            commit.id = compute_commit_id(&commit).unwrap();
+            provider.put_commit(&commit).await.unwrap();
+            assert_eq!(
+                provider.advance_head(parent, commit.id).await.unwrap(),
+                HeadAdvance::Advanced
+            );
+            parent = Some(commit.id);
+        }
+
+        let reachable = collect_reachable(&provider).await.unwrap();
+
+        assert!(
+            reachable.contains(&oldest_snapshot.unwrap()),
+            "the oldest version lives on page two and must survive GC"
+        );
     }
 
     /// Compressible filler roughly shaped like canonical snapshot JSON.

@@ -36,7 +36,7 @@ pub use ableton::{
 };
 pub use auru_pm_protocol::WIRE_VERSION;
 pub use canonical::{canonical_encoding, compute_commit_id};
-pub use cas::{Cas, GcReport, collect_reachable};
+pub use cas::{Cas, GcReport, collect_reachable, collect_reachable_with_roots};
 pub use commit::{AuthorIdentity, Commit, CommitId, CommitSummary, HistoryRange, TreeRef};
 pub use diff::{
     ChangeKind, ChangeRow, ChangeTag, ChannelDiff, ChannelKind, ProjectDiff, structured_diff,
@@ -60,7 +60,7 @@ pub use project_format::{ProjectFormat, ProjectSnapshot, restore_project, snapsh
 pub use project_info::{PROJECT_INFO_SCHEMA, ProjectInfo};
 pub use provider::{
     AuthMethod, Capabilities, HeadAdvance, Member, PermSet, ProjectProfile, ProjectProvider,
-    ProviderProject, UserId,
+    ProviderProject, RetentionReport, RetentionRoots, RetentionRule, UserId,
 };
 pub use registry::{
     AURU_REGISTRY_URL, RegistryAvailability, RegistryDocument, RegistryEntry,
