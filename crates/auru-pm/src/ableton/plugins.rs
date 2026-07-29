@@ -30,8 +30,10 @@ pub enum PluginFormat {
     Vst2,
     Vst3,
     AudioUnit,
-    /// Built into Live.
+    /// Built into the DAW.
     Native,
+    /// A hosted plugin whose binary could not be identified.
+    Unknown,
 }
 
 impl PluginFormat {
@@ -40,7 +42,8 @@ impl PluginFormat {
             Self::Vst2 => "VST2",
             Self::Vst3 => "VST3",
             Self::AudioUnit => "AU",
-            Self::Native => "Live",
+            Self::Native => "Built-in",
+            Self::Unknown => "Plugin",
         }
     }
 
@@ -63,6 +66,20 @@ pub enum PluginId {
     AudioUnit { name: String },
     /// A Live device, identified by its XML tag.
     Native { device: String },
+    /// A plugin identified only by the file it was loaded from.
+    ///
+    /// FL Studio records no numeric identity for third-party plugins — every
+    /// one of them reports the same internal name — so the binary's file name
+    /// is all there is. Stored lowercase, and deliberately *without* its
+    /// directory: two projects examined loaded the same Serum from
+    /// `E:\VST\VST 64 bit` and `C:\Program Files\Common Files\VST2`, so a
+    /// full path would identify the machine rather than the plugin.
+    Vst2ByFile { file_name: String },
+    /// A plugin bundled with FL Studio, identified by its own name.
+    ///
+    /// Kept apart from [`Self::Native`] so that a stock FL effect and a Live
+    /// device that happen to share a name cannot resolve to each other.
+    FlNative { device: String },
 }
 
 impl fmt::Display for PluginId {
@@ -77,6 +94,8 @@ impl fmt::Display for PluginId {
             ),
             Self::AudioUnit { name } => write!(formatter, "au:{name}"),
             Self::Native { device } => write!(formatter, "live:{device}"),
+            Self::Vst2ByFile { file_name } => write!(formatter, "vst2file:{file_name}"),
+            Self::FlNative { device } => write!(formatter, "fl:{device}"),
         }
     }
 }
@@ -126,6 +145,12 @@ impl std::str::FromStr for PluginId {
                 name: rest.to_owned(),
             }),
             "live" if !rest.is_empty() => Ok(Self::Native {
+                device: rest.to_owned(),
+            }),
+            "vst2file" if !rest.is_empty() => Ok(Self::Vst2ByFile {
+                file_name: rest.to_ascii_lowercase(),
+            }),
+            "fl" if !rest.is_empty() => Ok(Self::FlNative {
                 device: rest.to_owned(),
             }),
             _ => Err(invalid()),

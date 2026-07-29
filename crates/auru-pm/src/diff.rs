@@ -528,6 +528,11 @@ pub fn structured_diff(ancestor: &Value, current: &Value) -> ProjectDiff {
     if let Some(diff) = crate::ableton::diff::structured_diff(ancestor, current) {
         return diff;
     }
+    // Likewise for FL Studio: `None` means "not an FL project we can read",
+    // which must fall through rather than report no changes.
+    if let Some(diff) = crate::flstudio::diff::structured_diff(ancestor, current) {
+        return diff;
+    }
     if is_external_snapshot(ancestor) || is_external_snapshot(current) {
         return ProjectDiff {
             project_changes: summarize_external_diff(ancestor, current, false),

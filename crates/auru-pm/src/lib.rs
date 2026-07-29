@@ -11,8 +11,10 @@ pub mod canonical;
 pub mod cas;
 pub mod commit;
 pub mod diff;
+pub mod discovery;
 pub mod error;
 pub mod filesystem;
+pub mod flstudio;
 pub mod hash;
 pub mod http;
 pub mod merge;
@@ -40,6 +42,7 @@ pub use diff::{
     ChangeKind, ChangeRow, ChangeTag, ChannelDiff, ChannelKind, ProjectDiff, structured_diff,
     summarize_diff,
 };
+pub use discovery::{DiscoveredProject, read_headline};
 pub use error::{Error, Result};
 pub use filesystem::FilesystemProvider;
 pub use hash::{ContentHash, ParseHashError};
@@ -59,7 +62,8 @@ pub use provider::{
     AuthMethod, Capabilities, HeadAdvance, Member, PermSet, ProjectProvider, UserId,
 };
 pub use registry::{
-    AURU_REGISTRY_URL, RegistryEntry, get_or_fetch as fetch_registry, resolve_endpoint,
+    AURU_REGISTRY_URL, RegistryAvailability, RegistryDocument, RegistryEntry,
+    get_or_fetch as fetch_registry, resolve_endpoint,
 };
 pub use sample_manifest::{SampleEntry, SampleManifest};
 pub use sidecar::{RemoteState, SIDECAR_SUFFIX, Sidecar, Stash, sidecar_path_for};

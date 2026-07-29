@@ -25,7 +25,9 @@
       "endpoint": "https://pm.auru.studio",
       "detail": "Hosted · eu-west · encrypted at rest",
       "availability": "recommended",
-      "auth_methods": ["oauth_device_code"],
+      "auth_methods": [
+        "oauth_device_code"
+      ],
       "description": "Hosted backup with encrypted storage",
       "recommended": true
     },
@@ -35,7 +37,9 @@
       "endpoint": "http://studio-nas.local:4242",
       "detail": "smb://studio-nas/auru-backups",
       "availability": "on-your-network",
-      "auth_methods": ["none"],
+      "auth_methods": [
+        "none"
+      ],
       "description": "A provider discovered on this network"
     },
     {
@@ -44,7 +48,9 @@
       "endpoint": "https://s3-provider.example",
       "detail": "S3-compatible · bring your own bucket",
       "availability": "available",
-      "auth_methods": ["pat"],
+      "auth_methods": [
+        "pat"
+      ],
       "description": "Bring an existing S3-compatible archive"
     },
     {
@@ -53,7 +59,9 @@
       "endpoint": "",
       "detail": "/Volumes/T7/Auru — any drive or shared folder",
       "availability": "available",
-      "auth_methods": ["none"],
+      "auth_methods": [
+        "none"
+      ],
       "description": "A folder on a drive you already own"
     }
   ]

@@ -27,12 +27,12 @@ use gpui_platform::application;
 
 use crate::catalog::{
     AuthHint, CatalogState, ProviderAvailability, ProviderListing, fetch_first_party_catalog,
-    load_provider_file, stub_provider_catalog,
+    load_provider_file, local_provider,
 };
 use crate::menus::{
-    AddAbletonProject, AddAuruProject, AddDawproject, CloseWindow, Minimize, OpenSettings,
-    SortByAttentionRequired, SortByLastModifiedLocal, SortByLastModifiedRemote, SortByName,
-    SortByRecentlyAdded, Zoom,
+    AddAbletonProject, AddAuruProject, AddDawproject, AddFlStudioProject, CloseWindow, Minimize,
+    OpenSettings, SortByAttentionRequired, SortByLastModifiedLocal, SortByLastModifiedRemote,
+    SortByName, SortByRecentlyAdded, Zoom,
 };
 use crate::model::{
     ImportKind, PLUGIN_SETTINGS_REASSURANCE, Project, ProjectAction, ProjectStatus, SortOrder,
@@ -170,13 +170,16 @@ impl ProjectManager {
         let mut state = crate::state::AppState::load();
         let projects = load_library(&mut state);
 
+        // The name someone chose last time, if they have been here before.
+        let display_name_seed = state.display_name.clone();
+
         let display_name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Alice, Bob, or Charlie"));
         // A separate input from onboarding's: Settings edits a name that
         // already exists, so it starts populated rather than empty.
         let display_name_setting = cx.new(|cx| {
             let mut state = InputState::new(window, cx).placeholder("Your name");
-            state.set_value("Alice", window, cx);
+            state.set_value(display_name_seed.as_str(), window, cx);
             state
         });
         let search_input =
@@ -236,10 +239,20 @@ impl ProjectManager {
                                     provider.mark_connected();
                                 }
                             }
+                            // The published list does not know about the
+                            // user's own folders, so carry those across rather
+                            // than replacing the lot — otherwise a NAS added
+                            // before the fetch returned would vanish.
+                            providers.extend(
+                                this.providers
+                                    .iter()
+                                    .filter(|current| current.is_local())
+                                    .cloned(),
+                            );
                             this.providers = providers;
                             this.catalog_state = CatalogState::Live;
                         }
-                        Err(_) => this.catalog_state = CatalogState::Fallback,
+                        Err(_) => this.catalog_state = CatalogState::Unreachable,
                     }
                     cx.notify();
                 });
@@ -247,9 +260,23 @@ impl ProjectManager {
             .detach();
         }
 
+        // Local destinations are the user's own and are known immediately;
+        // the published list arrives later, or not at all.
+        let local: Vec<ProviderListing> = state
+            .local_providers
+            .iter()
+            .map(|path| local_provider(path))
+            .collect();
+
         let (providers, catalog_state) = match file_providers {
-            Some(providers) => (providers, CatalogState::FromFile),
-            None => (stub_provider_catalog(), CatalogState::Loading),
+            Some(mut providers) => {
+                providers.extend(local);
+                (providers, CatalogState::FromFile)
+            }
+            // Deliberately no placeholder entries. An invented provider list is
+            // worse than an empty one: every row is something the person cannot
+            // actually connect to, and they have no way to tell which.
+            None => (local, CatalogState::Loading),
         };
 
         Self {
@@ -259,7 +286,7 @@ impl ProjectManager {
             list_scroll: UniformListScrollHandle::default(),
             route: Route::Library,
             overlay: Overlay::None,
-            display_name: "Alice".to_owned(),
+            display_name: state.display_name.clone(),
             display_name_input,
             search_input,
             credential_input,
@@ -366,6 +393,15 @@ impl ProjectManager {
             .and_then(|id| self.projects.iter().position(|project| project.id == id))
             .unwrap_or(0);
         cx.notify();
+    }
+
+    fn add_flstudio_project(
+        &mut self,
+        _: &AddFlStudioProject,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.add_project(ImportKind::FlStudio, window, cx);
     }
 
     fn add_dawproject(&mut self, _: &AddDawproject, window: &mut Window, cx: &mut Context<Self>) {
@@ -526,6 +562,61 @@ impl ProjectManager {
         }
 
         section.into_any_element()
+    }
+
+    /// Add a folder as a backup destination.
+    ///
+    /// A drive or a NAS share with no Auru software on it is a perfectly good
+    /// second home for a project. Treating it as a provider that needs no
+    /// authentication means pushing, history and restore work against it
+    /// unchanged, rather than it being a special case threaded through the app.
+    fn add_local_provider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Use this folder for backups".into()),
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            // A cancelled dialog is an ordinary outcome, not an error.
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+
+            _ = this.update_in(cx, |this, window, cx| {
+                let listing = local_provider(&path);
+                let name = listing.entry.name.clone();
+
+                // Adding the same folder twice replaces rather than duplicates:
+                // the identity is the path.
+                if let Some(existing) = this
+                    .providers
+                    .iter_mut()
+                    .find(|provider| provider.entry.id == listing.entry.id)
+                {
+                    *existing = listing;
+                } else {
+                    this.providers.push(listing);
+                }
+
+                this.state.add_local_provider(&path);
+                this.state.save();
+
+                window.push_notification(
+                    Notification::success(format!(
+                        "{name} is ready to use. Nothing has been uploaded yet."
+                    ))
+                    .title("Local destination added"),
+                    cx,
+                );
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Pick a folder and scan it for projects.
@@ -2512,7 +2603,38 @@ impl ProjectManager {
                                 self.catalog_state.label()
                             )),
                     )
-                    .child(div().flex().flex_col().gap_2().children(provider_rows))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .when(self.providers.is_empty(), |this| {
+                                // Silence would read as "there are no providers",
+                                // which is a different thing from "we could not
+                                // ask". Both leave the list empty; only one is
+                                // worth retrying, so they must not look alike.
+                                this.child(
+                                    div()
+                                        .flex()
+                                        .h(px(64.0))
+                                        .items_center()
+                                        .justify_center()
+                                        .px_4()
+                                        .text_size(px(9.0))
+                                        .text_color(faint())
+                                        .child(match self.catalog_state {
+                                            CatalogState::Loading => {
+                                                "Looking for providers…"
+                                            }
+                                            CatalogState::Unreachable => {
+                                                "Couldn't reach the provider list. Add a local folder below — it needs no account."
+                                            }
+                                            _ => "No providers yet. Add a local folder below.",
+                                        }),
+                                )
+                            })
+                            .children(provider_rows),
+                    )
                     .child(
                         div()
                             .id("add-custom-provider")
@@ -2536,6 +2658,24 @@ impl ProjectManager {
                                 );
                             }))
                             .child("＋ ADD A CUSTOM PROVIDER URL"),
+                    )
+                    .child(
+                        div()
+                            .id("add-local-provider")
+                            .flex()
+                            .h(px(44.0))
+                            .cursor_pointer()
+                            .items_center()
+                            .border_1()
+                            .border_color(line())
+                            .px_4()
+                            .text_size(px(8.0))
+                            .text_color(faint())
+                            .hover(|this| this.border_color(green()).text_color(green()))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.add_local_provider(window, cx);
+                            }))
+                            .child("＋ ADD A LOCAL FOLDER OR NAS  ·  NO ACCOUNT NEEDED"),
                     ),
             );
 
@@ -2811,6 +2951,7 @@ impl Render for ProjectManager {
             .on_action(cx.listener(Self::zoom_window))
             .on_action(cx.listener(Self::open_settings_action))
             .on_action(cx.listener(Self::add_ableton_project))
+            .on_action(cx.listener(Self::add_flstudio_project))
             .on_action(cx.listener(Self::add_dawproject))
             .on_action(cx.listener(Self::add_auru_project))
             .on_action(cx.listener(Self::sort_by_last_modified_local))
@@ -2981,6 +3122,7 @@ impl RenderOnce for BarLink {
 fn import_action(kind: ImportKind) -> Box<dyn gpui::Action> {
     match kind {
         ImportKind::AbletonLiveSet => Box::new(AddAbletonProject),
+        ImportKind::FlStudio => Box::new(AddFlStudioProject),
         ImportKind::Dawproject => Box::new(AddDawproject),
         ImportKind::AuruProject => Box::new(AddAuruProject),
     }

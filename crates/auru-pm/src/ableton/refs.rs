@@ -22,7 +22,7 @@
 //! that it exists. Path-shape heuristics are only a fallback for sets that
 //! predate the field or write it as `0`.
 
-use crate::project_format::XmlElement;
+use crate::project_format::{XmlContent, XmlElement};
 
 /// How Live resolves a `FileRef`'s `RelativePath`.
 ///
@@ -173,7 +173,7 @@ fn walk(element: &XmlElement, location: &mut Vec<usize>, out: &mut Vec<AssetRef>
 
 fn read_file_ref(element: &XmlElement, location: Vec<usize>) -> AssetRef {
     let relative_path = read_relative_path(element);
-    let absolute_path = element.child_value("Path").unwrap_or_default().to_owned();
+    let absolute_path = read_absolute_path(element);
     let relative_path_type_raw = element
         .child_value("RelativePathType")
         .and_then(|value| value.parse::<u32>().ok())
@@ -205,8 +205,16 @@ fn read_file_ref(element: &XmlElement, location: Vec<usize>) -> AssetRef {
 
 /// Read `RelativePath`, tolerating both encodings Ableton has shipped.
 ///
-/// Live 9 and earlier nested a list of `<RelativePathElement Dir="…" />`
-/// children; Live 10+ writes a flat `Value` attribute.
+/// Live 11+ writes a flat `Value` attribute holding the whole path, file name
+/// included. Live 9 and 10 instead nest `<RelativePathElement Dir="…" />`
+/// children that name **only the directories**, and keep the file name in a
+/// sibling `<Name Value="…" />`.
+///
+/// Appending that name is not a detail. Without it every sample in a folder
+/// resolves to the folder itself: a real Live 9 project here collapsed 2,049
+/// references into 25 "distinct files", 361 of them sharing one entry. Asset
+/// counts would be wrong, and vendoring would try to copy a directory in place
+/// of each sample.
 fn read_relative_path(element: &XmlElement) -> String {
     let Some(node) = element.child("RelativePath") else {
         return String::new();
@@ -214,13 +222,76 @@ fn read_relative_path(element: &XmlElement) -> String {
     if let Some(value) = node.attribute("Value") {
         return value.to_owned();
     }
-    let segments: Vec<&str> = node
+
+    let mut segments: Vec<&str> = node
         .descendants()
         .filter(|descendant| descendant.tag == "RelativePathElement")
         .filter_map(|descendant| descendant.attribute("Dir"))
         .filter(|dir| !dir.is_empty())
         .collect();
+
+    // A reference to a folder — a Live device directory, say — has an empty
+    // `Name` and is complete already.
+    if element.child_value("RefersToFolder") != Some("true")
+        && let Some(name) = element.child_value("Name").filter(|name| !name.is_empty())
+    {
+        segments.push(name);
+    }
     segments.join("/")
+}
+
+/// Read the absolute path, tolerating both encodings Ableton has shipped.
+///
+/// Live 11+ writes `<Path Value="…" />`. Live 9 and 10 wrote none, keeping the
+/// location in `<Data>` instead — as UTF-16 hex on Windows, and as a macOS
+/// alias record on a Mac. The first is readable and worth reading, because an
+/// absolute path is what locates a sample living outside the project folder.
+/// The second is not, and is left absent rather than guessed at.
+fn read_absolute_path(element: &XmlElement) -> String {
+    if let Some(path) = element.child_value("Path").filter(|path| !path.is_empty()) {
+        return path.to_owned();
+    }
+    element
+        .child("Data")
+        .and_then(decode_data_path)
+        .unwrap_or_default()
+}
+
+/// Decode a Live 9 `<Data>` blob, if it holds a readable path.
+fn decode_data_path(data: &XmlElement) -> Option<String> {
+    let digits: Vec<u8> = data
+        .children
+        .iter()
+        .filter_map(|content| match content {
+            XmlContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .flat_map(str::bytes)
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    // Odd length is not hex; a very long blob is an alias record, not a path.
+    if digits.is_empty() || digits.len() % 4 != 0 || digits.len() > 8192 {
+        return None;
+    }
+
+    let mut units = Vec::with_capacity(digits.len() / 4);
+    for chunk in digits.chunks_exact(4) {
+        let value = u16::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+        units.push(value.swap_bytes());
+    }
+    while units.last() == Some(&0) {
+        units.pop();
+    }
+
+    let decoded = String::from_utf16(&units).ok()?;
+    // A macOS alias record also decodes without error, into control characters
+    // and mojibake. Only accept something that looks like a path someone wrote.
+    let looks_like_a_path = decoded.contains('\\') || decoded.contains('/');
+    let is_readable = !decoded.is_empty()
+        && decoded
+            .chars()
+            .all(|character| !character.is_control() && character != '\u{fffd}');
+    (looks_like_a_path && is_readable).then_some(decoded)
 }
 
 fn classify(
@@ -340,6 +411,117 @@ mod tests {
                 <OriginalCrc Value="0" />
             </FileRef>"#
         )
+    }
+
+    /// A `FileRef` in the shape Live 9 and 10 wrote: directories as child
+    /// elements, the file name in a sibling, and the location in `<Data>`.
+    fn legacy_file_ref(dirs: &[&str], name: &str, data: &str, refers_to_folder: bool) -> String {
+        let elements: String = dirs
+            .iter()
+            .map(|dir| format!(r#"<RelativePathElement Dir="{dir}" />"#))
+            .collect();
+        format!(
+            r#"<FileRef>
+                <HasRelativePath Value="true" />
+                <RelativePathType Value="3" />
+                <RelativePath>{elements}</RelativePath>
+                <Name Value="{name}" />
+                <Type Value="2" />
+                <Data>{data}</Data>
+                <RefersToFolder Value="{refers_to_folder}" />
+            </FileRef>"#
+        )
+    }
+
+    fn first_legacy_ref(dirs: &[&str], name: &str, data: &str, refers_to_folder: bool) -> AssetRef {
+        let xml = format!(
+            "<Root>{}</Root>",
+            legacy_file_ref(dirs, name, data, refers_to_folder)
+        );
+        collect(&parse_xml(&xml)).into_iter().next().expect("a ref")
+    }
+
+    #[test]
+    fn a_live_9_reference_should_include_the_file_name() {
+        // Live 9 and 10 name only the directories in `RelativePath` and keep
+        // the file in a sibling `<Name>`. Without appending it, every sample in
+        // a folder resolves to the folder: a real Live 9 project collapsed
+        // 2,049 references into 25 "distinct files", one of them standing for
+        // 361 different samples.
+        let reference = first_legacy_ref(
+            &["Samples", "Processed", "Reverse"],
+            "Vox Samples R.wav",
+            "",
+            false,
+        );
+        assert_eq!(
+            reference.relative_path,
+            "Samples/Processed/Reverse/Vox Samples R.wav"
+        );
+        assert_eq!(reference.file_name(), Some("Vox Samples R.wav"));
+    }
+
+    #[test]
+    fn two_live_9_samples_in_one_folder_should_be_two_distinct_files() {
+        // The consequence that matters: deduplication keys on the path, so a
+        // folder-only path makes every sample in it look like the same file.
+        let xml = format!(
+            "<Root>{}{}</Root>",
+            legacy_file_ref(&["Samples", "Imported"], "Kick.wav", "", false),
+            legacy_file_ref(&["Samples", "Imported"], "Snare.wav", "", false),
+        );
+        let refs = collect(&parse_xml(&xml));
+        assert_ne!(refs[0].dedup_key(), refs[1].dedup_key());
+    }
+
+    #[test]
+    fn a_live_9_folder_reference_should_not_gain_a_file_name() {
+        // A Live device directory has an empty `Name` and `RefersToFolder`
+        // set; appending anything would invent a file that is not there.
+        let reference = first_legacy_ref(&["Devices", "Audio Effects", "Utility"], "", "", true);
+        assert_eq!(reference.relative_path, "Devices/Audio Effects/Utility");
+    }
+
+    #[test]
+    fn a_live_9_windows_data_blob_should_yield_the_absolute_path() {
+        // Live 9 wrote no `<Path>`; on Windows the location is UTF-16 hex in
+        // `<Data>`, and it is what locates a sample outside the project.
+        let path = r"C:\Samples\Kick.wav";
+        let hex: String = path
+            .encode_utf16()
+            .map(|unit| format!("{:04X}", unit.swap_bytes()))
+            .collect();
+        let reference = first_legacy_ref(&["Samples"], "Kick.wav", &hex, false);
+        assert_eq!(reference.absolute_path, path);
+    }
+
+    #[test]
+    fn a_macos_alias_record_should_not_be_mistaken_for_a_path() {
+        // The same field on a Mac holds a binary alias record. Decoding it
+        // produces mojibake, and a made-up absolute path is worse than none —
+        // it would send the resolver looking somewhere meaningless.
+        let alias = "000000000224000200000C4D6163696E746F736820484400000000000000";
+        let reference = first_legacy_ref(&["Samples"], "Kick.wav", alias, false);
+        assert!(
+            reference.absolute_path.is_empty(),
+            "decoded {:?}",
+            reference.absolute_path
+        );
+        // The relative path still works, which is what actually opens the set.
+        assert_eq!(reference.relative_path, "Samples/Kick.wav");
+    }
+
+    #[test]
+    fn a_modern_reference_should_be_unaffected_by_the_legacy_reader() {
+        // Live 11+ writes the whole path in `Value`, file name included;
+        // appending `Name` again would double it.
+        let xml = format!(
+            "<Root>{}</Root>",
+            file_ref(3, "Samples/Imported/Kick.wav", "/music/Kick.wav")
+        );
+        let refs = collect(&parse_xml(&xml));
+        assert_eq!(refs[0].relative_path, "Samples/Imported/Kick.wav");
+        assert_eq!(refs[0].absolute_path, "/music/Kick.wav");
     }
 
     fn classify_one(relative_path_type: u32, relative_path: &str, path: &str) -> RefClass {

@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use auru_pm::{
-    PluginAvailability, PluginSearchPaths, ProjectFormat, ProjectInfo, ProjectSnapshot,
-    ResolvedPlugin, Sidecar, ableton, plugin_registry, sidecar_path_for,
+    DiscoveredProject, PluginAvailability, PluginSearchPaths, ProjectFormat, ProjectInfo,
+    ProjectSnapshot, ResolvedPlugin, Sidecar, ableton, discovery, flstudio, plugin_registry,
+    sidecar_path_for,
 };
 
 /// A folder Auru watches for projects.
@@ -24,9 +25,9 @@ pub struct WatchedFolder {
 impl WatchedFolder {
     /// Scan `path` and record what is in it.
     pub fn scan(path: &Path) -> Self {
-        let projects = ableton::scan_for_projects(path, &ableton::ScanOptions::default())
+        let projects = discovery::scan_for_projects(path, &discovery::ScanOptions::default())
             .into_iter()
-            .map(|bundle| FoundProject::from_bundle(&bundle))
+            .map(|found| FoundProject::from_discovered(&found))
             .collect();
         Self {
             path: path.to_path_buf(),
@@ -66,21 +67,31 @@ pub struct FoundProject {
 }
 
 impl FoundProject {
-    fn from_bundle(bundle: &ableton::AbletonBundle) -> Self {
-        let live_set = bundle.live_set();
+    fn from_discovered(found: &DiscoveredProject) -> Self {
+        let project_file = found.project_file();
         Self {
-            name: live_set
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or("Untitled")
-                .to_owned(),
-            root: bundle.root().to_path_buf(),
-            file: live_set
+            name: found.name(),
+            // What adding this project means: a folder for Ableton, a single
+            // file for FL. Keying on the folder for FL would make two projects
+            // saved side by side look like the same one.
+            root: if found.owns_its_directory() {
+                found.directory().to_path_buf()
+            } else {
+                project_file.to_path_buf()
+            },
+            file: project_file
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or_default()
                 .to_owned(),
-            bytes: folder_bytes(bundle.root()),
+            // Measuring the containing folder would be wrong for a project
+            // that does not own it — an `.flp` saved into Downloads would
+            // report the size of everything else in there.
+            bytes: if found.owns_its_directory() {
+                folder_bytes(found.directory())
+            } else {
+                std::fs::metadata(project_file).map_or(0, |meta| meta.len())
+            },
         }
     }
 
@@ -207,17 +218,24 @@ pub struct LoadedDetail {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImportKind {
     AbletonLiveSet,
+    FlStudio,
     Dawproject,
     AuruProject,
 }
 
 impl ImportKind {
     /// Every kind that can be added, in menu order.
-    pub const ALL: [Self; 3] = [Self::AbletonLiveSet, Self::Dawproject, Self::AuruProject];
+    pub const ALL: [Self; 4] = [
+        Self::AbletonLiveSet,
+        Self::FlStudio,
+        Self::Dawproject,
+        Self::AuruProject,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::AbletonLiveSet => "Ableton Live project…",
+            Self::FlStudio => "FL Studio project…",
             Self::Dawproject => "DAWproject file…",
             Self::AuruProject => "Auru project…",
         }
@@ -227,6 +245,7 @@ impl ImportKind {
     pub const fn prompt(self) -> &'static str {
         match self {
             Self::AbletonLiveSet => "Choose an Ableton project folder or .als",
+            Self::FlStudio => "Choose an .flp",
             Self::Dawproject => "Choose a .dawproject file",
             Self::AuruProject => "Choose an .auru file",
         }
@@ -244,6 +263,7 @@ impl ImportKind {
     pub const fn format(self) -> ProjectFormat {
         match self {
             Self::AbletonLiveSet => ProjectFormat::AbletonLiveSet,
+            Self::FlStudio => ProjectFormat::FlStudio,
             Self::Dawproject => ProjectFormat::Dawproject,
             Self::AuruProject => ProjectFormat::Auru,
         }
@@ -291,18 +311,7 @@ pub fn import_project(kind: ImportKind, path: &Path) -> Result<Project, String> 
         .as_ref()
         .and_then(ProjectDetail::from_project_info);
 
-    let missing_plugins = ableton::read_plugins(&snapshot)
-        .map(|plugins| {
-            plugin_registry::resolve(
-                &plugins,
-                plugin_registry::bundled(),
-                &PluginSearchPaths::detect(),
-            )
-            .iter()
-            .filter_map(MissingPlugin::from_resolved)
-            .collect()
-        })
-        .unwrap_or_default();
+    let missing_plugins = missing_plugins_for(&snapshot);
 
     let name = project_file
         .file_stem()
@@ -342,6 +351,34 @@ pub fn import_project(kind: ImportKind, path: &Path) -> Result<Project, String> 
         detail,
         missing_plugins,
     })
+}
+
+/// Plugins this computer does not have, for a project of any format.
+///
+/// Each DAW records plugin identity differently — Ableton in its XML, FL
+/// inside opaque plugin state — so the reading is per format, but what comes
+/// back is the same question answered: what would fail to load here.
+fn missing_plugins_for(snapshot: &ProjectSnapshot) -> Vec<MissingPlugin> {
+    let plugins = match snapshot.format() {
+        ProjectFormat::FlStudio => snapshot
+            .restore_bytes()
+            .ok()
+            .and_then(|bytes| flstudio::read_plugins(&bytes).ok()),
+        _ => ableton::read_plugins(snapshot).ok(),
+    };
+
+    plugins
+        .map(|plugins| {
+            plugin_registry::resolve(
+                &plugins,
+                plugin_registry::bundled(),
+                &PluginSearchPaths::detect(),
+            )
+            .iter()
+            .filter_map(MissingPlugin::from_resolved)
+            .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn display_name(path: &Path) -> String {
@@ -395,6 +432,9 @@ impl ProjectDetail {
     /// `None` for a format whose detail Auru does not read, so the detail page
     /// falls back to what it showed before rather than displaying zeroes.
     pub fn from_project_info(info: &ProjectInfo) -> Option<Self> {
+        if let Some(fl) = info.flstudio.as_ref() {
+            return Some(Self::from_flstudio(fl));
+        }
         let ableton = info.ableton.as_ref()?;
         Some(Self {
             tempo: ableton.tempo,
@@ -413,6 +453,31 @@ impl ProjectDetail {
             files_total: ableton.assets.total(),
             files_gathered: ableton.assets.vendorable(),
         })
+    }
+
+    /// Read the detail out of an FL Studio summary.
+    ///
+    /// FL describes a project in its own terms, so several fields have no
+    /// counterpart and stay empty rather than being filled with a plausible
+    /// zero: FL has no project-wide key, and its channel rack is not a track
+    /// list. The channel count is reported as the track total because that is
+    /// the number a person recognises the project by.
+    fn from_flstudio(fl: &flstudio::FlStudioMetadata) -> Self {
+        Self {
+            tempo: fl.tempo,
+            time_signature: fl.time_signature,
+            key: None,
+            in_key: false,
+            tracks_total: usize::from(fl.channels),
+            tracks_midi: 0,
+            tracks_audio: 0,
+            tracks_return: 0,
+            clip_count: fl.pattern_names.len(),
+            bars: None,
+            live_version: fl.version.clone(),
+            files_total: fl.assets.total,
+            files_gathered: fl.assets.vendored(),
+        }
     }
 
     /// `"175 BPM · 4/4"`, omitting whatever the project did not declare.
@@ -741,8 +806,8 @@ impl Project {
     ///
     /// `None` when the folder turns out not to hold a project after all.
     pub fn read_from_disk(root: &Path) -> Option<Self> {
-        let bundle = ableton::AbletonBundle::detect(root).ok().flatten()?;
-        let live_set = bundle.live_set().to_path_buf();
+        let found = DiscoveredProject::detect(root).ok().flatten()?;
+        let live_set = found.project_file().to_path_buf();
         let status = ProjectStatus::read_from_disk(&live_set);
         // Read once and reused for both the caption and the sort key, so the
         // two can never disagree about when this project was last saved.
@@ -753,7 +818,10 @@ impl Project {
         };
 
         Some(Self {
-            id: format!("project:{}", bundle.root().display()),
+            // Keyed on the project file, not the folder: a folder can hold
+            // several `.flp`s, and keying on it would make the second silently
+            // replace the first.
+            id: format!("project:{}", live_set.display()),
             name: live_set
                 .file_stem()
                 .and_then(|stem| stem.to_str())
@@ -764,9 +832,9 @@ impl Project {
                 .and_then(|name| name.to_str())
                 .unwrap_or_default()
                 .to_owned(),
-            local_path: bundle.root().display().to_string(),
+            local_path: found.directory().display().to_string(),
             size: String::new(),
-            format: ProjectFormat::AbletonLiveSet,
+            format: found.format(),
             status,
             last_activity: describe_modified(modified_at),
             safe_version: match status {
@@ -797,18 +865,7 @@ impl Project {
         let detail = ProjectInfo::from_snapshot_bytes(snapshot.as_bytes())
             .as_ref()
             .and_then(ProjectDetail::from_project_info);
-        let missing_plugins = ableton::read_plugins(&snapshot)
-            .map(|plugins| {
-                plugin_registry::resolve(
-                    &plugins,
-                    plugin_registry::bundled(),
-                    &PluginSearchPaths::detect(),
-                )
-                .iter()
-                .filter_map(MissingPlugin::from_resolved)
-                .collect()
-            })
-            .unwrap_or_default();
+        let missing_plugins = missing_plugins_for(&snapshot);
 
         LoadedDetail {
             size: describe_size(&snapshot, detail.as_ref()),
@@ -846,6 +903,7 @@ impl Project {
         match self.format {
             ProjectFormat::Dawproject => "DAWPROJECT",
             ProjectFormat::AbletonLiveSet => "ABLETON LIVE SET",
+            ProjectFormat::FlStudio => "FL STUDIO PROJECT",
             ProjectFormat::Auru => "AURU PROJECT",
         }
     }
@@ -853,6 +911,7 @@ impl Project {
     pub const fn open_label(&self) -> &'static str {
         match self.format {
             ProjectFormat::AbletonLiveSet => "OPEN IN ABLETON LIVE  ⌘↵",
+            ProjectFormat::FlStudio => "OPEN IN FL STUDIO  ⌘↵",
             ProjectFormat::Dawproject => "OPEN IN YOUR DAW  ⌘↵",
             ProjectFormat::Auru => "OPEN IN AURU STUDIO  ⌘↵",
         }
@@ -1101,8 +1160,14 @@ pub fn load_library(state: &mut crate::state::AppState) -> Vec<Project> {
     let mut roots: Vec<PathBuf> = Vec::new();
 
     for folder in &state.watched_folders {
-        for bundle in ableton::scan_for_projects(folder, &ableton::ScanOptions::default()) {
-            roots.push(bundle.root().to_path_buf());
+        for found in discovery::scan_for_projects(folder, &discovery::ScanOptions::default()) {
+            // The path that identifies this project: its folder when it owns
+            // one, otherwise the project file itself.
+            roots.push(if found.owns_its_directory() {
+                found.directory().to_path_buf()
+            } else {
+                found.project_file().to_path_buf()
+            });
         }
     }
     roots.extend(state.projects.iter().cloned());
@@ -1316,7 +1381,7 @@ mod tests {
             MissingPlugin::from_resolved(&make(PluginAvailability::NotOnThisComputer)).is_some()
         );
         assert!(MissingPlugin::from_resolved(&make(PluginAvailability::Installed)).is_none());
-        assert!(MissingPlugin::from_resolved(&make(PluginAvailability::BundledWithLive)).is_none());
+        assert!(MissingPlugin::from_resolved(&make(PluginAvailability::BundledWithDaw)).is_none());
         assert!(MissingPlugin::from_resolved(&make(PluginAvailability::Unknown)).is_none());
     }
 
@@ -1890,12 +1955,133 @@ mod tests {
         }
     }
 
+    /// A minimal `.flp` on disk, at `path`.
+    fn write_flp_at(path: &Path, channels: u16) {
+        use auru_pm::flstudio::{Event, Header, Stream};
+        let bytes = Stream {
+            header: Header {
+                format: 0,
+                channels,
+                ppq: 96,
+            },
+            events: vec![
+                Event::new(199, b"20.5.0.1142\0".to_vec()),
+                Event::new(156, 174_000u32.to_le_bytes()),
+                Event::new(17, [4]),
+                Event::new(18, [4]),
+            ],
+        }
+        .encode();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create dirs");
+        }
+        std::fs::write(path, bytes).expect("write flp");
+    }
+
+    #[test]
+    fn an_fl_project_should_be_read_from_disk_like_any_other() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("Doom.flp");
+        write_flp_at(&path, 12);
+
+        let project = Project::read_from_disk(&path).expect("a project");
+        assert_eq!(project.format, ProjectFormat::FlStudio);
+        assert_eq!(project.name, "Doom");
+        assert_eq!(project.file_name, "Doom.flp");
+        assert_eq!(project.format_label(), "FL STUDIO PROJECT");
+        assert!(project.open_label().contains("FL STUDIO"));
+    }
+
+    #[test]
+    fn two_fl_projects_in_one_folder_should_be_two_projects() {
+        // The trap the whole design turns on. Keying identity on the folder —
+        // which is right for Ableton — would make the second silently replace
+        // the first, and one of them would vanish from the library.
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_flp_at(&temp.path().join("One.flp"), 2);
+        write_flp_at(&temp.path().join("Two.flp"), 3);
+
+        let mut state = crate::state::AppState::default();
+        state.watch(temp.path());
+
+        let projects = load_library(&mut state);
+        assert_eq!(projects.len(), 2);
+        assert_ne!(projects[0].id, projects[1].id);
+    }
+
+    #[test]
+    fn an_fl_project_should_not_be_measured_by_the_folder_it_sits_in() {
+        // An `.flp` saved into a downloads folder does not own it. Measuring
+        // the folder would report someone's whole Downloads directory as the
+        // size of one project — and on a paid plan that is a bill.
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_flp_at(&temp.path().join("Song.flp"), 2);
+        std::fs::write(temp.path().join("unrelated.bin"), vec![0u8; 5_000_000]).expect("write");
+
+        let folder = WatchedFolder::scan(temp.path());
+        assert_eq!(folder.projects.len(), 1);
+        assert!(
+            folder.projects[0].bytes < 1_000,
+            "measured {} bytes, which is the folder rather than the project",
+            folder.projects[0].bytes
+        );
+    }
+
+    #[test]
+    fn a_watched_folder_should_find_both_daws_together() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_project_folder_at(&temp.path().join("Live Song Project"));
+        write_flp_at(&temp.path().join("FL Song.flp"), 2);
+
+        let folder = WatchedFolder::scan(temp.path());
+        let names: Vec<&str> = folder
+            .projects
+            .iter()
+            .map(|project| project.name.as_str())
+            .collect();
+        assert_eq!(names.len(), 2, "found {names:?}");
+        assert!(names.contains(&"FL Song"));
+    }
+
+    #[test]
+    fn fl_detail_should_come_from_the_real_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("Doom.flp");
+        write_flp_at(&path, 12);
+
+        let loaded = Project::detail_for(&path);
+        let detail = loaded.detail.expect("detail");
+        assert_eq!(detail.tempo, Some(174.0));
+        assert_eq!(detail.time_signature, Some((4, 4)));
+        assert_eq!(detail.tracks_total, 12, "FL counts channels, not tracks");
+        assert_eq!(
+            detail.key, None,
+            "FL records no project-wide key; inventing one would be a lie"
+        );
+    }
+
+    #[test]
+    fn every_import_kind_should_have_its_own_action_and_prompt() {
+        // Adding a DAW means adding a variant and nothing else; this catches a
+        // variant that was added without being given a menu line.
+        for kind in ImportKind::ALL {
+            assert!(!kind.label().is_empty());
+            assert!(!kind.prompt().is_empty());
+        }
+        assert_eq!(ImportKind::FlStudio.format(), ProjectFormat::FlStudio);
+        assert!(
+            !ImportKind::FlStudio.accepts_directories(),
+            "an FL project is a file; offering a folder invites picking one that cannot work"
+        );
+    }
+
     #[test]
     fn a_format_without_readable_detail_should_yield_none() {
         let info = ProjectInfo {
             schema: auru_pm::PROJECT_INFO_SCHEMA,
             format: ProjectFormat::Dawproject,
             ableton: None,
+            flstudio: None,
         };
         assert!(ProjectDetail::from_project_info(&info).is_none());
     }

@@ -47,7 +47,7 @@ fn main() -> ExitCode {
 
     let (third_party, from_live): (Vec<_>, Vec<_>) = resolved
         .iter()
-        .partition(|plugin| plugin.availability != PluginAvailability::BundledWithLive);
+        .partition(|plugin| plugin.availability != PluginAvailability::BundledWithDaw);
 
     if !third_party.is_empty() {
         println!("-- needs to be installed separately --");
@@ -74,7 +74,7 @@ fn main() -> ExitCode {
     }
 
     if !from_live.is_empty() {
-        println!("-- comes with Live --");
+        println!("-- comes with your DAW --");
         for plugin in &from_live {
             println!("  {:<24} ×{}", plugin.name, plugin.instances);
         }

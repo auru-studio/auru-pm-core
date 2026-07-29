@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ableton::AbletonMetadata;
+use crate::flstudio::FlStudioMetadata;
 use crate::hash::ContentHash;
 use crate::project_format::ProjectFormat;
 
@@ -37,6 +38,14 @@ pub struct ProjectInfo {
     /// Present for Ableton Live Sets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ableton: Option<AbletonMetadata>,
+    /// Present for FL Studio projects.
+    ///
+    /// A separate field rather than a shared shape: the two DAWs describe a
+    /// project in genuinely different terms — Ableton has scenes and a scale,
+    /// FL has patterns and a channel rack — and flattening them into one
+    /// struct would mean inventing values neither format records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flstudio: Option<FlStudioMetadata>,
 }
 
 impl ProjectInfo {
@@ -47,11 +56,20 @@ impl ProjectInfo {
     /// `None` rather than an empty summary keeps commits for those formats
     /// byte-identical to what they were before this existed.
     pub fn from_snapshot(snapshot: &Value) -> Option<Self> {
+        if let Some(flstudio) = crate::flstudio::metadata_from_value(snapshot) {
+            return Some(Self {
+                schema: PROJECT_INFO_SCHEMA,
+                format: ProjectFormat::FlStudio,
+                ableton: None,
+                flstudio: Some(flstudio),
+            });
+        }
         let ableton = crate::ableton::metadata_from_value(snapshot)?;
         Some(Self {
             schema: PROJECT_INFO_SCHEMA,
             format: ProjectFormat::AbletonLiveSet,
             ableton: Some(ableton),
+            flstudio: None,
         })
     }
 

@@ -57,9 +57,13 @@ const BUNDLED_REGISTRY: &str = include_str!("../data/plugins.json");
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum PluginSource {
-    /// Ships with Live. Nothing to obtain; if it is missing, the Live
+    /// Ships with the DAW. Nothing to obtain; if it is missing, the DAW
     /// installation is incomplete rather than the project.
-    BundledWithLive,
+    ///
+    /// The old `bundled-with-live` spelling is still accepted: a hosted
+    /// registry written before FL Studio was supported must keep working.
+    #[serde(rename = "bundled-with-daw", alias = "bundled-with-live")]
+    BundledWithDaw,
     /// Freely redistributable, with an official release to link to.
     ///
     /// Note `formats`: some open-source plugins are licensed such that their
@@ -85,7 +89,7 @@ impl PluginSource {
     /// A link to show the user, if there is one worth showing.
     pub fn link(&self) -> Option<&str> {
         match self {
-            Self::BundledWithLive => None,
+            Self::BundledWithDaw => None,
             Self::Download { url, .. } => Some(url),
             Self::Vendor { product_url, .. } => Some(product_url),
         }
@@ -101,6 +105,13 @@ pub struct PluginEntry {
     #[serde(default)]
     pub vendor: String,
     pub source: PluginSource,
+    /// Binary file names this plugin is known by, lowercase.
+    ///
+    /// FL Studio records no numeric identity for a hosted plugin — only the
+    /// file it loaded — so this is the only way one registry entry can serve
+    /// both DAWs. Ableton finds the same plugin by `id`; FL finds it here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
     /// Anything a person should know before going to get it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
@@ -122,9 +133,25 @@ pub struct PluginRegistry {
 
 impl PluginRegistry {
     /// Look up a plugin by identity.
+    ///
+    /// Falls back to matching a file name when the identity is one FL Studio
+    /// produced, so a project that loaded `Serum_x64.dll` resolves to the same
+    /// entry an Ableton project reaches by its VST2 identifier.
     pub fn get(&self, id: &PluginId) -> Option<&PluginEntry> {
         let key = id.to_string();
-        self.plugins.iter().find(|entry| entry.id == key)
+        if let Some(entry) = self.plugins.iter().find(|entry| entry.id == key) {
+            return Some(entry);
+        }
+
+        let PluginId::Vst2ByFile { file_name } = id else {
+            return None;
+        };
+        self.plugins.iter().find(|entry| {
+            entry
+                .files
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(file_name))
+        })
     }
 
     /// Index by identity, skipping entries whose key does not parse.
@@ -152,8 +179,9 @@ pub fn bundled() -> &'static PluginRegistry {
 pub enum PluginAvailability {
     /// Found on this machine.
     Installed,
-    /// Ships with Live, so it is present wherever Live is.
-    BundledWithLive,
+    /// Ships with the DAW, so it is present wherever the DAW is.
+    #[serde(rename = "bundled-with-daw", alias = "bundled-with-live")]
+    BundledWithDaw,
     /// Not found. Phrased throughout as "not on this computer" rather than
     /// "missing", because nothing is wrong with the project — this machine
     /// simply does not have the plugin yet.
@@ -166,7 +194,7 @@ impl PluginAvailability {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Installed => "installed",
-            Self::BundledWithLive => "comes with Live",
+            Self::BundledWithDaw => "comes with your DAW",
             Self::NotOnThisComputer => "not on this computer",
             Self::Unknown => "unknown",
         }
@@ -302,11 +330,11 @@ pub fn resolve(
             let bundled_with_live = plugin.format.is_native()
                 || matches!(
                     entry.map(|entry| &entry.source),
-                    Some(PluginSource::BundledWithLive)
+                    Some(PluginSource::BundledWithDaw)
                 );
 
             let availability = if bundled_with_live {
-                PluginAvailability::BundledWithLive
+                PluginAvailability::BundledWithDaw
             } else {
                 detect_availability(plugin, search_paths)
             };
@@ -481,7 +509,7 @@ mod tests {
         // worse than no entry: it claims knowledge it does not have.
         for entry in &registry().plugins {
             match &entry.source {
-                PluginSource::BundledWithLive => {}
+                PluginSource::BundledWithDaw => {}
                 source => assert!(
                     source
                         .link()
@@ -573,6 +601,75 @@ mod tests {
     }
 
     #[test]
+    fn an_fl_plugin_should_resolve_by_its_file_name() {
+        // FL records no numeric identity for a hosted plugin, so the file name
+        // is the only way one registry entry can serve both DAWs.
+        let entry = bundled()
+            .get(&PluginId::Vst2ByFile {
+                file_name: "serum_x64.dll".to_owned(),
+            })
+            .expect("Serum by file name");
+        assert_eq!(entry.name, "Serum");
+        assert_eq!(entry.vendor, "Xfer Records");
+    }
+
+    #[test]
+    fn a_file_name_should_match_whatever_case_it_was_written_in() {
+        // The name comes out of a path recorded on Windows, where case is not
+        // meaningful; matching exactly would miss half of them.
+        assert!(
+            bundled()
+                .get(&PluginId::Vst2ByFile {
+                    file_name: "Serum_x64.DLL".to_owned(),
+                })
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn an_unknown_file_should_not_resolve_to_something_else() {
+        // An entry under a wrong identity is worse than no entry: it would
+        // name one plugin and link to another.
+        assert!(
+            bundled()
+                .get(&PluginId::Vst2ByFile {
+                    file_name: "something_nobody_has_heard_of.dll".to_owned(),
+                })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fl_stock_plugins_should_be_known_and_namespaced_apart_from_live() {
+        let limiter = bundled()
+            .get(&PluginId::FlNative {
+                device: "Fruity Limiter".to_owned(),
+            })
+            .expect("Fruity Limiter");
+        assert_eq!(limiter.source, PluginSource::BundledWithDaw);
+        assert_eq!(limiter.vendor, "Image-Line");
+
+        // The same name under Ableton's namespace must not find it.
+        assert!(
+            bundled()
+                .get(&PluginId::Native {
+                    device: "Fruity Limiter".to_owned(),
+                })
+                .is_none(),
+            "an FL plugin resolved through Ableton's namespace"
+        );
+    }
+
+    #[test]
+    fn the_previous_spelling_of_the_bundled_source_should_still_parse() {
+        // A hosted registry written before FL Studio was supported says
+        // `bundled-with-live`; dropping it would break every such entry.
+        let json = r#"{"plugins":[{"id":"live:Eq8","name":"EQ Eight","vendor":"Ableton","source":{"kind":"bundled-with-live"}}]}"#;
+        let registry: PluginRegistry = serde_json::from_str(json).expect("parse");
+        assert_eq!(registry.plugins[0].source, PluginSource::BundledWithDaw);
+    }
+
+    #[test]
     fn live_devices_should_never_be_reported_as_missing() {
         // EQ Eight is not something to go and download.
         let plugins = [plugin(
@@ -584,10 +681,7 @@ mod tests {
         )];
         let resolved = resolve(&plugins, registry(), &no_search_paths());
 
-        assert_eq!(
-            resolved[0].availability,
-            PluginAvailability::BundledWithLive
-        );
+        assert_eq!(resolved[0].availability, PluginAvailability::BundledWithDaw);
         assert!(!resolved[0].blocks_playback());
         assert!(resolved[0].link().is_none(), "nothing to link to");
     }

@@ -45,6 +45,8 @@ pub enum ProjectFormat {
     Dawproject,
     /// Ableton Live Set `.als` gzip-compressed XML.
     AbletonLiveSet,
+    /// FL Studio `.flp` binary event stream.
+    FlStudio,
 }
 
 impl ProjectFormat {
@@ -57,6 +59,8 @@ impl ProjectFormat {
             Some(Self::Dawproject)
         } else if extension.eq_ignore_ascii_case("als") {
             Some(Self::AbletonLiveSet)
+        } else if extension.eq_ignore_ascii_case("flp") {
+            Some(Self::FlStudio)
         } else {
             None
         }
@@ -68,6 +72,7 @@ impl ProjectFormat {
             Self::Auru => "auru",
             Self::Dawproject => "dawproject",
             Self::AbletonLiveSet => "als",
+            Self::FlStudio => "flp",
         }
     }
 
@@ -82,6 +87,8 @@ impl ProjectFormat {
             .find(|byte| !byte.is_ascii_whitespace());
         if source.starts_with(&[0x1f, 0x8b]) {
             Ok(Self::AbletonLiveSet)
+        } else if crate::flstudio::is_flp(source) {
+            Ok(Self::FlStudio)
         } else if source.starts_with(b"PK\x03\x04")
             || source.starts_with(b"PK\x05\x06")
             || source.starts_with(b"PK\x07\x08")
@@ -91,7 +98,7 @@ impl ProjectFormat {
             Ok(Self::Auru)
         } else {
             Err(Error::ProjectFormat(format!(
-                "unsupported project file '{}'; expected .auru, .dawproject, or .als",
+                "unsupported project file '{}'; expected .auru, .dawproject, .als, or .flp",
                 path.display()
             )))
         }
@@ -104,6 +111,7 @@ impl fmt::Display for ProjectFormat {
             Self::Auru => "Auru",
             Self::Dawproject => "DAWproject",
             Self::AbletonLiveSet => "Ableton Live Set",
+            Self::FlStudio => "FL Studio Project",
         })
     }
 }
@@ -145,6 +153,7 @@ impl ProjectSnapshot {
             ProjectFormat::Auru => parse_auru(source)?,
             ProjectFormat::Dawproject => encode_dawproject(source)?,
             ProjectFormat::AbletonLiveSet => encode_ableton(source)?,
+            ProjectFormat::FlStudio => encode_flstudio(source)?,
         };
         Ok(Self {
             format,
@@ -227,6 +236,11 @@ impl ProjectSnapshot {
                 let snapshot: PortableSnapshot = serde_json::from_slice(&self.canonical_bytes)?;
                 snapshot.validate()?;
                 decode_ableton(&snapshot)
+            }
+            ProjectFormat::FlStudio => {
+                let snapshot: PortableSnapshot = serde_json::from_slice(&self.canonical_bytes)?;
+                snapshot.validate()?;
+                decode_flstudio(&snapshot)
             }
         }
     }
@@ -682,6 +696,36 @@ fn decode_ableton(snapshot: &PortableSnapshot) -> Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&xml)?;
     encoder.finish().map_err(Error::from)
+}
+
+/// Normalize an FL Studio project.
+///
+/// Unlike the Ableton path, the tree here is a faithful record of a binary
+/// stream: restoring it reproduces the original bytes. The one intentional
+/// difference is [`crate::flstudio::redact`], which empties the registration
+/// name so a shared backup does not carry the licence holder's identity.
+fn encode_flstudio(source: &[u8]) -> Result<Value> {
+    let mut stream = crate::flstudio::Stream::decode(source)?;
+    crate::flstudio::redact(&mut stream);
+
+    let snapshot = PortableSnapshot {
+        auru_pm_snapshot: SNAPSHOT_SCHEMA_VERSION,
+        format: ProjectFormat::FlStudio,
+        project: crate::flstudio::tree::to_document(&stream),
+        metadata: None,
+        resources: Vec::new(),
+    };
+    serde_json::to_value(snapshot).map_err(Error::from)
+}
+
+fn decode_flstudio(snapshot: &PortableSnapshot) -> Result<Vec<u8>> {
+    if snapshot.format != ProjectFormat::FlStudio {
+        return Err(Error::ProjectFormat(format!(
+            "expected FL Studio snapshot, found {}",
+            snapshot.format
+        )));
+    }
+    crate::flstudio::from_tree(&snapshot.project)
 }
 
 fn encode_dawproject(source: &[u8]) -> Result<Value> {

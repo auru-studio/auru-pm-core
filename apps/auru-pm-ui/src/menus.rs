@@ -19,6 +19,7 @@ actions!(
         // right thing. Adding a DAW means adding a variant here and a menu
         // line, nothing more.
         AddAbletonProject,
+        AddFlStudioProject,
         AddDawproject,
         AddAuruProject,
         // One per sort order, for the same reason: an action carrying a field
@@ -58,6 +59,7 @@ fn build_menus() -> Vec<Menu> {
         Menu::new("Auru PM").items(application_menu_items()),
         Menu::new("File").items([
             MenuItem::action("Add Ableton Live Project…", AddAbletonProject),
+            MenuItem::action("Add FL Studio Project…", AddFlStudioProject),
             MenuItem::action("Add DAWproject…", AddDawproject),
             MenuItem::action("Add Auru Project…", AddAuruProject),
             MenuItem::separator(),

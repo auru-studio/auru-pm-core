@@ -150,7 +150,7 @@ impl PathAlias {
 }
 
 /// An Ableton project folder on disk.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AbletonBundle {
     root: PathBuf,
     live_set: PathBuf,
@@ -432,9 +432,26 @@ fn looks_like_project_root(dir: &Path) -> bool {
 }
 
 fn is_live_set(path: &Path) -> bool {
+    if is_apple_double(path) {
+        return false;
+    }
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("als"))
+}
+
+/// Whether `path` is a macOS resource-fork companion rather than a real file.
+///
+/// A project authored on a Mac and copied to a non-Apple filesystem grows a
+/// `._Name` sibling for every file, and `._Song.als` ends in `.als`. Counting
+/// one as a Live Set makes a perfectly ordinary project look like it holds two,
+/// which is what a real Live 9 project here did — the folder became
+/// unopenable, reported as "contains 2 Live Sets and none matches the folder
+/// name".
+fn is_apple_double(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("._"))
 }
 
 fn top_level_live_sets(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -564,6 +581,25 @@ fn has_windows_drive(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_macos_resource_fork_should_not_count_as_a_live_set() {
+        // A project authored on a Mac and copied to another filesystem grows a
+        // `._Name` sibling for every file, and `._Song.als` ends in `.als`.
+        // Counting one made a real Live 9 project unopenable: it reported
+        // "contains 2 Live Sets and none matches the folder name".
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("1k remix Project");
+        std::fs::create_dir_all(root.join(PROJECT_INFO_DIR)).expect("mkdir");
+        std::fs::write(root.join("1k remix.als"), b"set").expect("write");
+        std::fs::write(root.join("._1k remix.als"), b"resource fork").expect("write");
+        std::fs::write(root.join("._Icon"), b"resource fork").expect("write");
+
+        let bundle = AbletonBundle::detect(&root)
+            .expect("detect")
+            .expect("a project");
+        assert_eq!(bundle.live_set(), root.join("1k remix.als"));
+    }
     use super::*;
 
     fn touch(path: &Path, bytes: &[u8]) {

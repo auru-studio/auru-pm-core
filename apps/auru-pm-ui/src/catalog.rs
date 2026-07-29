@@ -1,13 +1,24 @@
 use std::path::{Path, PathBuf};
 
-use auru_pm::{AURU_REGISTRY_URL, AuthMethod, Capabilities, RegistryEntry, fetch_registry};
+use auru_pm::{
+    AURU_REGISTRY_URL, AuthMethod, Capabilities, RegistryAvailability, RegistryDocument,
+    RegistryEntry, fetch_registry,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatalogState {
+    /// The published list is being fetched; no providers are shown yet.
     Loading,
     Live,
-    Fallback,
+    /// The list could not be reached.
+    ///
+    /// Distinct from [`Self::Loading`] because there is nothing more to wait
+    /// for, and the person is owed the reason rather than a spinner that never
+    /// resolves. Nothing is invented to fill the gap — a fabricated provider
+    /// list is worse than an empty one, since the entries would be things the
+    /// user cannot actually connect to.
+    Unreachable,
     /// Supplied by `--providers-file`.
     FromFile,
 }
@@ -15,9 +26,9 @@ pub enum CatalogState {
 impl CatalogState {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Loading => "CHECKING FIRST-PARTY LIST…",
+            Self::Loading => "CHECKING FOR PROVIDERS…",
             Self::Live => "FIRST-PARTY LIST",
-            Self::Fallback => "OFFLINE FALLBACK",
+            Self::Unreachable => "COULD NOT REACH THE PROVIDER LIST",
             Self::FromFile => "PROVIDER LIST FROM FILE",
         }
     }
@@ -81,7 +92,7 @@ impl AuthHint {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ProviderListing {
     pub entry: RegistryEntry,
     pub detail: String,
@@ -89,17 +100,32 @@ pub struct ProviderListing {
 }
 
 impl ProviderListing {
+    /// Present a registry entry in the picker.
     pub fn from_registry(entry: RegistryEntry) -> Self {
-        let detail = if entry.description.is_empty() {
-            entry.endpoint.clone()
-        } else {
-            entry.description.clone()
+        // The registry's own one-liner, falling back to whatever else it said.
+        let detail = [&entry.detail, &entry.description, &entry.endpoint]
+            .into_iter()
+            .find(|value| !value.is_empty())
+            .cloned()
+            .unwrap_or_default();
+
+        // What the registry asked for, falling back to the older
+        // `recommended` flag. `Connected` is never reachable from here: it is
+        // per-machine state the app applies afterwards, and a document fetched
+        // over the network must not be able to claim it.
+        let availability = match entry.availability {
+            RegistryAvailability::Recommended => ProviderAvailability::Recommended,
+            RegistryAvailability::OnYourNetwork => ProviderAvailability::OnYourNetwork,
+            RegistryAvailability::Available if entry.recommended => {
+                ProviderAvailability::Recommended
+            }
+            RegistryAvailability::Available => ProviderAvailability::Available,
         };
 
         Self {
             entry,
             detail,
-            availability: ProviderAvailability::Available,
+            availability,
         }
     }
 
@@ -129,183 +155,126 @@ impl ProviderListing {
     }
 }
 
-/// A provider list supplied by `--providers-file`.
+/// Read a registry from a file.
 ///
-/// Lets the desktop app be driven against a made-up catalogue while the real
-/// registry does not exist yet, and lets anyone reproduce a provider-picker
-/// state by handing over one file.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ProviderFile {
-    #[serde(default)]
-    pub providers: Vec<ProviderFileEntry>,
-}
-
-/// One provider as written in a providers file.
-///
-/// Deliberately flatter than [`RegistryEntry`]: this is a file a person writes
-/// by hand, so it asks for what has to be said and defaults the rest.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ProviderFileEntry {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub endpoint: String,
-    /// The line under the name, eg `"Hosted · eu-west · encrypted at rest"`.
-    #[serde(default)]
-    pub detail: String,
-    #[serde(default)]
-    pub availability: ProviderAvailability,
-    /// `"oauth_device_code"`, `"pat"`, or `"none"`. Defaults to `none`, so a
-    /// hand-written entry that says nothing about auth claims nothing.
-    #[serde(default)]
-    pub auth_methods: Vec<AuthMethod>,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub recommended: bool,
-}
-
-impl ProviderFileEntry {
-    fn into_listing(self) -> ProviderListing {
-        let auth_methods = if self.auth_methods.is_empty() {
-            vec![AuthMethod::None]
-        } else {
-            self.auth_methods
-        };
-        let detail = if self.detail.is_empty() {
-            if self.description.is_empty() {
-                self.endpoint.clone()
-            } else {
-                self.description.clone()
-            }
-        } else {
-            self.detail
-        };
-
-        ProviderListing {
-            entry: RegistryEntry {
-                id: self.id,
-                name: self.name,
-                endpoint: self.endpoint,
-                capabilities: Capabilities {
-                    auth_methods: auth_methods.clone(),
-                    ..Capabilities::default()
-                },
-                auth_methods,
-                icon_url: None,
-                description: self.description,
-                recommended: self.recommended,
-            },
-            detail,
-            availability: self.availability,
-        }
-    }
-}
-
-/// Read a provider list from `path`.
-///
-/// Errors name the file and say what was wrong with it — this is a file
-/// someone is editing, so the message needs to help them fix it.
+/// A `--providers-file` is just a registry that happens to live on disk, so it
+/// goes through the same parser as the published one.
 pub fn load_provider_file(path: &Path) -> Result<Vec<ProviderListing>, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| format!("couldn't read {}: {error}", path.display()))?;
-    let file: ProviderFile = serde_json::from_str(&text)
-        .map_err(|error| format!("{} isn't a valid provider list: {error}", path.display()))?;
+    parse_provider_list(&text, &path.display().to_string())
+}
 
-    if file.providers.is_empty() {
-        return Err(format!("{} lists no providers", path.display()));
+/// Read a provider list, from wherever it came.
+///
+/// One parser for the published list and for `--providers-file`, because they
+/// are the same document: someone can save what the server publishes, edit it,
+/// and pass it back with the flag, and get exactly what they expect. Two
+/// schemas for one concept would drift, and the drift would only show up as a
+/// provider list that mysteriously fails to load.
+fn parse_provider_list(text: &str, source: &str) -> Result<Vec<ProviderListing>, String> {
+    let document = RegistryDocument::parse(text)
+        .map_err(|error| format!("{source} isn't a valid provider list: {error}"))?;
+
+    if document.providers.is_empty() {
+        return Err(format!("{source} lists no providers"));
     }
 
-    Ok(file
+    Ok(document
         .providers
         .into_iter()
-        .map(ProviderFileEntry::into_listing)
+        .map(ProviderListing::from_registry)
         .collect())
 }
 
-fn entry(
-    id: &str,
-    name: &str,
-    endpoint: &str,
-    auth_methods: Vec<AuthMethod>,
-    description: &str,
-    recommended: bool,
-) -> RegistryEntry {
-    RegistryEntry {
-        id: id.to_owned(),
-        name: name.to_owned(),
-        endpoint: endpoint.to_owned(),
-        capabilities: Capabilities {
-            auth_methods: auth_methods.clone(),
-            ..Capabilities::default()
+/// Prefix marking a provider that is a folder rather than a server.
+const LOCAL_ID_PREFIX: &str = "local:";
+
+/// A destination that is just a folder — an external drive, or a NAS share
+/// mounted on this machine.
+///
+/// Not every safe copy needs a server. A NAS with no Auru software on it is a
+/// perfectly good second home for a project, and treating it as a provider that
+/// happens to need no authentication means the rest of the app — pushing,
+/// history, restore — works against it unchanged.
+///
+/// Stored as a `file://` endpoint so it is distinguishable from an HTTP
+/// provider by inspection rather than by a separate flag.
+pub fn local_provider(path: &Path) -> ProviderListing {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Local folder")
+        .to_owned();
+
+    ProviderListing {
+        entry: RegistryEntry {
+            // Path-derived, so adding the same folder twice replaces rather
+            // than duplicates it.
+            id: format!("{LOCAL_ID_PREFIX}{}", path.display()),
+            name,
+            endpoint: format!("file://{}", path.display()),
+            capabilities: Capabilities::default(),
+            // A folder authenticates nobody. Saying so explicitly is what stops
+            // the connect screen asking for a token that does not exist.
+            auth_methods: vec![AuthMethod::None],
+            icon_url: None,
+            description: path.display().to_string(),
+            detail: path.display().to_string(),
+            recommended: false,
+            availability: RegistryAvailability::OnYourNetwork,
         },
-        auth_methods,
-        icon_url: None,
-        description: description.to_owned(),
-        recommended,
+        detail: path.display().to_string(),
+        availability: ProviderAvailability::OnYourNetwork,
     }
 }
 
-pub fn stub_provider_catalog() -> Vec<ProviderListing> {
-    vec![
-        ProviderListing {
-            entry: entry(
-                "auru-cloud",
-                "Auru Cloud",
-                "https://pm.auru.studio",
-                vec![AuthMethod::OAuthDeviceCode],
-                "Hosted backup with encrypted storage",
-                true,
-            ),
-            detail: "Hosted · eu-west · encrypted at rest".to_owned(),
-            availability: ProviderAvailability::Connected,
-        },
-        ProviderListing {
-            entry: entry(
-                "studio-nas",
-                "Studio NAS",
-                "http://studio-nas.local:3000",
-                vec![AuthMethod::None],
-                "A provider discovered on this network",
-                false,
-            ),
-            detail: "studio-nas.local · private network".to_owned(),
-            availability: ProviderAvailability::OnYourNetwork,
-        },
-        ProviderListing {
-            entry: entry(
-                "s3-archive",
-                "S3 Archive",
-                "https://s3-provider.example",
-                vec![AuthMethod::Pat],
-                "Bring an existing S3-compatible archive",
-                false,
-            ),
-            detail: "S3-compatible · personal access token".to_owned(),
-            availability: ProviderAvailability::Available,
-        },
-    ]
+impl ProviderListing {
+    /// Whether this destination is a folder on this machine or network.
+    pub fn is_local(&self) -> bool {
+        self.entry.id.starts_with(LOCAL_ID_PREFIX)
+    }
+
+    /// The folder behind a local destination.
+    ///
+    /// The bridge to `FilesystemProvider` once pushing is wired up; until then
+    /// nothing in the app constructs a provider, so this has no caller outside
+    /// its tests. Kept because it is where that wiring attaches.
+    #[allow(dead_code)]
+    pub fn local_path(&self) -> Option<PathBuf> {
+        self.entry
+            .id
+            .strip_prefix(LOCAL_ID_PREFIX)
+            .map(PathBuf::from)
+    }
 }
 
+/// Fetch the published registry.
+///
+/// The default source of providers, cached for a day by
+/// [`auru_pm::registry`] so a launch is not held up by the network.
+/// `--providers-file` overrides it, which is how a studio points the app at
+/// its own list.
 pub fn fetch_first_party_catalog() -> Result<Vec<ProviderListing>, String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| format!("provider catalog runtime: {error}"))?;
+
     let entries = runtime
         .block_on(fetch_registry(AURU_REGISTRY_URL, &catalog_cache_path()))
         .map_err(|error| error.to_string())?;
 
     if entries.is_empty() {
-        return Err("provider catalog returned no entries".to_owned());
+        return Err(format!("{AURU_REGISTRY_URL} lists no providers"));
     }
-
     Ok(entries
         .into_iter()
         .map(ProviderListing::from_registry)
         .collect())
 }
 
+/// Where the registry is cached between launches.
 fn catalog_cache_path() -> PathBuf {
     std::env::temp_dir()
         .join("auru-pm")
@@ -316,9 +285,51 @@ fn catalog_cache_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    /// Exactly what `https://pm.auru.studio/providers.json` serves today.
+    ///
+    /// Pinned verbatim because the app is useless if this stops parsing, and
+    /// the failure would be silent — an empty picker rather than an error.
+    const PUBLISHED: &str = r#"{"providers":[{"id":"auru-cloud","name":"Auru Cloud","endpoint":"https://pm.auru.studio","detail":"Hosted · au-melb · encrypted at rest","availability":"recommended","auth_methods":["oauth_device_code"],"description":"Hosted backup with encrypted storage","recommended":true}]}"#;
+
+    #[test]
+    fn the_published_provider_list_should_parse() {
+        let providers = parse_provider_list(PUBLISHED, "published").expect("parse");
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].entry.name, "Auru Cloud");
+        assert_eq!(providers[0].entry.endpoint, "https://pm.auru.studio");
+        assert_eq!(providers[0].detail, "Hosted · au-melb · encrypted at rest");
+        assert_eq!(providers[0].availability, ProviderAvailability::Recommended);
+    }
+
+    #[test]
+    fn the_published_list_and_the_flag_should_read_the_same_document() {
+        // Someone can save what the server publishes, edit it, and pass it back
+        // with --providers-file. Two schemas for one concept would drift, and
+        // the drift would surface only as a list that fails to load.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("providers.json");
+        std::fs::write(&path, PUBLISHED).expect("write");
+
+        let from_file = load_provider_file(&path).expect("from file");
+        let from_network = parse_provider_list(PUBLISHED, "published").expect("from network");
+
+        assert_eq!(from_file.len(), from_network.len());
+        assert_eq!(from_file[0].entry.id, from_network[0].entry.id);
+        assert_eq!(from_file[0].detail, from_network[0].detail);
+    }
+
+    #[test]
+    fn an_empty_or_broken_list_should_be_an_error_not_an_empty_picker() {
+        // A list that parses to nothing is a misconfiguration, not a state to
+        // render silently.
+        assert!(parse_provider_list(r#"{"providers":[]}"#, "test").is_err());
+        assert!(parse_provider_list("not json", "test").is_err());
+    }
+
     #[test]
     fn oauth_provider_should_require_authentication() {
-        let providers = stub_provider_catalog();
+        let providers = parse_provider_list(PUBLISHED, "published").expect("parse");
 
         assert!(providers[0].requires_authentication());
         assert_eq!(
@@ -329,10 +340,86 @@ mod tests {
 
     #[test]
     fn provider_advertising_none_should_connect_directly() {
-        let providers = stub_provider_catalog();
+        let json = r#"{"providers":[{"id":"studio-nas","name":"Studio NAS","endpoint":"http://nas.local:3000","auth_methods":["none"]}]}"#;
+        let providers = parse_provider_list(json, "test").expect("parse");
 
-        assert!(!providers[1].requires_authentication());
-        assert_eq!(providers[1].preferred_auth_method(), AuthMethod::None);
+        assert!(!providers[0].requires_authentication());
+        assert_eq!(providers[0].preferred_auth_method(), AuthMethod::None);
+    }
+
+    #[test]
+    fn an_entry_that_says_nothing_about_availability_should_be_available() {
+        let json = r#"{"providers":[{"id":"remote","name":"Remote","endpoint":"https://remote.example","description":"Remote provider"}]}"#;
+        let providers = parse_provider_list(json, "test").expect("parse");
+
+        assert_eq!(providers[0].availability, ProviderAvailability::Available);
+    }
+
+    #[test]
+    fn a_registry_should_not_be_able_to_claim_you_are_connected() {
+        // Connection is per-machine state. A document fetched over the network
+        // asserting it would show a provider as ready to use when it is not,
+        // and the type system is what stops that rather than a check.
+        let json = r#"{"providers":[{"id":"a","name":"A","endpoint":"https://a.example","availability":"connected"}]}"#;
+        let providers = parse_provider_list(json, "test").expect("parse");
+        assert_ne!(providers[0].availability, ProviderAvailability::Connected);
+    }
+
+    #[test]
+    fn a_registry_may_say_a_provider_is_on_your_network() {
+        // A studio's own registry knows this about its own NAS.
+        let json = r#"{"providers":[{"id":"nas","name":"NAS","endpoint":"http://nas.local:3000","availability":"on-your-network"}]}"#;
+        let providers = parse_provider_list(json, "test").expect("parse");
+        assert_eq!(
+            providers[0].availability,
+            ProviderAvailability::OnYourNetwork
+        );
+    }
+
+    #[test]
+    fn a_local_folder_should_need_no_account() {
+        // The whole point of a local destination: a NAS share with no Auru
+        // software on it is a valid second home, and asking for a token that
+        // does not exist would make it unusable.
+        let listing = local_provider(Path::new("/mnt/nas/Auru Backups"));
+
+        assert!(listing.is_local());
+        assert!(!listing.requires_authentication());
+        assert_eq!(listing.preferred_auth_method(), AuthMethod::None);
+        assert_eq!(listing.entry.name, "Auru Backups");
+        assert_eq!(
+            listing.local_path().as_deref(),
+            Some(Path::new("/mnt/nas/Auru Backups"))
+        );
+    }
+
+    #[test]
+    fn the_same_folder_should_always_produce_the_same_identity() {
+        // Identity is the path, so adding a folder twice replaces rather than
+        // duplicating it.
+        let path = Path::new("/mnt/nas/Backups");
+        assert_eq!(local_provider(path).entry.id, local_provider(path).entry.id);
+        assert_ne!(
+            local_provider(path).entry.id,
+            local_provider(Path::new("/mnt/other/Backups")).entry.id
+        );
+    }
+
+    #[test]
+    fn a_fetched_provider_should_not_be_mistaken_for_a_local_one() {
+        let providers = parse_provider_list(PUBLISHED, "published").expect("parse");
+        assert!(!providers[0].is_local());
+        assert_eq!(providers[0].local_path(), None);
+    }
+
+    #[test]
+    fn an_unreachable_list_should_be_distinguishable_from_a_loading_one() {
+        // Both leave the picker empty; only one is worth waiting on, so the
+        // states must not read alike.
+        assert_ne!(
+            CatalogState::Loading.label(),
+            CatalogState::Unreachable.label()
+        );
     }
 
     fn write(path: &Path, body: &str) {
@@ -454,21 +541,23 @@ mod tests {
         let hint = AuthHint::for_method(&AuthMethod::Pat);
         assert!(hint.detail.contains("keychain"), "{}", hint.detail);
     }
+}
 
+#[cfg(test)]
+mod live_fetch {
+    /// Hits the network. Ignored by default; run with
+    /// `cargo test --offline -- --ignored live_fetch`.
     #[test]
-    fn registry_entry_should_become_an_available_listing() {
-        let entry = entry(
-            "remote",
-            "Remote",
-            "https://remote.example",
-            vec![AuthMethod::None],
-            "Remote provider",
-            true,
-        );
-
-        let listing = ProviderListing::from_registry(entry);
-
-        assert_eq!(listing.availability, ProviderAvailability::Available);
-        assert_eq!(listing.detail, "Remote provider");
+    #[ignore = "requires network"]
+    fn the_published_list_should_be_reachable_and_parse() {
+        let providers = super::fetch_first_party_catalog().expect("fetch");
+        assert!(!providers.is_empty());
+        for provider in &providers {
+            println!(
+                "  {} · {} · {:?}",
+                provider.entry.name, provider.detail, provider.availability
+            );
+        }
     }
 }
+

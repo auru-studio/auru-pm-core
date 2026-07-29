@@ -23,6 +23,14 @@ pub const STATE_SCHEMA: u32 = 1;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppState {
+    /// Where this state was read from, and the only place it will be written.
+    ///
+    /// Absent on a state built in memory, which makes [`Self::save`] a no-op.
+    /// That is deliberate: `load_library` persists first-seen times, so without
+    /// this a test constructing a throwaway `AppState` would overwrite the
+    /// real user's settings — which is exactly what happened.
+    #[serde(skip)]
+    origin: Option<PathBuf>,
     pub schema: u32,
     /// Name shown against saved versions.
     pub display_name: String,
@@ -42,6 +50,13 @@ pub struct AppState {
     pub first_seen: BTreeMap<String, i64>,
     /// Folders scanned for projects.
     pub watched_folders: Vec<PathBuf>,
+    /// Folders used as backup destinations — an external drive, or a NAS share.
+    ///
+    /// Kept apart from `watched_folders`: one is where projects are *read
+    /// from*, the other where copies are *written to*, and conflating them
+    /// would eventually have Auru back a project up into itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_providers: Vec<PathBuf>,
     /// Projects added individually, outside any watched folder.
     pub projects: Vec<PathBuf>,
 }
@@ -49,6 +64,7 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            origin: None,
             schema: STATE_SCHEMA,
             display_name: String::new(),
             appearance: "night".to_owned(),
@@ -58,6 +74,7 @@ impl Default for AppState {
             sort_order: "attention".to_owned(),
             first_seen: BTreeMap::new(),
             watched_folders: Vec::new(),
+            local_providers: Vec::new(),
             projects: Vec::new(),
         }
     }
@@ -86,6 +103,14 @@ impl AppState {
     }
 
     pub fn load_from(path: &Path) -> Self {
+        let mut state = Self::read_from(path);
+        // Remember where it came from, whether or not it parsed: a state that
+        // fell back to defaults still belongs to this file.
+        state.origin = Some(path.to_path_buf());
+        state
+    }
+
+    fn read_from(path: &Path) -> Self {
         let Ok(text) = std::fs::read_to_string(path) else {
             return Self::default();
         };
@@ -106,9 +131,12 @@ impl AppState {
         }
     }
 
-    /// Write the state out. Best-effort: a failure is reported, never fatal.
+    /// Write the state back where it came from.
+    ///
+    /// Best-effort: a failure is reported, never fatal. A state with no origin
+    /// — one built in memory — writes nowhere at all.
     pub fn save(&self) {
-        let Some(path) = Self::path() else {
+        let Some(path) = self.origin.clone() else {
             return;
         };
         if let Err(error) = self.save_to(&path) {
@@ -153,6 +181,13 @@ impl AppState {
         }
         if !self.projects.iter().any(|known| known == root) {
             self.projects.push(root.to_path_buf());
+        }
+    }
+
+    /// Add a backup destination folder, ignoring one already recorded.
+    pub fn add_local_provider(&mut self, path: &Path) {
+        if !self.local_providers.iter().any(|known| known == path) {
+            self.local_providers.push(path.to_path_buf());
         }
     }
 
@@ -225,6 +260,39 @@ mod tests {
         assert_eq!(loaded.appearance, "day");
         assert_eq!(loaded.watched_folders.len(), 1);
         assert_eq!(loaded.projects.len(), 1);
+    }
+
+    #[test]
+    fn a_state_built_in_memory_should_never_write_to_the_real_config() {
+        // `load_library` persists first-seen times, so a throwaway state that
+        // could reach the user's own file would overwrite their settings when
+        // the test suite ran. It did, once.
+        let mut state = AppState {
+            display_name: "should not be written".to_owned(),
+            ..AppState::default()
+        };
+        state.note_first_seen("/somewhere");
+
+        // No origin, so nothing to write to — and nothing written.
+        state.save();
+
+        let on_disk = AppState::path()
+            .map(|path| AppState::load_from(&path).display_name)
+            .unwrap_or_default();
+        assert_ne!(on_disk, "should not be written");
+    }
+
+    #[test]
+    fn a_state_read_from_a_file_should_save_back_to_that_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("state.json");
+        AppState::default().save_to(&path).expect("seed");
+
+        let mut state = AppState::load_from(&path);
+        state.display_name = "Jake".to_owned();
+        state.save();
+
+        assert_eq!(AppState::load_from(&path).display_name, "Jake");
     }
 
     #[test]
