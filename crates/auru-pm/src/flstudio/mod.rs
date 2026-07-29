@@ -40,7 +40,7 @@ pub fn plan_bundle_assets(
     source: &[u8],
     aliases: &[crate::ableton::PathAlias],
 ) -> Result<AssetPlan> {
-    Ok(assets::plan(&read_asset_refs(source)?, aliases))
+    plan_bundle_assets_from_directory(source, None, aliases)
 }
 
 /// Work out what a backup captures when the directory containing the `.flp`

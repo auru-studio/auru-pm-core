@@ -147,7 +147,7 @@ impl SampleManifest {
 /// Dispatches on what the project is:
 ///
 /// - **Native Auru** — the audio its clips reference. Absolute clip paths keep
-///   their historical behaviour; relative paths resolve from `project_root`
+///   their historical behaviour; relative paths resolve from `project_directory`
 ///   while retaining the raw path as the manifest key.
 /// - **Ableton Live Set with a project folder** — the folder's contents plus
 ///   everything referenced from outside it, gathered in.
@@ -160,17 +160,17 @@ impl SampleManifest {
 ///   decodes it directly rather than routing it through this filesystem plan.
 pub fn plan_assets(
     snapshot: &Value,
-    project_root: Option<&Path>,
+    project_directory: Option<&Path>,
     policy: &BundlePolicy,
 ) -> Vec<PlannedAsset> {
     if crate::ableton::is_ableton_snapshot(snapshot) {
-        return match project_root {
+        return match project_directory {
             Some(root) => crate::ableton::plan_assets_from_value(snapshot, root, policy).assets,
             None => Vec::new(),
         };
     }
     if snapshot_format(snapshot) == Some(crate::ProjectFormat::FlStudio) {
-        return flstudio_assets_from_value(snapshot, project_root, policy);
+        return flstudio_assets_from_value(snapshot, project_directory, policy);
     }
     // Native: the manifest path stays the raw clip path, which keeps existing
     // commits and their ids byte-identical.
@@ -178,7 +178,7 @@ pub fn plan_assets(
         .into_iter()
         .map(|path| {
             let recorded = PathBuf::from(&path);
-            let source = match (recorded.is_relative(), project_root) {
+            let source = match (recorded.is_relative(), project_directory) {
                 (true, Some(root)) => root.join(&recorded),
                 _ => recorded,
             };
