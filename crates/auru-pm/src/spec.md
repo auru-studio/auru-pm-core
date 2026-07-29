@@ -81,6 +81,7 @@ Public. Returns provider metadata.
   "protocol": "auru-pm-v1",
   "name": "Auru Cloud",
   "capabilities": {
+    "project_listing": true,
     "members": true,
     "permissions": true,
     "branches": false,
@@ -88,6 +89,40 @@ Public. Returns provider metadata.
     "auth_methods": ["oauth_device_code"]
   }
 }
+```
+
+### `GET /v1/projects` *(capability: `project_listing`)*
+
+Lists projects visible to the authenticated account, newest first. This is the
+recovery entry point on a machine that has no project sidecars yet.
+
+```json
+{
+  "projects": [
+    {
+      "handle": "opaque-provider-handle",
+      "head": "blake3:...",
+      "profile": {
+        "display_name": "Night Drive",
+        "format": "ableton-live-set"
+      },
+      "updated_at": 1750000000
+    }
+  ]
+}
+```
+
+`profile` may be absent for a project written by a client predating this
+endpoint. The client then reads the HEAD snapshot to determine its format and
+uses the opaque handle as a fallback display name.
+
+### `PUT /v1/projects/{handle}` *(capability: `project_listing`)*
+
+Idempotently registers the human-facing metadata required by the account
+project list. It does not create a commit or move HEAD.
+
+```json
+{ "display_name": "Night Drive", "format": "ableton-live-set" }
 ```
 
 ### `GET /v1/projects/{handle}/head`
@@ -165,7 +200,8 @@ Idempotent: re-uploading an existing hash is `200 OK`.
 ### `GET /v1/blobs/{hash}`
 
 Download a blob. Body is the raw bytes; `Content-Type:
-application/octet-stream`. `404` if absent.
+application/octet-stream`. `404` if absent. Clients MUST verify the downloaded
+bytes hash to `{hash}` before using them.
 
 ### `GET /v1/projects/{handle}/members` *(capability: `members`)*
 

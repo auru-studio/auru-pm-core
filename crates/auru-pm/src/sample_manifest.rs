@@ -146,8 +146,9 @@ impl SampleManifest {
 ///
 /// Dispatches on what the project is:
 ///
-/// - **Native Auru** — the audio its clips reference, exactly as before
-///   project folders existed. `project_root` is not consulted.
+/// - **Native Auru** — the audio its clips reference. Absolute clip paths keep
+///   their historical behaviour; relative paths resolve from `project_root`
+///   while retaining the raw path as the manifest key.
 /// - **Ableton Live Set with a project folder** — the folder's contents plus
 ///   everything referenced from outside it, gathered in.
 /// - **FL Studio** — every sample referenced by the event stream, gathered
@@ -172,11 +173,18 @@ pub fn plan_assets(
     // commits and their ids byte-identical.
     sample_paths_in_snapshot(snapshot)
         .into_iter()
-        .map(|path| PlannedAsset {
-            source: PathBuf::from(&path),
-            bundle_path: path,
-            kind: AssetKind::Sample,
-            origin: None,
+        .map(|path| {
+            let recorded = PathBuf::from(&path);
+            let source = match (recorded.is_relative(), project_root) {
+                (true, Some(root)) => root.join(&recorded),
+                _ => recorded,
+            };
+            PlannedAsset {
+                source,
+                bundle_path: path,
+                kind: AssetKind::Sample,
+                origin: None,
+            }
         })
         .collect()
 }
@@ -347,6 +355,27 @@ mod tests {
                 .iter()
                 .all(|asset| asset.source.as_os_str() == asset.bundle_path.as_str())
         );
+    }
+
+    #[test]
+    fn native_relative_sample_paths_should_resolve_from_the_project_folder() {
+        let snapshot = serde_json::json!({
+            "channels": [{ "clips": [{
+                "data": { "Audio": { "file_path": "Samples/kick.wav" } }
+            }]}]
+        });
+
+        let planned = plan_assets(
+            &snapshot,
+            Some(Path::new("/projects/Song")),
+            &BundlePolicy::default(),
+        );
+
+        assert_eq!(
+            planned[0].source,
+            Path::new("/projects/Song/Samples/kick.wav")
+        );
+        assert_eq!(planned[0].bundle_path, "Samples/kick.wav");
     }
 
     #[test]

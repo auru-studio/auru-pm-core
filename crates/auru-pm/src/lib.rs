@@ -46,7 +46,7 @@ pub use discovery::{DiscoveredProject, read_headline};
 pub use error::{Error, Result};
 pub use filesystem::FilesystemProvider;
 pub use hash::{ContentHash, ParseHashError};
-pub use http::HttpProvider;
+pub use http::{HttpAccount, HttpProvider};
 pub use merge::{
     ConflictChoice, ConflictResolution, ConflictedField, MergeOutcome, merge3, merge3_json_bytes,
     resolve_conflicts,
@@ -59,7 +59,8 @@ pub use plugin_registry::{
 pub use project_format::{ProjectFormat, ProjectSnapshot, restore_project, snapshot_project};
 pub use project_info::{PROJECT_INFO_SCHEMA, ProjectInfo};
 pub use provider::{
-    AuthMethod, Capabilities, HeadAdvance, Member, PermSet, ProjectProvider, UserId,
+    AuthMethod, Capabilities, HeadAdvance, Member, PermSet, ProjectProfile, ProjectProvider,
+    ProviderProject, UserId,
 };
 pub use registry::{
     AURU_REGISTRY_URL, RegistryAvailability, RegistryDocument, RegistryEntry,

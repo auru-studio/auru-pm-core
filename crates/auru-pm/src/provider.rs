@@ -4,6 +4,14 @@ use serde::{Deserialize, Serialize};
 use crate::commit::{Commit, CommitId, CommitSummary, HistoryRange};
 use crate::error::{Error, Result};
 use crate::hash::ContentHash;
+use crate::project_format::ProjectFormat;
+
+/// Metadata registered for a project so an account-level catalogue can show
+/// it without downloading the latest snapshot.
+pub type ProjectProfile = auru_pm_protocol::ProjectProfile<ProjectFormat>;
+
+/// One project returned by a provider account catalogue.
+pub type ProviderProject = auru_pm_protocol::ProviderProject<CommitId, ProjectFormat>;
 
 /// What a provider can do beyond the dumb-core surface.
 ///
@@ -13,6 +21,9 @@ use crate::hash::ContentHash;
 /// trait method returns [`Error::Unsupported`] when the flag is `false`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Capabilities {
+    /// Whether the provider implements account-level project discovery.
+    #[serde(default)]
+    pub project_listing: bool,
     pub members: bool,
     pub permissions: bool,
     pub branches: bool,
@@ -140,6 +151,15 @@ pub trait ProjectProvider: Send + Sync {
     async fn advance_head(&self, from: Option<CommitId>, to: CommitId) -> Result<HeadAdvance>;
 
     // -- Optional, capability-gated ------------------------------------
+
+    /// Store the human-facing metadata used by account-level project lists.
+    ///
+    /// Available iff `capabilities().project_listing`. Providers should treat
+    /// this as an idempotent upsert for the current project handle.
+    async fn put_project_profile(&self, _profile: &ProjectProfile) -> Result<()> {
+        Err(Error::Unsupported("project listing"))
+    }
+
     //
     // ╔═══ TEAMS INTEGRATION BOUNDARY ═════════════════════════════════╗
     // The two methods below are the M6 teams-readiness hooks. They give

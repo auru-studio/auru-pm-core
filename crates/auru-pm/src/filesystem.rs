@@ -30,7 +30,8 @@ use crate::commit::{Commit, CommitId, CommitSummary, HistoryRange};
 use crate::error::{Error, Result};
 use crate::hash::ContentHash;
 use crate::provider::{
-    AuthMethod, Capabilities, HeadAdvance, Member, PermSet, ProjectProvider, UserId,
+    AuthMethod, Capabilities, HeadAdvance, Member, PermSet, ProjectProfile, ProjectProvider,
+    ProviderProject, UserId,
 };
 
 /// Default cap for [`ProjectProvider::list_history`] when the caller
@@ -38,6 +39,7 @@ use crate::provider::{
 /// size; deliberately small so a 10k-commit project doesn't fault in
 /// every commit on first open.
 const DEFAULT_HISTORY_LIMIT: u32 = 100;
+const PROJECT_PROFILE_FILE: &str = "project.json";
 
 #[derive(Clone, Debug)]
 pub struct FilesystemProvider {
@@ -76,6 +78,53 @@ impl FilesystemProvider {
     /// map.
     pub fn provider_id(&self) -> String {
         format!("local-folder://{}", self.root.display())
+    }
+
+    /// List every project repository beneath an account-level projects root.
+    ///
+    /// A broken or half-created child is skipped so one damaged project does
+    /// not hide every other recovery option on the drive.
+    pub fn list_projects(root: &Path) -> Result<Vec<ProviderProject>> {
+        let entries = match fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(Error::Io(error)),
+        };
+        let mut projects = Vec::new();
+        for entry in entries {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let handle = entry.file_name().to_string_lossy().into_owned();
+            let Ok(provider) = Self::open(entry.path()) else {
+                continue;
+            };
+            let Ok(Some(head)) = provider.read_head() else {
+                continue;
+            };
+            let Ok(commit) = provider.read_commit(&head) else {
+                continue;
+            };
+            let profile = fs::read(provider.root.join(PROJECT_PROFILE_FILE))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+            projects.push(ProviderProject {
+                handle,
+                head,
+                profile,
+                updated_at: commit.timestamp,
+            });
+        }
+        projects.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.handle.cmp(&right.handle))
+        });
+        Ok(projects)
     }
 
     fn head_path(&self) -> PathBuf {
@@ -129,12 +178,24 @@ impl FilesystemProvider {
         let commit: Commit = serde_json::from_value(value)?;
         Ok(commit)
     }
+
+    fn write_project_profile(&self, profile: &ProjectProfile) -> Result<()> {
+        let path = self.root.join(PROJECT_PROFILE_FILE);
+        let body = serde_json::to_vec_pretty(profile)?;
+        // Unlike commits, this small cache is reconstructible from HEAD when
+        // absent or malformed. A direct overwrite also keeps the required
+        // idempotent upsert semantics on Windows, where rename does not
+        // replace an existing destination.
+        fs::write(path, body)?;
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl ProjectProvider for FilesystemProvider {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            project_listing: true,
             members: false,
             permissions: false,
             branches: false,
@@ -210,6 +271,10 @@ impl ProjectProvider for FilesystemProvider {
         }
         self.write_head(Some(to))?;
         Ok(HeadAdvance::Advanced)
+    }
+
+    async fn put_project_profile(&self, profile: &ProjectProfile) -> Result<()> {
+        self.write_project_profile(profile)
     }
 
     async fn list_members(&self) -> Result<Vec<Member>> {
@@ -379,6 +444,47 @@ mod tests {
             let msgs: Vec<&str> = h.iter().map(|s| s.message.as_str()).collect();
             assert_eq!(msgs, vec!["second", "first"]);
         });
+    }
+
+    #[test]
+    fn an_account_projects_root_should_list_committed_projects() {
+        let dir = TempDir::new().unwrap();
+        let projects_root = dir.path().join("projects");
+        let provider = FilesystemProvider::open(projects_root.join("night-drive")).unwrap();
+        let commit = build_commit("first", None);
+        let profile = ProjectProfile {
+            display_name: "Night Drive".into(),
+            format: crate::ProjectFormat::AbletonLiveSet,
+        };
+
+        rt().block_on(async {
+            provider.put_commit(&commit).await.unwrap();
+            provider.put_project_profile(&profile).await.unwrap();
+            provider
+                .put_project_profile(&ProjectProfile {
+                    display_name: "Night Drive (Renamed)".into(),
+                    ..profile.clone()
+                })
+                .await
+                .unwrap();
+            provider.advance_head(None, commit.id).await.unwrap();
+        });
+        // A half-created child has no HEAD and must not hide the valid one.
+        fs::create_dir_all(projects_root.join("unfinished")).unwrap();
+
+        let projects = FilesystemProvider::list_projects(&projects_root).unwrap();
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].handle, "night-drive");
+        assert_eq!(projects[0].head, commit.id);
+        assert_eq!(
+            projects[0]
+                .profile
+                .as_ref()
+                .map(|profile| profile.display_name.as_str()),
+            Some("Night Drive (Renamed)")
+        );
+        assert_eq!(projects[0].updated_at, commit.timestamp);
     }
 
     #[test]

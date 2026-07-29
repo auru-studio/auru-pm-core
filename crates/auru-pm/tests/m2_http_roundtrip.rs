@@ -17,9 +17,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use auru_pm::{
-    AuthorIdentity, Commit, CommitId, ContentHash, HeadAdvance, HistoryRange, HttpProvider,
-    ProjectProvider, RemoteState, SampleManifest, Sidecar, TreeRef, compute_commit_id,
-    sidecar_path_for,
+    AuthorIdentity, Commit, CommitId, ContentHash, HeadAdvance, HistoryRange, HttpAccount,
+    HttpProvider, ProjectFormat, ProjectProfile, ProjectProvider, RemoteState, SampleManifest,
+    Sidecar, TreeRef, compute_commit_id, sidecar_path_for,
 };
 use tempfile::TempDir;
 
@@ -29,7 +29,14 @@ use tempfile::TempDir;
 struct Db {
     blobs: HashMap<String, Vec<u8>>,
     commits: HashMap<String, Value>,
+    projects: HashMap<String, StoredProject>,
+}
+
+#[derive(Default, Clone)]
+struct StoredProject {
     head: Option<String>,
+    profile: Option<ProjectProfile>,
+    updated_at: i64,
 }
 
 type Shared = Arc<Mutex<Db>>;
@@ -43,6 +50,7 @@ async fn health() -> impl IntoResponse {
         "protocol": "auru-pm-v1",
         "name": "test stub",
         "capabilities": {
+            "project_listing": true,
             "members": false, "permissions": false,
             "branches": false, "server_side_merge": false,
             "auth_methods": ["none"]
@@ -50,8 +58,45 @@ async fn health() -> impl IntoResponse {
     }))
 }
 
-async fn get_head(State(db): State<Shared>) -> impl IntoResponse {
-    Json(json!({ "commit_id": db.lock().unwrap().head }))
+async fn get_projects(State(db): State<Shared>) -> impl IntoResponse {
+    let db = db.lock().unwrap();
+    let projects: Vec<Value> = db
+        .projects
+        .iter()
+        .filter_map(|(handle, project)| {
+            Some(json!({
+                "handle": handle,
+                "head": project.head.as_ref()?,
+                "profile": project.profile.as_ref(),
+                "updated_at": project.updated_at,
+            }))
+        })
+        .collect();
+    Json(json!({ "projects": projects }))
+}
+
+async fn put_profile(
+    State(db): State<Shared>,
+    Path(handle): Path<String>,
+    Json(profile): Json<ProjectProfile>,
+) -> StatusCode {
+    db.lock()
+        .unwrap()
+        .projects
+        .entry(handle)
+        .or_default()
+        .profile = Some(profile);
+    StatusCode::NO_CONTENT
+}
+
+async fn get_head(State(db): State<Shared>, Path(handle): Path<String>) -> impl IntoResponse {
+    let head = db
+        .lock()
+        .unwrap()
+        .projects
+        .get(&handle)
+        .and_then(|project| project.head.clone());
+    Json(json!({ "commit_id": head }))
 }
 
 #[derive(Deserialize)]
@@ -60,10 +105,18 @@ struct AdvBody {
     to: String,
 }
 
-async fn post_head(State(db): State<Shared>, Json(b): Json<AdvBody>) -> Response {
+async fn post_head(
+    State(db): State<Shared>,
+    Path(handle): Path<String>,
+    Json(b): Json<AdvBody>,
+) -> Response {
     let mut db = db.lock().unwrap();
-    if db.head.as_deref() != b.from.as_deref() {
-        let cur = db.head.clone();
+    let current = db
+        .projects
+        .get(&handle)
+        .and_then(|project| project.head.clone());
+    if current.as_deref() != b.from.as_deref() {
+        let cur = current;
         drop(db);
         return (
             StatusCode::CONFLICT,
@@ -71,7 +124,15 @@ async fn post_head(State(db): State<Shared>, Json(b): Json<AdvBody>) -> Response
         )
             .into_response();
     }
-    db.head = Some(b.to);
+    let updated_at = db
+        .commits
+        .get(&b.to)
+        .and_then(|commit| commit.get("timestamp"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let project = db.projects.entry(handle).or_default();
+    project.head = Some(b.to);
+    project.updated_at = updated_at;
     (StatusCode::OK, Json(json!({"result":"advanced"}))).into_response()
 }
 
@@ -107,12 +168,19 @@ struct HQ {
     before: Option<String>,
 }
 
-async fn list_history(State(db): State<Shared>, Query(q): Query<HQ>) -> impl IntoResponse {
+async fn list_history(
+    State(db): State<Shared>,
+    Path(handle): Path<String>,
+    Query(q): Query<HQ>,
+) -> impl IntoResponse {
     let db = db.lock().unwrap();
     let limit = q.limit.unwrap_or(100) as usize;
     let mut out: Vec<Value> = Vec::new();
     let mut started = q.before.is_none();
-    let mut cursor = db.head.clone();
+    let mut cursor = db
+        .projects
+        .get(&handle)
+        .and_then(|project| project.head.clone());
     while let Some(id) = cursor {
         let raw = match db.commits.get(&id) {
             Some(v) => v.clone(),
@@ -175,6 +243,8 @@ async fn get_blob(State(db): State<Shared>, Path(hash): Path<String>) -> Respons
 fn make_app(db: Shared) -> Router {
     Router::new()
         .route("/v1/health", get(health))
+        .route("/v1/projects", get(get_projects))
+        .route("/v1/projects/:h", put(put_profile))
         .route("/v1/projects/:h/head", get(get_head).post(post_head))
         .route("/v1/projects/:h/commits", post(post_commit))
         .route("/v1/projects/:h/commits/:id", get(get_commit))
@@ -184,16 +254,21 @@ fn make_app(db: Shared) -> Router {
         .with_state(db)
 }
 
-async fn start_stub() -> String {
+async fn start_stub_with_db() -> (String, Shared) {
     let db: Shared = Arc::new(Mutex::new(Db::default()));
+    let server_db = db.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
-        axum::serve(listener, make_app(db))
+        axum::serve(listener, make_app(server_db))
             .await
             .expect("test HTTP server should remain available");
     });
-    format!("http://127.0.0.1:{port}")
+    (format!("http://127.0.0.1:{port}"), db)
+}
+
+async fn start_stub() -> String {
+    start_stub_with_db().await.0
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -203,14 +278,41 @@ async fn m2_probe_returns_capabilities() {
     let base = start_stub().await;
     let (name, caps) = HttpProvider::probe(&base).await.unwrap();
     assert!(!name.is_empty());
+    assert!(caps.project_listing);
     assert!(!caps.members);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m2_corrupt_blob_download_is_rejected() {
+    let (base, db) = start_stub_with_db().await;
+    let requested = ContentHash::of(b"expected bytes");
+    db.lock()
+        .unwrap()
+        .blobs
+        .insert(requested.to_string(), b"wrong bytes".to_vec());
+    let provider = HttpProvider::open(&base, "test/corruption", None)
+        .await
+        .unwrap();
+
+    let error = provider
+        .get_blob(&requested)
+        .await
+        .expect_err("corrupt response must not reach a restore");
+
+    assert!(error.to_string().contains("blob hash mismatch"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn m2_commit_roundtrip_over_http() {
     let base = start_stub().await;
     let handle = "test/song";
-    let provider = HttpProvider::open(&base, handle, None).await.unwrap();
+    let account = HttpAccount::connect(&base, None).await.unwrap();
+    let provider = account.open_project(handle);
+    let profile = ProjectProfile {
+        display_name: "Night Drive".into(),
+        format: ProjectFormat::Auru,
+    };
+    provider.put_project_profile(&profile).await.unwrap();
 
     // Fresh repo has no HEAD.
     assert_eq!(provider.get_head().await.unwrap(), None);
@@ -269,6 +371,13 @@ async fn m2_commit_roundtrip_over_http() {
     let adv = provider.advance_head(None, commit.id).await.unwrap();
     assert_eq!(adv, HeadAdvance::Advanced);
     assert_eq!(provider.get_head().await.unwrap(), Some(commit.id));
+
+    let projects = account.list_projects().await.unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].handle, handle);
+    assert_eq!(projects[0].head, commit.id);
+    assert_eq!(projects[0].profile.as_ref(), Some(&profile));
+    assert_eq!(projects[0].updated_at, commit.timestamp);
 
     // list_history returns the commit.
     let history = provider

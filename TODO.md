@@ -20,6 +20,10 @@ described, it was read out of a real project rather than from documentation.
   keychain, and OAuth uses the real device-code progress stream.
 - Provider-scoped project handles persist in the sidecar, so moving a project
   and its sidecar does not create a second remote history.
+- Provider accounts now expose typed project catalogues over filesystem and
+  HTTP providers. Provider-only projects enter the library as downloadable,
+  and a complete recovery writes an enrolled local copy with its provider
+  identity and HEAD intact.
 - Recent versions come from `list_history`, and Restore now fetches the selected
   commit into a new folder without overwriting the working project. Native,
   DAWproject, Ableton, and FL restore paths are wired; FL restore materialises
@@ -37,10 +41,11 @@ described, it was read out of a real project rather than from documentation.
 
 ---
 
-## 1. Blocking — remaining product-loop gaps
+## 1. Blocking product loop — **resolved 2026-07-29**
 
-Backup, local/known-project history, and restore are now reachable. The
-remaining blocker is discovering projects that exist only on a provider.
+Backup, provider discovery, history, download, and restore are now reachable
+from the desktop app for local providers and HTTP providers advertising the
+`project_listing` capability.
 
 ### 1.1 Backup button — **resolved 2026-07-29**
 
@@ -54,11 +59,11 @@ advances it.
 `flstudio::plan_bundle_assets`. The UI backup/restore integration test proves
 the sample blob is captured, materialised, and repointed.
 
-### 1.3 Restore — **resolved for known projects 2026-07-29**
+### 1.3 Restore — **resolved 2026-07-29**
 
-Recent-history rows restore their commit into a new folder. Recovery on a
-second machine remains blocked by the provider protocol having no project-list
-endpoint; see 4.
+Recent-history rows restore their commit into a new folder. A connected
+provider account lists provider-only projects; downloading one restores it
+into a new folder and writes the sidecar required for subsequent sync.
 
 ### 1.4 Provider construction — **resolved 2026-07-29**
 
@@ -87,14 +92,15 @@ token will be checked by the first project request.
 ### 2.3 The reference server has no authentication
 
 `auru-pm-server` advertises `auth_methods: ["none"]`
-([main.rs:66](crates/auru-pm-server/src/main.rs:66)) and keeps state in memory.
+([main.rs:74](crates/auru-pm-server/src/main.rs:74)) and keeps state in memory.
 It is a conformance target, not a deployable service. Missing: persistence,
 any auth, and rate limiting.
 
-### 2.4 `auru-pm-client` is an empty shell
+### 2.4 `auru-pm-client` — **resolved 2026-07-29**
 
-11 lines, no public API. Either build it or delete it — an empty crate in the
-workspace implies a component that does not exist.
+`ProviderAccount` is the account-level client API: it lists projects before a
+handle is known and opens the selected project as a project-scoped provider.
+The desktop app consumes this API for filesystem and HTTP recovery.
 
 ### 2.5 Teams surface is declared but unimplemented
 
@@ -182,9 +188,9 @@ restores, but:
 ### 3.4 Native `.auru` format
 
 - No `ProjectInfo` summary, so native projects show no detail.
-- `plan_assets` keeps raw clip paths as manifest keys, deliberately, to avoid
-  changing existing commit ids. Means native projects get no vendoring and no
-  path rewriting on restore.
+- **Resolved 2026-07-29:** `plan_assets` keeps raw clip paths as manifest keys
+  to preserve existing commit ids; restore now materialises those committed
+  blobs under a safe `Samples/` path and rewrites every recovered clip.
 
 ---
 
@@ -199,22 +205,21 @@ restores, but:
   `Cas` GC (`collect_reachable`, `GcReport`) exists and is unused by the app.
 - **Onboarding is one step, not the designed three.** The provider-connection
   and folder-selection steps from `auru-pm-claude-design` are not built.
-- **New-machine recovery is not representable in the protocol.** Providers can
-  read history for a known project handle but cannot list a person's projects.
-  The premature Recovery route and promise to restore a whole library were
-  removed. Add a provider project-list endpoint before rebuilding this UI.
+- **Resolved 2026-07-29:** the `project_listing` capability adds
+  `GET /v1/projects` and project profiles. New-machine projects appear in the
+  normal library, and Download restores and enrolls the selected project.
 - **`ProjectStatus::Conflicted` is now reachable** from a real coordinator
   outcome, but the field-by-field resolver is still only a notification.
   `SyncDirection::UpstreamAhead` is produced when refreshing a known project's
   history, and Download Latest restores that head to a new folder.
-  `ProjectStatus::NotDownloaded` still needs provider project listing.
+  `ProjectStatus::NotDownloaded` is produced by provider project discovery.
 - **Project status is inferred from modification time.** `ProjectStatus::read_from_disk`
   compares the project's mtime against the sidecar's, so it means "you have saved
   since your last backup" rather than "the contents differ". Documented, and
   errs toward offering a no-op backup — the harmless direction.
-- **Resolved for backups made by this app:** Last Modified (Remote) uses the
-  sidecar modification time after a successful backup. Remote refresh still
-  needs provider discovery.
+- **Resolved 2026-07-29:** Last Modified (Remote) uses sidecar modification time
+  for local projects and the provider HEAD commit timestamp for provider-only
+  projects.
 - **The FL import flow and detail page have never been used.** They compile,
   are unit-tested, and the app launches, but no one has clicked through them.
 

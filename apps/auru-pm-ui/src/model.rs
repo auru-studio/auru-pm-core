@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -142,6 +143,20 @@ fn file_modified_at(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
+}
+
+fn provider_links_for(project_path: &Path) -> (Option<RemoteProjectRef>, BTreeMap<String, String>) {
+    let Ok(sidecar) = Sidecar::load(&sidecar_path_for(project_path)) else {
+        return (None, BTreeMap::new());
+    };
+    let remote = sidecar.primary.as_ref().and_then(|provider_id| {
+        Some(RemoteProjectRef {
+            provider_id: provider_id.clone(),
+            handle: sidecar.provider_handles.get(provider_id)?.clone(),
+            head: sidecar.local_head?,
+        })
+    });
+    (remote, sidecar.provider_handles)
 }
 
 /// How long ago a file was saved, in the words a person would use.
@@ -356,6 +371,8 @@ pub fn import_project(kind: ImportKind, path: &Path) -> Result<Project, String> 
         // Stamped by `load_library` once this project is part of the library.
         added_at: None,
         live_set: Some(project_file),
+        remote: None,
+        provider_handles: BTreeMap::new(),
         detail,
         missing_plugins,
     })
@@ -637,10 +654,6 @@ pub enum SyncDirection {
     UpstreamAhead,
 }
 
-/// `NotDownloaded` still awaits provider project discovery: the current
-/// protocol can refresh a known project's head but cannot list a remote-only
-/// project on a new machine.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProjectStatus {
     /// On this computer and nowhere else — no backup has ever been made.
@@ -761,6 +774,26 @@ pub struct ProjectVersion {
     pub created_at: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteProjectRef {
+    pub provider_id: String,
+    pub handle: String,
+    pub head: CommitId,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteProjectSeed {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub handle: String,
+    pub head: CommitId,
+    pub name: String,
+    pub file_name: String,
+    pub format: ProjectFormat,
+    pub updated_at: i64,
+    pub info: Option<ProjectInfo>,
+}
+
 #[derive(Debug)]
 pub struct Project {
     /// Derived from the project's location so adding the same project twice
@@ -795,6 +828,12 @@ pub struct Project {
     pub added_at: Option<i64>,
     /// The `.als` on disk, for projects read from a real folder.
     pub live_set: Option<PathBuf>,
+    /// Provider identity for both linked local projects and provider-only
+    /// projects discovered through an account catalogue.
+    pub remote: Option<RemoteProjectRef>,
+    /// Every provider handle recorded for this project, cached from its
+    /// sidecar so catalogue reconciliation never performs filesystem I/O.
+    pub provider_handles: BTreeMap<String, String>,
     pub detail: Option<ProjectDetail>,
     /// Plugins this computer does not have. Empty is the good case.
     pub missing_plugins: Vec<MissingPlugin>,
@@ -821,6 +860,7 @@ impl Project {
             ProjectStatus::NeverBackedUp => None,
             _ => file_modified_at(&sidecar_path_for(&live_set)),
         };
+        let (remote, provider_handles) = provider_links_for(&live_set);
 
         Some(Self {
             // Keyed on the project file, not the folder: a folder can hold
@@ -855,7 +895,49 @@ impl Project {
             detail: None,
             missing_plugins: Vec::new(),
             live_set: Some(live_set),
+            remote,
+            provider_handles,
         })
+    }
+
+    pub fn from_remote(seed: RemoteProjectSeed) -> Self {
+        let backed_up_at = u64::try_from(seed.updated_at)
+            .ok()
+            .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)));
+        let detail = seed
+            .info
+            .as_ref()
+            .and_then(ProjectDetail::from_project_info);
+        let provider_handles = BTreeMap::from([(seed.provider_id.clone(), seed.handle.clone())]);
+        Self {
+            id: format!("remote:{}:{}", seed.provider_id, seed.handle),
+            name: seed.name,
+            file_name: seed.file_name,
+            local_path: format!("Stored on {}", seed.provider_name),
+            size: String::new(),
+            format: seed.format,
+            status: ProjectStatus::NotDownloaded,
+            last_activity: format!("backed up · {}", describe_epoch(seed.updated_at)),
+            safe_version: describe_epoch(seed.updated_at),
+            local_inventory: detail
+                .as_ref()
+                .map(ProjectDetail::files_line)
+                .unwrap_or_default(),
+            versions: Vec::new(),
+            sync_progress: 0.0,
+            modified_at: None,
+            backed_up_at,
+            added_at: Some(seed.updated_at),
+            live_set: None,
+            remote: Some(RemoteProjectRef {
+                provider_id: seed.provider_id,
+                handle: seed.handle,
+                head: seed.head,
+            }),
+            provider_handles,
+            detail,
+            missing_plugins: Vec::new(),
+        }
     }
 
     /// Read a Live Set for everything the detail page shows.
@@ -925,14 +1007,14 @@ impl Project {
     pub fn list_status(&self) -> String {
         match self.status {
             ProjectStatus::NeverBackedUp => "only on this computer".to_owned(),
-            ProjectStatus::NotDownloaded => "on Auru Cloud only".to_owned(),
+            ProjectStatus::NotDownloaded => "stored with your provider".to_owned(),
             ProjectStatus::Downloaded => self.last_activity.clone(),
             ProjectStatus::Syncing => "backing up…".to_owned(),
             ProjectStatus::OutOfSync(SyncDirection::LocalAhead) => {
                 format!("changes waiting · {}", self.last_activity)
             }
             ProjectStatus::OutOfSync(SyncDirection::UpstreamAhead) => {
-                "newer on studio mac".to_owned()
+                "a newer provider version is available".to_owned()
             }
             ProjectStatus::Conflicted => "conflict · needs you".to_owned(),
         }
@@ -942,7 +1024,7 @@ impl Project {
         match self.status {
             ProjectStatus::NeverBackedUp => "This project exists only on this computer.",
             ProjectStatus::NotDownloaded => {
-                "A safe copy lives on Auru Cloud — it isn't on this computer."
+                "A safe copy lives with your provider — it isn't on this computer."
             }
             ProjectStatus::Downloaded => "Backed up and verified. Safe to unplug.",
             ProjectStatus::Syncing => "Copying and verifying this project now.",
@@ -950,9 +1032,9 @@ impl Project {
                 "Changes on this computer aren't backed up."
             }
             ProjectStatus::OutOfSync(SyncDirection::UpstreamAhead) => {
-                "A newer version was saved from Studio Mac."
+                "A newer version was saved from another computer."
             }
-            ProjectStatus::Conflicted => "This computer and Studio Mac have different edits.",
+            ProjectStatus::Conflicted => "This computer and the provider have different edits.",
         }
     }
 
@@ -962,7 +1044,11 @@ impl Project {
                 "If this computer is lost or stolen, so is this work.".to_owned()
             }
             ProjectStatus::NotDownloaded => {
-                format!("Download it to work here ({}).", self.size)
+                if self.size.is_empty() {
+                    "Download it to work on this computer.".to_owned()
+                } else {
+                    format!("Download it to work here ({}).", self.size)
+                }
             }
             ProjectStatus::Downloaded => "Every file was verified on Auru Cloud.".to_owned(),
             ProjectStatus::Syncing => {
@@ -1014,7 +1100,13 @@ impl Project {
     }
 
     pub fn apply_history(&mut self, history: Vec<CommitSummary>) {
-        self.reconcile_remote_head(history.first().map(|commit| commit.id));
+        let remote_head = history.first().map(|commit| commit.id);
+        self.reconcile_remote_head(remote_head);
+        if let Some(head) = remote_head
+            && let Some(remote) = &mut self.remote
+        {
+            remote.head = head;
+        }
         let total = history.len();
         self.versions = history
             .into_iter()
@@ -1204,6 +1296,39 @@ pub fn sort_projects(projects: &mut [Project], order: SortOrder) {
     });
 }
 
+/// Replace one provider's catalogue rows while preserving linked local copies.
+///
+/// A project found on disk wins over its provider-only row; otherwise a
+/// refresh replaces stale remote metadata rather than duplicating it.
+pub fn replace_provider_projects(
+    projects: &mut Vec<Project>,
+    provider_id: &str,
+    remote: Vec<RemoteProjectSeed>,
+) {
+    projects.retain(|project| {
+        project.live_set.is_some()
+            || project
+                .remote
+                .as_ref()
+                .is_none_or(|remote| remote.provider_id != provider_id)
+    });
+    let mut known_handles: HashSet<(String, String)> = projects
+        .iter()
+        .flat_map(|project| {
+            project
+                .provider_handles
+                .iter()
+                .map(|(provider_id, handle)| (provider_id.clone(), handle.clone()))
+        })
+        .collect();
+    for seed in remote {
+        if !known_handles.insert((seed.provider_id.clone(), seed.handle.clone())) {
+            continue;
+        }
+        projects.push(Project::from_remote(seed));
+    }
+}
+
 pub fn load_library(state: &mut crate::state::AppState) -> Vec<Project> {
     let mut roots: Vec<PathBuf> = Vec::new();
 
@@ -1328,6 +1453,67 @@ mod tests {
     #[test]
     fn downloaded_project_should_not_need_attention() {
         assert!(!ProjectStatus::Downloaded.needs_attention());
+    }
+
+    #[test]
+    fn a_provider_project_should_enter_the_library_as_downloadable() {
+        let head = CommitId(auru_pm::ContentHash::of(b"remote head"));
+        let project = Project::from_remote(RemoteProjectSeed {
+            provider_id: "studio-nas".into(),
+            provider_name: "Studio NAS".into(),
+            handle: "night-drive".into(),
+            head,
+            name: "Night Drive".into(),
+            file_name: "Night Drive.als".into(),
+            format: ProjectFormat::AbletonLiveSet,
+            updated_at: 1_750_000_000,
+            info: None,
+        });
+
+        assert_eq!(project.status, ProjectStatus::NotDownloaded);
+        assert_eq!(project.status.action(), ProjectAction::Download);
+        assert!(project.live_set.is_none());
+        assert_eq!(
+            project
+                .provider_handles
+                .get("studio-nas")
+                .map(String::as_str),
+            Some("night-drive")
+        );
+        assert_eq!(
+            project.remote.as_ref().map(|remote| remote.head),
+            Some(head)
+        );
+    }
+
+    #[test]
+    fn a_provider_refresh_should_replace_stale_rows_without_duplicates() {
+        let seed = |name: &str, head: &[u8]| RemoteProjectSeed {
+            provider_id: "studio-nas".into(),
+            provider_name: "Studio NAS".into(),
+            handle: "night-drive".into(),
+            head: CommitId(auru_pm::ContentHash::of(head)),
+            name: name.into(),
+            file_name: format!("{name}.als"),
+            format: ProjectFormat::AbletonLiveSet,
+            updated_at: 1_750_000_000,
+            info: None,
+        };
+        let old_head = CommitId(auru_pm::ContentHash::of(b"old head"));
+        let mut projects = vec![Project::from_remote(seed("Old Name", b"old head"))];
+
+        replace_provider_projects(
+            &mut projects,
+            "studio-nas",
+            vec![seed("Night Drive", b"new head")],
+        );
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "Night Drive");
+        assert_ne!(
+            projects[0].remote.as_ref().map(|remote| remote.head),
+            Some(old_head)
+        );
     }
 
     fn detail() -> ProjectDetail {
@@ -1673,6 +1859,11 @@ mod tests {
         // A sidecar recording a commit is what "has been backed up" means.
         let sidecar_path = auru_pm::sidecar_path_for(&root.join("Night Drive.als"));
         let sidecar = Sidecar {
+            primary: Some("studio-nas".into()),
+            provider_handles: std::collections::BTreeMap::from([(
+                "studio-nas".into(),
+                "night-drive".into(),
+            )]),
             local_head: Some(auru_pm::CommitId(auru_pm::ContentHash::of(b"a commit"))),
             ..Sidecar::default()
         };
@@ -1680,6 +1871,51 @@ mod tests {
 
         let project = Project::read_from_disk(&root).expect("a project");
         assert_ne!(project.status, ProjectStatus::NeverBackedUp);
+        assert_eq!(
+            project
+                .provider_handles
+                .get("studio-nas")
+                .map(String::as_str),
+            Some("night-drive")
+        );
+    }
+
+    #[test]
+    fn a_local_project_should_match_every_provider_handle_in_its_sidecar() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("Night Drive Project");
+        write_project_folder_at(&root);
+        let project_file = root.join("Night Drive.als");
+        let sidecar_path = sidecar_path_for(&project_file);
+        Sidecar {
+            primary: Some("auru-cloud".into()),
+            provider_handles: std::collections::BTreeMap::from([
+                ("auru-cloud".into(), "cloud-night-drive".into()),
+                ("studio-nas".into(), "nas-night-drive".into()),
+            ]),
+            local_head: Some(auru_pm::CommitId(auru_pm::ContentHash::of(b"a commit"))),
+            ..Sidecar::default()
+        }
+        .save(&sidecar_path)
+        .expect("sidecar");
+
+        let project = Project::read_from_disk(&root).expect("a project");
+        std::fs::remove_file(sidecar_path).expect("prove matching uses cached handles");
+
+        assert_eq!(
+            project
+                .provider_handles
+                .get("auru-cloud")
+                .map(String::as_str),
+            Some("cloud-night-drive")
+        );
+        assert_eq!(
+            project
+                .provider_handles
+                .get("studio-nas")
+                .map(String::as_str),
+            Some("nas-night-drive")
+        );
     }
 
     #[test]
@@ -1849,6 +2085,8 @@ mod tests {
             backed_up_at: None,
             added_at: None,
             live_set: None,
+            remote: None,
+            provider_handles: BTreeMap::new(),
             detail: None,
             missing_plugins: Vec::new(),
         }

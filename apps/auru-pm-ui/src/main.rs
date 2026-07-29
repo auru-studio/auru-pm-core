@@ -37,7 +37,8 @@ use crate::menus::{
 };
 use crate::model::{
     ImportKind, PLUGIN_SETTINGS_REASSURANCE, Project, ProjectAction, ProjectStatus, SortOrder,
-    SyncDirection, WatchedFolder, format_bytes, import_project, load_library, sort_projects,
+    SyncDirection, WatchedFolder, format_bytes, import_project, load_library,
+    replace_provider_projects, sort_projects,
 };
 
 const OAUTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -150,6 +151,12 @@ struct ProjectManager {
     watched_folders: Vec<WatchedFolder>,
     /// True while a folder is being scanned.
     scanning: bool,
+    /// True while connected provider catalogues are being refreshed.
+    remote_refreshing: bool,
+    /// A provider changed while a refresh was running; run once more after it.
+    remote_refresh_pending: bool,
+    /// Provider catalogue failures from the latest refresh.
+    remote_discovery_errors: Vec<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -253,6 +260,7 @@ impl ProjectManager {
                             );
                             this.providers = providers;
                             this.catalog_state = CatalogState::Live;
+                            this.refresh_remote_projects(cx);
                         }
                         Err(_) => this.catalog_state = CatalogState::Unreachable,
                     }
@@ -315,6 +323,9 @@ impl ProjectManager {
             display_name_setting,
             watched_folders: Vec::new(),
             scanning: false,
+            remote_refreshing: false,
+            remote_refresh_pending: false,
+            remote_discovery_errors: Vec::new(),
             _subscriptions,
         }
     }
@@ -621,6 +632,7 @@ impl ProjectManager {
                 this.state.add_local_provider(&path);
                 this.state.connect_provider(&provider_id);
                 this.state.save();
+                this.refresh_remote_projects(cx);
 
                 window.push_notification(
                     Notification::success(format!(
@@ -820,14 +832,17 @@ impl ProjectManager {
 
         match action {
             ProjectAction::Push => self.start_project_backup(index, window, cx),
-            ProjectAction::Download => window.push_notification(
-                Notification::warning(
-                    "This provider does not expose a project-listing endpoint yet, so Auru \
-                     cannot discover a remote-only project safely.",
-                )
-                .title("Download is not available yet"),
-                cx,
-            ),
+            ProjectAction::Download => {
+                let Some(commit_id) = project.remote.as_ref().map(|remote| remote.head) else {
+                    window.push_notification(
+                        Notification::error("The provider did not identify a version to restore.")
+                            .title("Can't download this project"),
+                        cx,
+                    );
+                    return;
+                };
+                self.restore_version(index, commit_id, window, cx);
+            }
             ProjectAction::Pull => {
                 let Some(commit_id) = project.versions.first().map(|version| version.id) else {
                     window.push_notification(
@@ -1238,6 +1253,7 @@ impl ProjectManager {
 
         self.overlay = Overlay::None;
         self.auth_phase = AuthPhase::Ready;
+        self.refresh_remote_projects(cx);
         window.push_notification(
             Notification::success(detail).title(format!("{provider_name} configured")),
             cx,
@@ -1297,16 +1313,28 @@ impl ProjectManager {
         if !project.versions.is_empty() {
             return;
         }
-        let Some(project_path) = project.live_set.clone() else {
-            return;
-        };
-        let Some(provider) = backend::primary_listing(&self.providers, &project_path) else {
-            return;
-        };
         let project_id = project.id.clone();
-        let task = cx
-            .background_executor()
-            .spawn(async move { backend::history(provider, project_path) });
+        let task = if let Some(project_path) = project.live_set.clone() {
+            let Some(provider) = backend::primary_listing(&self.providers, &project_path) else {
+                return;
+            };
+            cx.background_executor()
+                .spawn(async move { backend::history(provider, project_path) })
+        } else {
+            let Some(remote) = project.remote.clone() else {
+                return;
+            };
+            let Some(provider) = self
+                .providers
+                .iter()
+                .find(|provider| provider.entry.id == remote.provider_id)
+                .cloned()
+            else {
+                return;
+            };
+            cx.background_executor()
+                .spawn(async move { backend::remote_history(provider, remote.handle) })
+        };
         cx.spawn(async move |this, cx| {
             let Ok(history) = task.await else {
                 return;
@@ -1335,10 +1363,19 @@ impl ProjectManager {
         let Some(project) = self.projects.get(index) else {
             return;
         };
-        let Some(project_path) = project.live_set.clone() else {
-            return;
+        let project_path = project.live_set.clone();
+        let remote = project.remote.clone();
+        let provider = if let Some(project_path) = project_path.as_deref() {
+            backend::primary_listing(&self.providers, project_path)
+        } else {
+            remote.as_ref().and_then(|remote| {
+                self.providers
+                    .iter()
+                    .find(|provider| provider.entry.id == remote.provider_id)
+                    .cloned()
+            })
         };
-        let Some(provider) = backend::primary_listing(&self.providers, &project_path) else {
+        let Some(provider) = provider else {
             window.push_notification(
                 Notification::error("The provider for this history is not configured.")
                     .title("Can't restore this version"),
@@ -1347,6 +1384,9 @@ impl ProjectManager {
             return;
         };
         let project_name = project.name.clone();
+        let project_file_name = project.file_name.clone();
+        let project_id = project.id.clone();
+        let remote_only = project_path.is_none();
         let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: false,
             directories: true,
@@ -1361,37 +1401,159 @@ impl ProjectManager {
             let Some(destination) = paths.into_iter().next() else {
                 return;
             };
+            if remote_only {
+                _ = this.update_in(cx, |this, _, cx| {
+                    if let Some(project) = this
+                        .projects
+                        .iter_mut()
+                        .find(|project| project.id == project_id)
+                    {
+                        project.status = ProjectStatus::Syncing;
+                        cx.notify();
+                    }
+                });
+            }
             let task = cx.background_executor().spawn(async move {
-                backend::restore(provider, project_path, commit_id, destination)
+                match (project_path, remote) {
+                    (Some(project_path), _) => {
+                        backend::restore(provider, project_path, commit_id, destination)
+                    }
+                    (None, Some(remote)) => backend::restore_remote(
+                        provider,
+                        remote.handle,
+                        project_file_name,
+                        commit_id,
+                        destination,
+                    ),
+                    (None, None) => Err("The project has no provider identity.".to_owned()),
+                }
             });
             let result = task.await;
-            _ = this.update_in(cx, |_, window, cx| match result {
-                Ok(report) => {
-                    let detail = if report.unavailable == 0 {
-                        format!(
-                            "{} captured file(s) restored to {}",
-                            report.files_written,
-                            report.project_file.display()
-                        )
-                    } else {
-                        format!(
-                            "Restored to {} · {} file(s) unavailable",
-                            report.project_file.display(),
-                            report.unavailable
-                        )
+            _ = this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(report) => {
+                        if remote_only {
+                            this.state.add_project(&report.project_file);
+                            this.state.save();
+                            let restored = Project::read_from_disk(&report.project_file);
+                            if let Some(index) = this
+                                .projects
+                                .iter()
+                                .position(|project| project.id == project_id)
+                            {
+                                match restored {
+                                    Some(restored) => {
+                                        this.projects[index] = restored;
+                                        this.selected_project = index;
+                                    }
+                                    None => {
+                                        this.projects[index].status = ProjectStatus::NotDownloaded;
+                                    }
+                                }
+                            }
+                        }
+                        let notification = if report.unavailable == 0 {
+                            Notification::success(format!(
+                                "{} captured file(s) restored to {}",
+                                report.files_written,
+                                report.project_file.display()
+                            ))
+                            .title(format!("{project_name} restored"))
+                        } else {
+                            Notification::warning(format!(
+                                "Restored to {} · {} file(s) unavailable",
+                                report.project_file.display(),
+                                report.unavailable
+                            ))
+                            .title(format!("{project_name} partially restored"))
+                        };
+                        window.push_notification(notification, cx);
+                    }
+                    Err(message) => {
+                        if remote_only
+                            && let Some(project) = this
+                                .projects
+                                .iter_mut()
+                                .find(|project| project.id == project_id)
+                        {
+                            project.status = ProjectStatus::NotDownloaded;
+                        }
+                        window.push_notification(
+                            Notification::error(message)
+                                .title(format!("Couldn't restore {project_name}")),
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn refresh_remote_projects(&mut self, cx: &mut Context<Self>) {
+        if self.remote_refreshing {
+            self.remote_refresh_pending = true;
+            return;
+        }
+        let providers: Vec<ProviderListing> = self
+            .providers
+            .iter()
+            .filter(|provider| provider.is_connected())
+            .cloned()
+            .collect();
+        if providers.is_empty() {
+            self.remote_discovery_errors.clear();
+            return;
+        }
+
+        self.remote_refreshing = true;
+        self.remote_refresh_pending = false;
+        cx.notify();
+        let task = cx.background_executor().spawn(async move {
+            providers
+                .into_iter()
+                .map(|provider| {
+                    let provider_id = provider.entry.id.clone();
+                    (provider_id, backend::remote_catalogue(provider))
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let results = task.await;
+            _ = this.update(cx, |this, cx| {
+                let selected = this
+                    .projects
+                    .get(this.selected_project)
+                    .map(|project| project.id.clone());
+                this.remote_refreshing = false;
+                this.remote_discovery_errors.clear();
+
+                for (provider_id, result) in results {
+                    let catalogue = match result {
+                        Ok(catalogue) => catalogue,
+                        Err(error) => {
+                            this.remote_discovery_errors.push(error);
+                            continue;
+                        }
                     };
-                    window.push_notification(
-                        Notification::success(detail).title(format!("{project_name} restored")),
-                        cx,
-                    );
+                    if catalogue.unavailable > 0 {
+                        this.remote_discovery_errors.push(format!(
+                            "{} project(s) on {provider_id} could not be read",
+                            catalogue.unavailable
+                        ));
+                    }
+                    replace_provider_projects(&mut this.projects, &provider_id, catalogue.projects);
                 }
-                Err(message) => {
-                    window.push_notification(
-                        Notification::error(message)
-                            .title(format!("Couldn't restore {project_name}")),
-                        cx,
-                    );
+                let sort_order = this.sort_order();
+                sort_projects(&mut this.projects, sort_order);
+                this.selected_project = selected
+                    .and_then(|id| this.projects.iter().position(|project| project.id == id))
+                    .unwrap_or(0);
+                if this.remote_refresh_pending {
+                    this.refresh_remote_projects(cx);
                 }
+                cx.notify();
             });
         })
         .detach();
@@ -1402,10 +1564,19 @@ impl ProjectManager {
     /// The library is a view of the filesystem, so this is how it catches up
     /// with anything Live created or moved while Auru was open.
     fn reload_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let remote_only: Vec<Project> = self
+            .projects
+            .drain(..)
+            .filter(|project| project.live_set.is_none())
+            .collect();
         self.projects = load_library(&mut self.state);
+        self.projects.extend(remote_only);
+        let sort_order = self.sort_order();
+        sort_projects(&mut self.projects, sort_order);
         self.selected_project = 0;
         self.route = Route::Library;
         self.overlay = Overlay::None;
+        self.refresh_remote_projects(cx);
 
         let found = self.projects.len();
         let unbacked = self
@@ -2458,6 +2629,21 @@ impl ProjectManager {
 
     /// Display name and the recover-another-device action.
     fn render_profile_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let remote_projects = self
+            .projects
+            .iter()
+            .filter(|project| project.live_set.is_none())
+            .count();
+        let recovery_status = if self.remote_refreshing {
+            "Checking connected providers…".to_owned()
+        } else if remote_projects == 0 {
+            "No provider-only projects found.".to_owned()
+        } else if remote_projects == 1 {
+            "1 project is ready to download from its provider.".to_owned()
+        } else {
+            format!("{remote_projects} projects are ready to download from their providers.")
+        };
+        let recovery_errors = self.remote_discovery_errors.join(" · ");
         div()
             .flex()
             .flex_col()
@@ -2515,15 +2701,49 @@ impl ProjectManager {
             )
             .child(
                 div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
                     .border_t_1()
                     .border_color(line())
                     .pt_4()
-                    .text_size(px(9.0))
-                    .line_height(relative(1.5))
-                    .text_color(faint())
                     .child(
-                        "NEW-MACHINE RECOVERY REQUIRES PROVIDER PROJECT DISCOVERY. \
-                         THIS PROTOCOL DOES NOT EXPOSE IT YET.",
+                        div()
+                            .text_size(px(9.0))
+                            .line_height(relative(1.5))
+                            .text_color(dim())
+                            .child(recovery_status),
+                    )
+                    .when(!recovery_errors.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .text_size(px(8.0))
+                                .line_height(relative(1.5))
+                                .text_color(amber())
+                                .child(recovery_errors),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("refresh-provider-projects")
+                            .flex()
+                            .h(px(36.0))
+                            .cursor_pointer()
+                            .items_center()
+                            .justify_center()
+                            .border_1()
+                            .border_color(line())
+                            .text_size(px(8.0))
+                            .text_color(green())
+                            .hover(|this| this.border_color(green()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.refresh_remote_projects(cx);
+                            }))
+                            .child(if self.remote_refreshing {
+                                "CHECKING PROVIDERS…"
+                            } else {
+                                "REFRESH PROVIDER PROJECTS"
+                            }),
                     ),
             )
             .into_any_element()
@@ -3882,6 +4102,9 @@ fn main() {
                     tint_component_theme(cx);
                     let view: Entity<ProjectManager> =
                         cx.new(|cx| ProjectManager::new(options.clone(), window, cx));
+                    view.update(cx, |manager, cx| {
+                        manager.refresh_remote_projects(cx);
+                    });
                     cx.new(|cx| Root::new(view, window, cx))
                 },
             );

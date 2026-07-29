@@ -10,12 +10,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use auru_pm::{
-    AuthorIdentity, CommitId, CommitSummary, FilesystemProvider, HistoryRange, HttpProvider,
-    ProjectFormat, ProjectProvider, ProjectSnapshot, PushOutcome, SampleManifest, Sidecar,
-    flstudio, push_with_freshness_check, sidecar_path_for,
+    AuthorIdentity, CommitId, CommitSummary, ContentHash, FilesystemProvider, HistoryRange,
+    HttpProvider, ProjectFormat, ProjectProfile, ProjectProvider, ProjectSnapshot, PushOutcome,
+    SampleManifest, Sidecar, fetch_project_info, flstudio, push_with_freshness_check,
+    sidecar_path_for,
 };
+use auru_pm_client::ProviderAccount;
 
 use crate::catalog::ProviderListing;
+use crate::model::RemoteProjectSeed;
 
 #[derive(Debug)]
 pub enum BackupResult {
@@ -31,6 +34,12 @@ pub struct RestoreResult {
     pub unavailable: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct RemoteCatalogue {
+    pub projects: Vec<RemoteProjectSeed>,
+    pub unavailable: usize,
+}
+
 /// Back up one project and return its refreshed history.
 pub fn back_up(
     listing: ProviderListing,
@@ -41,6 +50,15 @@ pub fn back_up(
         let provider = open_provider(&listing, &project_path).await?;
         let snapshot = ProjectSnapshot::load(&project_path)
             .map_err(|error| format!("read {}: {error}", project_path.display()))?;
+        if provider.capabilities().project_listing {
+            provider
+                .put_project_profile(&ProjectProfile {
+                    display_name: project_display_name(&project_path),
+                    format: snapshot.format(),
+                })
+                .await
+                .map_err(|error| format!("register project with provider: {error}"))?;
+        }
         let provider_id = listing.entry.id.clone();
         let author = AuthorIdentity {
             display_name: if display_name.trim().is_empty() {
@@ -88,6 +106,96 @@ pub fn history(
     })
 }
 
+/// List and enrich every project visible to one connected provider account.
+pub fn remote_catalogue(listing: ProviderListing) -> Result<RemoteCatalogue, String> {
+    runtime()?.block_on(async move {
+        let account = provider_account(&listing).await?;
+        if !account.supports_project_listing() {
+            return Ok(RemoteCatalogue {
+                projects: Vec::new(),
+                unavailable: 0,
+            });
+        }
+        let records = account
+            .list_projects()
+            .await
+            .map_err(|error| format!("list projects from {}: {error}", listing.entry.name))?;
+        let mut projects = Vec::new();
+        let mut unavailable = 0;
+        for record in records {
+            let provider = match account.open_project(&record.handle).await {
+                Ok(provider) => provider,
+                Err(_) => {
+                    unavailable += 1;
+                    continue;
+                }
+            };
+            let commit = match provider.get_commit(&record.head).await {
+                Ok(commit) => commit,
+                Err(_) => {
+                    unavailable += 1;
+                    continue;
+                }
+            };
+            let info = fetch_project_info(provider.as_ref(), &commit)
+                .await
+                .unwrap_or(None);
+            let profile = match record.profile {
+                Some(profile) => profile,
+                None => {
+                    let snapshot = match provider.get_blob(&commit.tree.snapshot).await {
+                        Ok(bytes) => ProjectSnapshot::from_canonical_bytes(&bytes),
+                        Err(error) => Err(error),
+                    };
+                    let Ok(snapshot) = snapshot else {
+                        unavailable += 1;
+                        continue;
+                    };
+                    ProjectProfile {
+                        display_name: record.handle.clone(),
+                        format: snapshot.format(),
+                    }
+                }
+            };
+            projects.push(RemoteProjectSeed {
+                provider_id: listing.entry.id.clone(),
+                provider_name: listing.entry.name.clone(),
+                handle: record.handle,
+                head: record.head,
+                file_name: safe_project_file_name(&profile.display_name, profile.format),
+                name: profile.display_name,
+                format: profile.format,
+                updated_at: record.updated_at,
+                info,
+            });
+        }
+        projects.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
+        Ok(RemoteCatalogue {
+            projects,
+            unavailable,
+        })
+    })
+}
+
+pub fn remote_history(
+    listing: ProviderListing,
+    handle: String,
+) -> Result<Vec<CommitSummary>, String> {
+    runtime()?.block_on(async move {
+        let provider = provider_account(&listing)
+            .await?
+            .open_project(&handle)
+            .await
+            .map_err(|error| format!("open remote project: {error}"))?;
+        load_history(provider.as_ref()).await
+    })
+}
+
 /// Restore a commit into a new sibling folder under `destination`.
 ///
 /// Never writes over the working project. A restore is something a person
@@ -101,65 +209,55 @@ pub fn restore(
 ) -> Result<RestoreResult, String> {
     runtime()?.block_on(async move {
         let provider = open_provider(&listing, &working_project).await?;
-        let commit = provider
-            .get_commit(&commit_id)
-            .await
-            .map_err(|error| format!("fetch version: {error}"))?;
-        let snapshot_bytes = provider
-            .get_blob(&commit.tree.snapshot)
-            .await
-            .map_err(|error| format!("fetch project: {error}"))?;
-        let snapshot = ProjectSnapshot::from_canonical_bytes(&snapshot_bytes)
-            .map_err(|error| format!("read stored project: {error}"))?;
-
-        let restore_root = unique_restore_root(&destination, &working_project, commit_id);
         let file_name = working_project
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("Restored Project")
             .to_owned();
-
-        match snapshot.format() {
-            ProjectFormat::AbletonLiveSet => {
-                let report = auru_pm::ableton::restore_bundle(
-                    provider.as_ref(),
-                    &commit,
-                    &restore_root,
-                    &file_name,
-                )
-                .await
-                .map_err(|error| format!("restore Ableton project: {error}"))?;
-                Ok(RestoreResult {
-                    project_file: report.live_set,
-                    files_written: report.files_written,
-                    unavailable: report.unavailable.len(),
-                })
-            }
-            ProjectFormat::FlStudio => {
-                restore_fl(
-                    provider.as_ref(),
-                    &commit,
-                    &snapshot,
-                    &restore_root,
-                    &file_name,
-                )
-                .await
-            }
-            ProjectFormat::Dawproject | ProjectFormat::Auru => {
-                std::fs::create_dir_all(&restore_root)
-                    .map_err(|error| format!("create restore folder: {error}"))?;
-                let project_file = restore_root.join(file_name);
-                snapshot
-                    .restore_to_path(&project_file)
-                    .map_err(|error| format!("restore project: {error}"))?;
-                Ok(RestoreResult {
-                    project_file,
-                    files_written: 0,
-                    unavailable: 0,
-                })
-            }
-        }
+        restore_from_provider(provider.as_ref(), commit_id, &destination, &file_name).await
     })
+}
+
+/// Recover a provider-only project and enroll the restored copy locally.
+pub fn restore_remote(
+    listing: ProviderListing,
+    handle: String,
+    file_name: String,
+    commit_id: CommitId,
+    destination: PathBuf,
+) -> Result<RestoreResult, String> {
+    runtime()?.block_on(async move {
+        let provider = provider_account(&listing)
+            .await?
+            .open_project(&handle)
+            .await
+            .map_err(|error| format!("open remote project: {error}"))?;
+        let result =
+            restore_from_provider(provider.as_ref(), commit_id, &destination, &file_name).await?;
+        let result = require_complete_recovery(result)?;
+        let sidecar_path = sidecar_path_for(&result.project_file);
+        Sidecar {
+            primary: Some(listing.entry.id.clone()),
+            provider_handles: BTreeMap::from([(listing.entry.id, handle)]),
+            local_head: Some(commit_id),
+            ..Sidecar::default()
+        }
+        .save(&sidecar_path)
+        .map_err(|error| format!("enroll restored project: {error}"))?;
+        Ok(result)
+    })
+}
+
+fn require_complete_recovery(result: RestoreResult) -> Result<RestoreResult, String> {
+    if result.unavailable == 0 {
+        return Ok(result);
+    }
+    Err(format!(
+        "Restored a partial copy to {}, but {} referenced file(s) could not be restored. \
+         The copy was not enrolled as synchronized.",
+        result.project_file.display(),
+        result.unavailable
+    ))
 }
 
 /// Ask the operating system to open a project in its registered DAW.
@@ -214,6 +312,20 @@ async fn load_history(provider: &dyn ProjectProvider) -> Result<Vec<CommitSummar
         .map_err(|error| format!("load history: {error}"))
 }
 
+async fn provider_account(listing: &ProviderListing) -> Result<ProviderAccount, String> {
+    if let Some(root) = listing.local_path() {
+        return Ok(ProviderAccount::filesystem(
+            root.join(".auru-pm").join("projects"),
+        ));
+    }
+    let token = auru_pm::token_store::load_provider_token(&listing.entry.id)
+        .ok()
+        .flatten();
+    ProviderAccount::connect_http(&listing.entry.endpoint, token)
+        .await
+        .map_err(|error| format!("connect to {}: {error}", listing.entry.name))
+}
+
 async fn open_provider(
     listing: &ProviderListing,
     project_path: &Path,
@@ -238,6 +350,194 @@ async fn open_provider(
         .await
         .map_err(|error| format!("connect to {}: {error}", listing.entry.name))?;
     Ok(Arc::new(provider))
+}
+
+async fn restore_from_provider(
+    provider: &dyn ProjectProvider,
+    commit_id: CommitId,
+    destination: &Path,
+    requested_file_name: &str,
+) -> Result<RestoreResult, String> {
+    let commit = provider
+        .get_commit(&commit_id)
+        .await
+        .map_err(|error| format!("fetch version: {error}"))?;
+    let snapshot_bytes = provider
+        .get_blob(&commit.tree.snapshot)
+        .await
+        .map_err(|error| format!("fetch project: {error}"))?;
+    let snapshot = ProjectSnapshot::from_canonical_bytes(&snapshot_bytes)
+        .map_err(|error| format!("read stored project: {error}"))?;
+    let requested_stem = Path::new(requested_file_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("Restored Project");
+    let file_name = safe_project_file_name(requested_stem, snapshot.format());
+    let restore_root = unique_restore_root(destination, Path::new(&file_name), commit_id);
+
+    match snapshot.format() {
+        ProjectFormat::AbletonLiveSet => {
+            let report =
+                auru_pm::ableton::restore_bundle(provider, &commit, &restore_root, &file_name)
+                    .await
+                    .map_err(|error| format!("restore Ableton project: {error}"))?;
+            Ok(RestoreResult {
+                project_file: report.live_set,
+                files_written: report.files_written,
+                unavailable: report.unavailable.len(),
+            })
+        }
+        ProjectFormat::FlStudio => {
+            restore_fl(provider, &commit, &snapshot, &restore_root, &file_name).await
+        }
+        ProjectFormat::Auru => {
+            restore_auru(provider, &commit, &snapshot, &restore_root, &file_name).await
+        }
+        ProjectFormat::Dawproject => {
+            std::fs::create_dir_all(&restore_root)
+                .map_err(|error| format!("create restore folder: {error}"))?;
+            let project_file = restore_root.join(file_name);
+            snapshot
+                .restore_to_path(&project_file)
+                .map_err(|error| format!("restore project: {error}"))?;
+            Ok(RestoreResult {
+                project_file,
+                files_written: 0,
+                unavailable: 0,
+            })
+        }
+    }
+}
+
+async fn restore_auru(
+    provider: &dyn ProjectProvider,
+    commit: &auru_pm::Commit,
+    snapshot: &ProjectSnapshot,
+    restore_root: &Path,
+    file_name: &str,
+) -> Result<RestoreResult, String> {
+    let manifest_bytes = provider
+        .get_blob(&commit.tree.samples)
+        .await
+        .map_err(|error| format!("fetch sample list: {error}"))?;
+    let manifest: SampleManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| format!("read sample list: {error}"))?;
+    let mut project: serde_json::Value = serde_json::from_slice(snapshot.as_bytes())
+        .map_err(|error| format!("read native project: {error}"))?;
+    let referenced = auru_pm::sample_manifest::sample_paths_in_snapshot(&project);
+    let mut restored_paths = BTreeMap::new();
+
+    std::fs::create_dir_all(restore_root)
+        .map_err(|error| format!("create restore folder: {error}"))?;
+    for entry in &manifest.entries {
+        if !referenced.contains(&entry.path) {
+            continue;
+        }
+        let Ok(bytes) = provider.get_blob(&entry.hash).await else {
+            continue;
+        };
+        let relative = format!(
+            "Samples/{}",
+            safe_native_asset_file_name(&entry.path, entry.hash)
+        );
+        let target = restore_root.join(&relative);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("create sample folder: {error}"))?;
+        }
+        std::fs::write(&target, bytes)
+            .map_err(|error| format!("restore sample {}: {error}", entry.path))?;
+        restored_paths.insert(entry.path.clone(), relative);
+    }
+
+    rewrite_native_sample_paths(&mut project, &restored_paths);
+    let encoded =
+        serde_json::to_vec(&project).map_err(|error| format!("encode native project: {error}"))?;
+    let restored_snapshot = ProjectSnapshot::from_source_bytes(ProjectFormat::Auru, &encoded)
+        .map_err(|error| format!("rebuild native project: {error}"))?;
+    let project_file = restore_root.join(file_name);
+    restored_snapshot
+        .restore_to_path(&project_file)
+        .map_err(|error| format!("restore project: {error}"))?;
+
+    Ok(RestoreResult {
+        project_file,
+        files_written: restored_paths.len(),
+        unavailable: referenced.len().saturating_sub(restored_paths.len()),
+    })
+}
+
+fn rewrite_native_sample_paths(
+    project: &mut serde_json::Value,
+    restored_paths: &BTreeMap<String, String>,
+) {
+    let Some(channels) = project
+        .get_mut("channels")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for clip in channels
+        .iter_mut()
+        .filter_map(|channel| channel.get_mut("clips"))
+        .filter_map(serde_json::Value::as_array_mut)
+        .flatten()
+    {
+        let Some(serde_json::Value::String(path)) = clip.pointer_mut("/data/Audio/file_path")
+        else {
+            continue;
+        };
+        if let Some(restored) = restored_paths.get(path) {
+            *path = restored.clone();
+        }
+    }
+}
+
+fn safe_native_asset_file_name(recorded_path: &str, hash: ContentHash) -> String {
+    let raw_name = recorded_path
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or("sample");
+    let path = Path::new(raw_name);
+    let stem = safe_file_component(
+        path.file_stem()
+            .and_then(|part| part.to_str())
+            .unwrap_or("sample"),
+        "sample",
+        120,
+    );
+    let extension = path
+        .extension()
+        .and_then(|part| part.to_str())
+        .map(|extension| safe_file_component(extension, "", 24))
+        .filter(|extension| !extension.is_empty());
+    let hash = hash.to_string();
+    let hash = hash.strip_prefix("blake3:").unwrap_or(&hash);
+    match extension {
+        Some(extension) => format!("{hash}-{stem}.{extension}"),
+        None => format!("{hash}-{stem}"),
+    }
+}
+
+fn safe_file_component(value: &str, fallback: &str, max_bytes: usize) -> String {
+    let mut safe = String::new();
+    for character in value.chars() {
+        let character = match character {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            character if character.is_control() => '_',
+            character => character,
+        };
+        if safe.len() + character.len_utf8() > max_bytes {
+            break;
+        }
+        safe.push(character);
+    }
+    let safe = safe.trim().trim_matches('.').trim();
+    if safe.is_empty() {
+        fallback.to_owned()
+    } else {
+        safe.to_owned()
+    }
 }
 
 fn persisted_project_handle(
@@ -319,6 +619,7 @@ fn unique_restore_root(destination: &Path, project_path: &Path, commit_id: Commi
         .and_then(|stem| stem.to_str())
         .unwrap_or("Project");
     let commit = commit_id.0.to_string();
+    let commit = commit.strip_prefix("blake3:").unwrap_or(&commit);
     let name = format!("{stem} Restored {}", &commit[..8]);
     let first = destination.join(&name);
     if !first.exists() {
@@ -347,7 +648,40 @@ fn project_handle(project_path: &Path) -> String {
         })
         .collect();
     let hash = auru_pm::ContentHash::of(project_path.to_string_lossy().as_bytes()).to_string();
+    let hash = hash.strip_prefix("blake3:").unwrap_or(&hash);
     format!("{}-{}", slug.trim_matches('-'), &hash[..12])
+}
+
+fn project_display_name(project_path: &Path) -> String {
+    project_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("Untitled Project")
+        .to_owned()
+}
+
+fn safe_project_file_name(display_name: &str, format: ProjectFormat) -> String {
+    let mut stem = safe_file_component(display_name, "Restored Project", 160);
+    if is_windows_reserved_name(&stem) {
+        stem.insert(0, '_');
+    }
+    format!("{stem}.{}", format.extension())
+}
+
+fn is_windows_reserved_name(value: &str) -> bool {
+    let stem = value
+        .split('.')
+        .next()
+        .unwrap_or(value)
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|number| {
+                matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            })
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime, String> {
@@ -392,6 +726,167 @@ mod tests {
             destination.join(".auru-pm/projects").is_dir(),
             "real provider storage should exist"
         );
+        let catalogue = remote_catalogue(listing).expect("provider catalogue");
+        assert_eq!(catalogue.unavailable, 0);
+        assert_eq!(catalogue.projects.len(), 1);
+        assert_eq!(catalogue.projects[0].name, "Song");
+        assert_eq!(catalogue.projects[0].format, ProjectFormat::Auru);
+        assert_eq!(catalogue.projects[0].head, history[0].id);
+    }
+
+    #[test]
+    fn recovering_a_remote_project_should_enroll_the_restored_copy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("Song.auru");
+        let sample = temp.path().join("source snare.wav");
+        std::fs::write(&sample, b"snare audio").expect("sample");
+        std::fs::write(
+            &project,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 8,
+                "channels": [{ "clips": [{
+                    "data": { "Audio": { "file_path": sample.to_str().unwrap() } }
+                }]}]
+            }))
+            .expect("project json"),
+        )
+        .expect("project");
+        let listing = local_listing(&temp.path().join("Backups"));
+        let BackupResult::Committed(history) =
+            back_up(listing.clone(), project, "Jake".to_owned()).expect("backup")
+        else {
+            panic!("first backup should commit");
+        };
+        let remote = remote_catalogue(listing.clone())
+            .expect("catalogue")
+            .projects
+            .remove(0);
+        std::fs::remove_file(&sample).expect("recovery must use the provider copy");
+
+        let restored = restore_remote(
+            listing.clone(),
+            remote.handle.clone(),
+            remote.file_name,
+            history[0].id,
+            temp.path().join("Recovered"),
+        )
+        .expect("recover");
+        assert_eq!(restored.files_written, 1);
+        assert_eq!(restored.unavailable, 0);
+        let sidecar =
+            Sidecar::load(&sidecar_path_for(&restored.project_file)).expect("restored sidecar");
+        let restored_project: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&restored.project_file).expect("restored project"),
+        )
+        .expect("restored project json");
+        let restored_sample = restored_project
+            .pointer("/channels/0/clips/0/data/Audio/file_path")
+            .and_then(serde_json::Value::as_str)
+            .expect("rewritten sample path");
+        assert!(restored_sample.starts_with("Samples/"));
+        assert_eq!(
+            std::fs::read(
+                restored
+                    .project_file
+                    .parent()
+                    .expect("restore folder")
+                    .join(restored_sample)
+            )
+            .expect("materialized sample"),
+            b"snare audio"
+        );
+
+        assert_eq!(sidecar.primary.as_deref(), Some(listing.entry.id.as_str()));
+        assert_eq!(sidecar.local_head, Some(history[0].id));
+        assert_eq!(
+            sidecar.provider_handles.get(&listing.entry.id),
+            Some(&remote.handle)
+        );
+
+        let BackupResult::Committed(recovered_history) = back_up(
+            listing.clone(),
+            restored.project_file.clone(),
+            "Jake".to_owned(),
+        )
+        .expect("back up recovered project") else {
+            panic!("rewritten native sample paths should remain backup-able");
+        };
+        let stored = FilesystemProvider::open(
+            temp.path()
+                .join("Backups/.auru-pm/projects")
+                .join(&remote.handle),
+        )
+        .expect("stored project");
+        let recovered_manifest = runtime()
+            .expect("runtime")
+            .block_on(async {
+                let commit = stored.get_commit(&recovered_history[0].id).await?;
+                let bytes = stored.get_blob(&commit.tree.samples).await?;
+                serde_json::from_slice::<SampleManifest>(&bytes).map_err(auru_pm::Error::from)
+            })
+            .expect("recovered sample manifest");
+        assert_eq!(recovered_manifest.entries.len(), 1);
+        assert!(recovered_manifest.entries[0].path.starts_with("Samples/"));
+        assert_eq!(
+            runtime()
+                .expect("runtime")
+                .block_on(stored.get_blob(&recovered_manifest.entries[0].hash))
+                .expect("re-backed-up sample"),
+            b"snare audio"
+        );
+    }
+
+    #[test]
+    fn a_partial_remote_restore_should_not_be_treated_as_synchronized() {
+        let result = RestoreResult {
+            project_file: PathBuf::from("/recover/Night Drive.als"),
+            files_written: 3,
+            unavailable: 2,
+        };
+
+        let error = require_complete_recovery(result).expect_err("partial restore");
+
+        assert!(error.contains("was not enrolled as synchronized"));
+        assert!(error.contains("2 referenced file(s) could not be restored"));
+    }
+
+    #[test]
+    fn a_native_recovery_with_an_uncaptured_sample_should_not_enroll() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing_sample = temp.path().join("already missing.wav");
+        let project = temp.path().join("Song.auru");
+        std::fs::write(
+            &project,
+            serde_json::to_vec(&serde_json::json!({
+                "channels": [{ "clips": [{
+                    "data": { "Audio": { "file_path": missing_sample.to_str().unwrap() } }
+                }]}]
+            }))
+            .expect("project json"),
+        )
+        .expect("project");
+        let listing = local_listing(&temp.path().join("Backups"));
+        let BackupResult::Committed(history) =
+            back_up(listing.clone(), project, "Jake".to_owned()).expect("backup")
+        else {
+            panic!("backup should commit even when a referenced sample is already missing");
+        };
+        let remote = remote_catalogue(listing.clone())
+            .expect("catalogue")
+            .projects
+            .remove(0);
+
+        let error = restore_remote(
+            listing,
+            remote.handle,
+            remote.file_name,
+            history[0].id,
+            temp.path().join("Recovered"),
+        )
+        .expect_err("an incomplete native recovery must not enroll");
+
+        assert!(error.contains("1 referenced file(s) could not be restored"));
+        assert!(error.contains("was not enrolled as synchronized"));
     }
 
     #[test]
@@ -522,6 +1017,34 @@ mod tests {
         assert_ne!(one, two);
         assert!(one.starts_with("my-song-"));
         assert!(!one.contains('/'));
+        assert!(!one.contains(':'));
+    }
+
+    #[test]
+    fn restored_native_asset_names_should_be_safe_path_components() {
+        let name = safe_native_asset_file_name(
+            r#"C:\Users\Jake\..\CON:?<>|.wav"#,
+            ContentHash::of(b"sample"),
+        );
+
+        assert!(!name.contains(['/', '\\', ':', '?', '<', '>', '|']));
+        assert!(name.ends_with(".wav"));
+    }
+
+    #[test]
+    fn restored_project_names_should_avoid_windows_devices() {
+        assert_eq!(
+            safe_project_file_name("CON", ProjectFormat::Auru),
+            "_CON.auru"
+        );
+        assert_eq!(
+            safe_project_file_name("lpt9.session", ProjectFormat::AbletonLiveSet),
+            "_lpt9.session.als"
+        );
+        assert_eq!(
+            safe_project_file_name("LPT10", ProjectFormat::FlStudio),
+            "LPT10.flp"
+        );
     }
 
     #[test]

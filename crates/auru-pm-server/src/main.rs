@@ -1,7 +1,7 @@
 //! In-memory `auru-pm-v1` server for development and protocol tests.
 //!
 //! Usage:
-//!   cargo run --example stub_server -- --port 4242 --handle myuser/mysong
+//!   cargo run -p auru-pm-server -- --port 4242
 //!
 //! The server advertises `auth_methods: ["none"]` and loses its state when
 //! stopped. It must not be exposed to an untrusted network.
@@ -11,7 +11,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use auru_pm_protocol::WIRE_VERSION;
+use auru_pm_protocol::{ProjectProfile, ProjectsResponse, ProviderProject, WIRE_VERSION};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -28,7 +28,14 @@ use tower_http::decompression::RequestDecompressionLayer;
 struct Db {
     blobs: HashMap<String, Vec<u8>>,
     commits: HashMap<String, Value>,
+    projects: HashMap<String, StoredProject>,
+}
+
+#[derive(Default)]
+struct StoredProject {
     head: Option<String>,
+    profile: Option<ProjectProfile<String>>,
+    updated_at: i64,
 }
 
 type SharedDb = Arc<Mutex<Db>>;
@@ -59,6 +66,7 @@ async fn get_health() -> impl IntoResponse {
         "protocol": WIRE_VERSION,
         "name": "Auru PM development server",
         "capabilities": {
+            "project_listing": true,
             "members": false,
             "permissions": false,
             "branches": false,
@@ -71,9 +79,50 @@ async fn get_health() -> impl IntoResponse {
     }))
 }
 
-async fn get_head(State(db): State<SharedDb>) -> impl IntoResponse {
+async fn get_projects(State(db): State<SharedDb>) -> impl IntoResponse {
     let db = db.lock().unwrap();
-    Json(json!({ "commit_id": db.head }))
+    let mut projects: Vec<ProviderProject<String, String>> = db
+        .projects
+        .iter()
+        .filter_map(|(handle, project)| {
+            Some(ProviderProject {
+                handle: handle.clone(),
+                head: project.head.clone()?,
+                profile: project.profile.clone(),
+                updated_at: project.updated_at,
+            })
+        })
+        .collect();
+    projects.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.handle.cmp(&right.handle))
+    });
+    Json(ProjectsResponse { projects })
+}
+
+async fn put_project_profile(
+    State(db): State<SharedDb>,
+    Path(handle): Path<String>,
+    Json(profile): Json<ProjectProfile<String>>,
+) -> StatusCode {
+    db.lock()
+        .unwrap()
+        .projects
+        .entry(handle)
+        .or_default()
+        .profile = Some(profile);
+    StatusCode::NO_CONTENT
+}
+
+async fn get_head(State(db): State<SharedDb>, Path(handle): Path<String>) -> impl IntoResponse {
+    let db = db.lock().unwrap();
+    let head = db
+        .projects
+        .get(&handle)
+        .and_then(|project| project.head.clone());
+    Json(json!({ "commit_id": head }))
 }
 
 #[derive(Deserialize)]
@@ -82,12 +131,28 @@ struct AdvanceHeadBody {
     to: String,
 }
 
-async fn post_head(State(db): State<SharedDb>, Json(body): Json<AdvanceHeadBody>) -> Response {
+async fn post_head(
+    State(db): State<SharedDb>,
+    Path(handle): Path<String>,
+    Json(body): Json<AdvanceHeadBody>,
+) -> Response {
     let mut db = db.lock().unwrap();
-    if db.head.as_deref() != body.from.as_deref() {
-        return conflict(db.head.as_deref());
+    let current = db
+        .projects
+        .get(&handle)
+        .and_then(|project| project.head.as_deref());
+    if current != body.from.as_deref() {
+        return conflict(current);
     }
-    db.head = Some(body.to);
+    let updated_at = db
+        .commits
+        .get(&body.to)
+        .and_then(|commit| commit.get("timestamp"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let project = db.projects.entry(handle).or_default();
+    project.head = Some(body.to);
+    project.updated_at = updated_at;
     (StatusCode::OK, Json(json!({"result": "advanced"}))).into_response()
 }
 
@@ -130,13 +195,17 @@ struct HistoryQuery {
 
 async fn get_history(
     State(db): State<SharedDb>,
+    Path(handle): Path<String>,
     Query(q): Query<HistoryQuery>,
 ) -> impl IntoResponse {
     let db = db.lock().unwrap();
     let limit = q.limit.unwrap_or(100) as usize;
     let mut out: Vec<Value> = Vec::new();
     let mut started = q.before.is_none();
-    let mut cursor = db.head.clone();
+    let mut cursor = db
+        .projects
+        .get(&handle)
+        .and_then(|project| project.head.clone());
 
     while let Some(id) = cursor {
         let commit_val = match db.commits.get(&id) {
@@ -226,6 +295,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/v1/health", get(get_health))
+        .route("/v1/projects", get(get_projects))
+        .route("/v1/projects/:handle", put(put_project_profile))
         .route("/v1/projects/:handle/head", get(get_head).post(post_head))
         .route("/v1/projects/:handle/commits", post(post_commit))
         .route("/v1/projects/:handle/commits/:id", get(get_commit))

@@ -1,8 +1,7 @@
 //! HTTP provider client implementing [`ProjectProvider`] over `auru-pm-v1`.
 //!
-//! Construct via [`HttpProvider::open`] (verifies the server is reachable
-//! and protocol-compatible) or probe cheaply via [`HttpProvider::probe`]
-//! for capability discovery from the "Add Custom URL" Verify button.
+//! Construct a project-scoped provider via [`HttpProvider::open`], or connect
+//! an [`HttpAccount`] once when listing and opening several projects.
 
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, header};
@@ -11,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use crate::commit::{Commit, CommitId, CommitSummary, HistoryRange};
 use crate::error::{Error, Result};
 use crate::hash::ContentHash;
-use crate::provider::{Capabilities, HeadAdvance, Member, PermSet, ProjectProvider, UserId};
+use crate::provider::{
+    Capabilities, HeadAdvance, Member, PermSet, ProjectProfile, ProjectProvider, ProviderProject,
+    UserId,
+};
 
 /// Gzip `bytes`, or `None` if the encoder failed — in which case the caller
 /// sends the body uncompressed rather than failing the upload.
@@ -74,7 +76,66 @@ struct MembersResponse {
     members: Vec<Member>,
 }
 
+type ProjectsResponse =
+    auru_pm_protocol::ProjectsResponse<CommitId, crate::project_format::ProjectFormat>;
+
 // ── Provider ─────────────────────────────────────────────────────────────────
+
+/// One authenticated HTTP provider account with cached capabilities.
+#[derive(Clone, Debug)]
+pub struct HttpAccount {
+    client: Client,
+    base_url: String,
+    caps: Capabilities,
+}
+
+impl HttpAccount {
+    /// Verify protocol compatibility and establish an authenticated account.
+    pub async fn connect(base_url: &str, token: Option<String>) -> Result<Self> {
+        let base_url = base_url.trim_end_matches('/').to_owned();
+        let (_, caps) = HttpProvider::probe(&base_url).await?;
+        let client = build_client(token.as_deref())?;
+        Ok(Self {
+            client,
+            base_url,
+            caps,
+        })
+    }
+
+    pub fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    /// List projects visible to the authenticated provider account.
+    pub async fn list_projects(&self) -> Result<Vec<ProviderProject>> {
+        if !self.caps.project_listing {
+            return Err(Error::Unsupported("project listing"));
+        }
+        let url = format!("{}/v1/projects", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|error| Error::Network(error.to_string()))?;
+        let resp = check_resp(resp).await?;
+        let body: ProjectsResponse = resp
+            .json()
+            .await
+            .map_err(|error| Error::Other(format!("list_projects parse: {error}")))?;
+        Ok(body.projects)
+    }
+
+    /// Open a project through this account without probing the provider again.
+    pub fn open_project(&self, handle: impl Into<String>) -> HttpProvider {
+        HttpProvider {
+            client: self.client.clone(),
+            base_url: self.base_url.clone(),
+            handle: handle.into(),
+            caps: self.caps.clone(),
+        }
+    }
+}
 
 /// HTTP provider connecting to an `auru-pm-v1` server.
 #[derive(Clone, Debug)]
@@ -129,15 +190,9 @@ impl HttpProvider {
     /// Calls `probe` to verify compatibility and cache capabilities.
     /// If the server requires a bearer token, supply it via `token`.
     pub async fn open(base_url: &str, handle: &str, token: Option<String>) -> Result<Self> {
-        let base_url = base_url.trim_end_matches('/').to_owned();
-        let (_, caps) = Self::probe(&base_url).await?;
-        let client = build_client(token.as_deref())?;
-        Ok(Self {
-            client,
-            base_url,
-            handle: handle.to_owned(),
-            caps,
-        })
+        Ok(HttpAccount::connect(base_url, token)
+            .await?
+            .open_project(handle))
     }
 
     /// Stable provider identifier. Used as key in sidecar `remotes` and
@@ -151,11 +206,18 @@ impl HttpProvider {
         &self.handle
     }
 
+    fn project_root_url(&self) -> String {
+        format!(
+            "{}/v1/projects/{}",
+            self.base_url,
+            encode_path_segment(&self.handle)
+        )
+    }
+
     fn project_url(&self, suffix: &str) -> String {
         format!(
-            "{}/v1/projects/{}/{}",
-            self.base_url,
-            encode_path_segment(&self.handle),
+            "{}/{}",
+            self.project_root_url(),
             suffix.trim_start_matches('/')
         )
     }
@@ -274,10 +336,18 @@ impl ProjectProvider for HttpProvider {
             .await
             .map_err(|e| Error::Network(e.to_string()))?;
         let resp = check_resp(resp).await?;
-        resp.bytes()
+        let bytes = resp
+            .bytes()
             .await
             .map(|b| b.to_vec())
-            .map_err(|e| Error::Network(e.to_string()))
+            .map_err(|e| Error::Network(e.to_string()))?;
+        let actual = ContentHash::of(&bytes);
+        if actual != *hash {
+            return Err(Error::Other(format!(
+                "blob hash mismatch: requested {hash}, received {actual}"
+            )));
+        }
+        Ok(bytes)
     }
 
     async fn put_commit(&self, commit: &Commit) -> Result<CommitId> {
@@ -375,6 +445,21 @@ impl ProjectProvider for HttpProvider {
 
         check_resp(resp).await?;
         Ok(HeadAdvance::Advanced)
+    }
+
+    async fn put_project_profile(&self, profile: &ProjectProfile) -> Result<()> {
+        if !self.caps.project_listing {
+            return Err(Error::Unsupported("project listing"));
+        }
+        let resp = self
+            .client
+            .put(self.project_root_url())
+            .json(profile)
+            .send()
+            .await
+            .map_err(|error| Error::Network(error.to_string()))?;
+        check_resp(resp).await?;
+        Ok(())
     }
 
     async fn list_members(&self) -> Result<Vec<Member>> {
