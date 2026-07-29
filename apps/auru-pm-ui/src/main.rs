@@ -3,6 +3,7 @@ mod backend;
 mod catalog;
 mod menus;
 mod model;
+mod runtime;
 mod state;
 
 use std::path::PathBuf;
@@ -1698,9 +1699,16 @@ impl ProjectManager {
             @ (AuthMethod::OAuthAuthorizationCodePkce | AuthMethod::OAuthDeviceCode) => {
                 self.auth_phase = AuthPhase::Waiting;
                 cx.notify();
+                let probe = cx.background_executor().spawn(async move {
+                    match runtime::block_on(auru_pm::HttpProvider::probe_health(&endpoint)) {
+                        Ok(Ok(health)) => Ok((health, endpoint)),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(error) => Err(error),
+                    }
+                });
                 cx.spawn(async move |this, cx| {
-                    let receiver = match auru_pm::HttpProvider::probe_health(&endpoint).await {
-                        Ok(health) => match health.authentication {
+                    let receiver = match probe.await {
+                        Ok((health, endpoint)) => match health.authentication {
                             Some(configuration) => {
                                 auru_pm::start_standard_oauth_flow(configuration)
                             }
