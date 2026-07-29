@@ -113,7 +113,7 @@ pub(crate) fn extract_parts(
             .resolve("Transport/Tempo")
             .and_then(|node| number_attribute(node, "value")),
         time_signature: read_time_signature(root),
-        clip_count: root.descendants().filter(|node| node.tag == "Clip").count(),
+        clip_count: visible_clip_count(root),
         scene_count: root
             .child("Scenes")
             .map(|scenes| {
@@ -238,6 +238,24 @@ fn arrangement_end(root: &XmlElement) -> f64 {
         return 0.0;
     };
     arrangement_lanes_end(lanes, None)
+}
+
+/// Count clips a musician sees, excluding clip-local content wrappers.
+///
+/// Bitwig exports warped audio as an arrangement `Clip` containing another
+/// `Clip`. The inner node describes the source content and is not a second
+/// timeline or launcher clip.
+fn visible_clip_count(root: &XmlElement) -> usize {
+    fn count(element: &XmlElement, inside_clip: bool) -> usize {
+        let is_clip = element.tag == "Clip";
+        usize::from(is_clip && !inside_clip)
+            + element
+                .child_elements()
+                .map(|child| count(child, inside_clip || is_clip))
+                .sum::<usize>()
+    }
+
+    count(root, false)
 }
 
 /// Furthest end of a top-level arrangement clip measured in beats.

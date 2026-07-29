@@ -378,12 +378,12 @@ mod tests {
         let source = archive(project, None, &[]);
         let snapshot = ProjectSnapshot::from_source_bytes(ProjectFormat::Dawproject, &source)
             .expect("snapshot");
+        let metadata = read_metadata(&snapshot).expect("metadata");
 
+        assert_eq!(metadata.arrangement_end_beats, 12.0);
         assert_eq!(
-            read_metadata(&snapshot)
-                .expect("metadata")
-                .arrangement_end_beats,
-            12.0
+            metadata.clip_count, 2,
+            "the nested clip describes content, not a second visible clip"
         );
     }
 }

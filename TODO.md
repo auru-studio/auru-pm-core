@@ -201,9 +201,24 @@ follows the official DAWproject 1.0 schema and now supplies:
   mix parameters, devices, plugin inventory, and embedded resources. Unknown
   XML still emits a generic change rather than disappearing.
 
-The committed oracle is deliberately small and Auru-generated. A project
-exported by a production DAW is still wanted as an interoperability fixture,
-especially one containing embedded audio and third-party plugin state.
+**Production interoperability proof, 2026-07-29:** paired Bitwig Studio 5.3.13
+native projects and DAWproject exports were checked. The MIDI-only export reads
+as 4 song tracks, 1 master, 1 visible clip, 8 scenes, and no media. Its edited
+version reads as 5 song tracks, 1 master, 3 visible clips, 8 scenes, and 2
+embedded audio files. Both preserve the same CLAP and built-in device
+identities, normalize/restore unchanged, commit successfully, and restore
+unchanged after hydrating media from their individual CAS objects. The two
+embedded WAV payloads are byte-identical to Bitwig's source samples, and the
+CLAP preset payload is byte-identical between the native and interchange
+archives.
+
+That pair also proved Bitwig renumbers later XML ids when inserting a track and
+renumbers clip-local content wrappers even when their notes are unchanged.
+Track matching now prefers stable role/name/device evidence before ids, and
+generated ids are ignored when comparing clip and device content. The source
+archives are not committed because they contain sample-pack audio, third-party
+preset state, and machine-local paths; the exporter behavior is captured by a
+small synthetic regression instead.
 
 - **Remaining:** making embedded media truly lazy, rather than storing the v1
   inline fallback as well as its CAS object, requires a versioned snapshot

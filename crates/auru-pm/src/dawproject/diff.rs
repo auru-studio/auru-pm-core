@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -6,7 +6,7 @@ use crate::diff::{
     ChangeKind, ChangeRow, ChangeTag, ChannelDiff, ChannelKind, ProjectDiff, TimeSig, fmt_f64,
     fmt_pos_beats,
 };
-use crate::project_format::XmlElement;
+use crate::project_format::{XmlContent, XmlElement};
 
 const MAX_ROWS_PER_TRACK: usize = 24;
 
@@ -177,10 +177,45 @@ fn track_diffs(
         numerator: time_sig.0.max(1),
         denominator: time_sig.1.max(1),
     };
-    let mut cards = Vec::new();
+    let mut matches = BTreeMap::new();
+    let mut matched_before = BTreeSet::new();
 
+    // Bitwig's exporter can renumber every later XML id when a track is
+    // inserted. Match the identities that survive that renumbering first,
+    // then use an unchanged compatible id for tracks that were simply renamed.
+    for (after_id, after_track) in &after {
+        let candidates = before
+            .iter()
+            .filter(|(before_id, before_track)| {
+                !matched_before.contains(*before_id)
+                    && high_confidence_track_match(before_track, after_track)
+            })
+            .map(|(before_id, _)| before_id)
+            .collect::<Vec<_>>();
+        if let [before_id] = candidates.as_slice() {
+            matches.insert(after_id.clone(), (*before_id).clone());
+            matched_before.insert((*before_id).clone());
+        }
+    }
+    for (after_id, after_track) in &after {
+        if matches.contains_key(after_id) {
+            continue;
+        }
+        let Some(before_track) = before.get(after_id) else {
+            continue;
+        };
+        if !matched_before.contains(after_id)
+            && super::meta::track_kind(before_track.element)
+                == super::meta::track_kind(after_track.element)
+        {
+            matches.insert(after_id.clone(), after_id.clone());
+            matched_before.insert(after_id.clone());
+        }
+    }
+
+    let mut cards = Vec::new();
     for (id, track) in &after {
-        match before.get(id) {
+        match matches.get(id).and_then(|before_id| before.get(before_id)) {
             Some(previous) => {
                 if let Some(card) = modified_track(previous, track, time_sig) {
                     cards.push(card);
@@ -198,7 +233,7 @@ fn track_diffs(
         }
     }
     for (id, track) in &before {
-        if !after.contains_key(id) {
+        if !matched_before.contains(id) {
             cards.push(ChannelDiff {
                 name: track_name(track.element),
                 kind: channel_kind(track.element),
@@ -211,6 +246,23 @@ fn track_diffs(
         }
     }
     cards
+}
+
+fn high_confidence_track_match(before: &TrackView<'_>, after: &TrackView<'_>) -> bool {
+    let kind = super::meta::track_kind(before.element);
+    if kind != super::meta::track_kind(after.element) {
+        return false;
+    }
+    if kind == super::DawprojectTrackKind::Master {
+        return true;
+    }
+    let before_name = track_name(before.element);
+    let after_name = track_name(after.element);
+    if before_name != "Untitled track" && before_name == after_name {
+        return true;
+    }
+    let before_devices = device_identity(before.element);
+    !before_devices.is_empty() && before_devices == device_identity(after.element)
 }
 
 fn tracks(root: &XmlElement) -> BTreeMap<String, TrackView<'_>> {
@@ -324,13 +376,14 @@ fn device_rows(rows: &mut Vec<ChangeRow>, before: &XmlElement, after: &XmlElemen
                 before: None,
                 after: None,
             }),
-            Some(previous) if *previous != *device => rows.push(ChangeRow {
-                tag: ChangeTag::PluginPreset,
-                kind: ChangeKind::Modify,
-                target: device_name(device),
-                before: None,
-                after: Some("device state changed".to_owned()),
-            }),
+            Some(previous) if !elements_equal_ignoring_generated_ids(previous, device) => rows
+                .push(ChangeRow {
+                    tag: ChangeTag::PluginPreset,
+                    kind: ChangeKind::Modify,
+                    target: device_name(device),
+                    before: None,
+                    after: Some("device state changed".to_owned()),
+                }),
             _ => {}
         }
     }
@@ -348,18 +401,28 @@ fn device_rows(rows: &mut Vec<ChangeRow>, before: &XmlElement, after: &XmlElemen
 }
 
 fn devices(track: &XmlElement) -> BTreeMap<String, &XmlElement> {
+    let mut occurrences = BTreeMap::<String, usize>::new();
     track
         .resolve("Channel/Devices")
         .into_iter()
         .flat_map(XmlElement::child_elements)
-        .enumerate()
-        .map(|(index, device)| {
-            (
-                device.id.clone().unwrap_or_else(|| format!("@{index}")),
-                device,
-            )
+        .map(|device| {
+            let identity = device
+                .attribute("deviceID")
+                .or_else(|| device.attribute("name"))
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&device.tag);
+            let base = format!("{}:{identity}", device.tag);
+            let occurrence = occurrences.entry(base.clone()).or_default();
+            let key = format!("{base}#{occurrence}");
+            *occurrence += 1;
+            (key, device)
         })
         .collect()
+}
+
+fn device_identity(track: &XmlElement) -> Vec<String> {
+    devices(track).into_keys().collect()
 }
 
 fn clip_rows(
@@ -388,7 +451,7 @@ fn clip_rows(
             });
             continue;
         };
-        if *previous == *clip {
+        if elements_equal_ignoring_generated_ids(previous, clip) {
             continue;
         }
         modified += 1;
@@ -427,7 +490,7 @@ fn clip_rows(
             "duration",
             |value| format!("{value} beats"),
         );
-        if previous.children != clip.children {
+        if !contents_equal_ignoring_generated_ids(&previous.children, &clip.children) {
             rows.push(ChangeRow {
                 tag: ChangeTag::Content,
                 kind: ChangeKind::Modify,
@@ -450,6 +513,41 @@ fn clip_rows(
         }
     }
     (added, removed, modified)
+}
+
+fn elements_equal_ignoring_generated_ids(left: &XmlElement, right: &XmlElement) -> bool {
+    left.tag == right.tag
+        && left
+            .attributes
+            .iter()
+            .filter(|(name, _)| name.as_str() != "id")
+            .eq(right
+                .attributes
+                .iter()
+                .filter(|(name, _)| name.as_str() != "id"))
+        && contents_equal_ignoring_generated_ids(&left.children, &right.children)
+}
+
+fn contents_equal_ignoring_generated_ids(left: &[XmlContent], right: &[XmlContent]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| match (left, right) {
+                (XmlContent::Element(left), XmlContent::Element(right)) => {
+                    elements_equal_ignoring_generated_ids(left, right)
+                }
+                (XmlContent::Text { text: left }, XmlContent::Text { text: right }) => {
+                    left == right
+                }
+                (XmlContent::Cdata { cdata: left }, XmlContent::Cdata { cdata: right }) => {
+                    left == right
+                }
+                (XmlContent::Comment { comment: left }, XmlContent::Comment { comment: right }) => {
+                    left == right
+                }
+                _ => false,
+            })
 }
 
 fn clip_index<'a>(clips: &[&'a XmlElement]) -> BTreeMap<String, &'a XmlElement> {
@@ -731,6 +829,65 @@ mod tests {
                 .any(|change| change == "DAWproject project XML changed"),
             "an extension field must not disappear just because the known metadata stayed equal"
         );
+    }
+
+    #[test]
+    fn bitwig_id_reissue_should_not_turn_shifted_tracks_into_edits() {
+        let before = snapshot(
+            r#"<Project version="1.0">
+                <Application name="Bitwig Studio" version="5.3.13"/>
+                <Structure>
+                  <Track contentType="notes" id="id2" name="Synth">
+                    <Channel role="regular"/>
+                  </Track>
+                  <Track contentType="audio" id="id23" name="FX 1">
+                    <Channel role="effect"/>
+                  </Track>
+                  <Track contentType="audio notes" id="id28" name="Master">
+                    <Channel role="master"/>
+                  </Track>
+                </Structure>
+                <Arrangement><Lanes timeUnit="beats">
+                  <Lanes track="id2"><Clips>
+                    <Clip time="0" duration="4"><Notes id="id49">
+                      <Note time="0" duration="1" channel="0" key="60" vel="1"/>
+                    </Notes></Clip>
+                  </Clips></Lanes>
+                </Lanes></Arrangement>
+              </Project>"#,
+        );
+        let after = snapshot(
+            r#"<Project version="1.0">
+                <Application name="Bitwig Studio" version="5.3.13"/>
+                <Structure>
+                  <Track contentType="notes" id="id2" name="Synth">
+                    <Channel role="regular"/>
+                  </Track>
+                  <Track contentType="audio" id="id23" name="GrannyBass Loop 3">
+                    <Channel role="regular"/>
+                  </Track>
+                  <Track contentType="audio" id="id28" name="FX 1">
+                    <Channel role="effect"/>
+                  </Track>
+                  <Track contentType="audio notes" id="id33" name="Master">
+                    <Channel role="master"/>
+                  </Track>
+                </Structure>
+                <Arrangement><Lanes timeUnit="beats">
+                  <Lanes track="id2"><Clips>
+                    <Clip time="0" duration="4"><Notes id="id57">
+                      <Note time="0" duration="1" channel="0" key="60" vel="1"/>
+                    </Notes></Clip>
+                  </Clips></Lanes>
+                </Lanes></Arrangement>
+              </Project>"#,
+        );
+
+        let diff = structured_diff(&before, &after).expect("structured diff");
+
+        assert_eq!(diff.channels.len(), 1);
+        assert_eq!(diff.channels[0].name, "GrannyBass Loop 3");
+        assert_eq!(diff.channels[0].status, ChangeKind::Add);
     }
 
     #[test]
