@@ -31,7 +31,9 @@ pub mod rewrite;
 pub mod validate;
 
 pub use assets::{AssetPlan, PlannedAsset, UnresolvedAsset};
-pub use bundle::{AbletonBundle, BundleFile, BundlePolicy, PathAlias};
+pub use bundle::{
+    AbletonBundle, BundleFile, BundlePolicy, PathAlias, ScanOptions, scan_for_projects,
+};
 pub use meta::{
     AbletonMetadata, AssetSummary, KeyInfo, TimeSignature, TrackCounts, TrackKind, TrackSummary,
     decode_packed_time_signature,

@@ -1,0 +1,322 @@
+//! What Auru remembers between launches.
+//!
+//! Small and deliberately boring: which folders to look in, which projects
+//! were added by hand, and the handful of preferences the settings window
+//! writes. Everything else — a project's tempo, whether it is backed up, what
+//! its history contains — is read from the projects themselves and from their
+//! sidecars, because those are the truth and a cache of them would only be a
+//! second thing that can be wrong.
+//!
+//! Nothing here is a credential. Provider tokens live in the operating
+//! system's keychain and never reach this file.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+/// Bumped when the shape changes in a way older builds cannot read.
+pub const STATE_SCHEMA: u32 = 1;
+
+/// Everything Auru carries from one launch to the next.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppState {
+    pub schema: u32,
+    /// Name shown against saved versions.
+    pub display_name: String,
+    /// `"night"` or `"day"`.
+    pub appearance: String,
+    pub automatic_backups: bool,
+    pub verify_uploads: bool,
+    /// Key of the chosen retention option.
+    pub version_retention: String,
+    /// Key of the sidebar's sort order. See `model::SortOrder::from_key`.
+    pub sort_order: String,
+    /// Unix seconds when Auru first saw each project, keyed by its folder.
+    ///
+    /// The only way to answer "recently added", because nothing on disk
+    /// records it — a project folder is as old as the music inside it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub first_seen: BTreeMap<String, i64>,
+    /// Folders scanned for projects.
+    pub watched_folders: Vec<PathBuf>,
+    /// Projects added individually, outside any watched folder.
+    pub projects: Vec<PathBuf>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            schema: STATE_SCHEMA,
+            display_name: String::new(),
+            appearance: "night".to_owned(),
+            automatic_backups: true,
+            verify_uploads: true,
+            version_retention: "everything".to_owned(),
+            sort_order: "attention".to_owned(),
+            first_seen: BTreeMap::new(),
+            watched_folders: Vec::new(),
+            projects: Vec::new(),
+        }
+    }
+}
+
+impl AppState {
+    /// Where the state file lives on this platform.
+    ///
+    /// `None` when the platform gives us nowhere to write, in which case the
+    /// app runs perfectly well and simply forgets — better than refusing to
+    /// start over a preferences file.
+    pub fn path() -> Option<PathBuf> {
+        Some(config_dir()?.join("state.json"))
+    }
+
+    /// Read the saved state, or start fresh.
+    ///
+    /// Any problem — missing, unreadable, malformed, written by a newer
+    /// build — yields defaults. Losing preferences is a small harm; refusing
+    /// to open someone's music because a settings file confused us is not.
+    pub fn load() -> Self {
+        let Some(path) = Self::path() else {
+            return Self::default();
+        };
+        Self::load_from(&path)
+    }
+
+    pub fn load_from(path: &Path) -> Self {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Self::default();
+        };
+        match serde_json::from_str::<Self>(&text) {
+            Ok(state) if state.schema <= STATE_SCHEMA => state,
+            Ok(state) => {
+                eprintln!(
+                    "[auru-pm] {} was written by a newer version (schema {}); starting fresh",
+                    path.display(),
+                    state.schema
+                );
+                Self::default()
+            }
+            Err(error) => {
+                eprintln!("[auru-pm] couldn't read {}: {error}", path.display());
+                Self::default()
+            }
+        }
+    }
+
+    /// Write the state out. Best-effort: a failure is reported, never fatal.
+    pub fn save(&self) {
+        let Some(path) = Self::path() else {
+            return;
+        };
+        if let Err(error) = self.save_to(&path) {
+            eprintln!("[auru-pm] couldn't save {}: {error}", path.display());
+        }
+    }
+
+    /// Write via a temporary file and rename, so an interrupted save cannot
+    /// leave behind a half-written file that the next launch discards.
+    pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = serde_json::to_vec_pretty(self)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &body)?;
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(error)
+            }
+        }
+    }
+
+    /// Add a watched folder, ignoring one already being watched.
+    pub fn watch(&mut self, path: &Path) {
+        if !self.watched_folders.iter().any(|known| known == path) {
+            self.watched_folders.push(path.to_path_buf());
+        }
+    }
+
+    /// Add an individually-added project.
+    ///
+    /// A project already covered by a watched folder is not recorded again —
+    /// it would be found by the scan anyway, and listing it twice would make
+    /// removing the folder leave a stray entry behind.
+    pub fn add_project(&mut self, root: &Path) {
+        if self.is_watched(root) {
+            return;
+        }
+        if !self.projects.iter().any(|known| known == root) {
+            self.projects.push(root.to_path_buf());
+        }
+    }
+
+    /// Record when a project was first seen, and return that time.
+    ///
+    /// Called for every project on every library load, so a project keeps the
+    /// time it was *first* found rather than the time of the latest scan.
+    ///
+    /// Entries are never pruned. A project on an unplugged drive is missing
+    /// from the scan but not gone, and forgetting when it was added — only to
+    /// re-add it as brand new when the drive comes back — would be worse than
+    /// the few bytes a stale entry costs.
+    pub fn note_first_seen(&mut self, root: &str) -> i64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|since| since.as_secs() as i64)
+            .unwrap_or_default();
+        *self.first_seen.entry(root.to_owned()).or_insert(now)
+    }
+
+    /// Whether `root` sits inside a folder already being watched.
+    pub fn is_watched(&self, root: &Path) -> bool {
+        self.watched_folders
+            .iter()
+            .any(|folder| root.starts_with(folder))
+    }
+}
+
+/// Auru's configuration directory for this platform.
+fn config_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "windows") {
+        return std::env::var_os("APPDATA").map(|base| PathBuf::from(base).join("Auru").join("pm"));
+    }
+
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if cfg!(target_os = "macos") {
+        return home.map(|home| {
+            home.join("Library")
+                .join("Application Support")
+                .join("studio.auru.pm")
+        });
+    }
+
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.map(|home| home.join(".config")))
+        .map(|base| base.join("auru-pm"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_should_survive_a_round_trip() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("state.json");
+
+        let mut state = AppState {
+            display_name: "Jake".to_owned(),
+            appearance: "day".to_owned(),
+            ..AppState::default()
+        };
+        state.watch(Path::new("/music/Ableton Projects"));
+        state.add_project(Path::new("/elsewhere/One Off Project"));
+        state.save_to(&path).expect("save");
+
+        let loaded = AppState::load_from(&path);
+        assert_eq!(loaded.display_name, "Jake");
+        assert_eq!(loaded.appearance, "day");
+        assert_eq!(loaded.watched_folders.len(), 1);
+        assert_eq!(loaded.projects.len(), 1);
+    }
+
+    #[test]
+    fn a_missing_file_should_start_fresh() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = AppState::load_from(&temp.path().join("nothing-here.json"));
+        assert!(state.watched_folders.is_empty());
+        assert_eq!(state.schema, STATE_SCHEMA);
+    }
+
+    #[test]
+    fn a_corrupt_file_should_start_fresh_rather_than_fail() {
+        // Refusing to open someone's music over a broken preferences file
+        // would be a far worse outcome than losing their preferences.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("state.json");
+        std::fs::write(&path, "{ not json at all").expect("write");
+
+        assert!(AppState::load_from(&path).watched_folders.is_empty());
+    }
+
+    #[test]
+    fn a_file_from_a_newer_build_should_not_be_guessed_at() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("state.json");
+        let state = AppState {
+            schema: STATE_SCHEMA + 1,
+            display_name: "From the future".to_owned(),
+            ..AppState::default()
+        };
+        state.save_to(&path).expect("save");
+
+        let loaded = AppState::load_from(&path);
+        assert_eq!(
+            loaded.display_name, "",
+            "fields we may not understand are not adopted"
+        );
+    }
+
+    #[test]
+    fn a_file_missing_fields_should_fill_them_in() {
+        // Anything written by an older build must keep working.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("state.json");
+        std::fs::write(&path, r#"{"display_name":"Jake"}"#).expect("write");
+
+        let loaded = AppState::load_from(&path);
+        assert_eq!(loaded.display_name, "Jake");
+        assert!(loaded.automatic_backups, "defaults fill the rest");
+        assert_eq!(loaded.appearance, "night");
+    }
+
+    #[test]
+    fn watching_the_same_folder_twice_should_record_it_once() {
+        let mut state = AppState::default();
+        state.watch(Path::new("/music"));
+        state.watch(Path::new("/music"));
+        assert_eq!(state.watched_folders.len(), 1);
+    }
+
+    #[test]
+    fn a_project_inside_a_watched_folder_should_not_be_listed_separately() {
+        // The scan finds it anyway. Recording it twice would leave a stray
+        // entry behind when the folder is unwatched.
+        let mut state = AppState::default();
+        state.watch(Path::new("/music/Ableton Projects"));
+        state.add_project(Path::new("/music/Ableton Projects/Song Project"));
+
+        assert!(state.projects.is_empty());
+        assert!(state.is_watched(Path::new("/music/Ableton Projects/Song Project")));
+    }
+
+    #[test]
+    fn a_project_outside_every_watched_folder_should_be_kept() {
+        let mut state = AppState::default();
+        state.watch(Path::new("/music/Ableton Projects"));
+        state.add_project(Path::new("/elsewhere/Song Project"));
+        assert_eq!(state.projects.len(), 1);
+    }
+
+    #[test]
+    fn an_interrupted_save_should_not_leave_a_stray_file_behind() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("state.json");
+        AppState::default().save_to(&path).expect("save");
+
+        let strays: Vec<_> = std::fs::read_dir(temp.path())
+            .expect("read dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "left behind {strays:?}");
+    }
+}

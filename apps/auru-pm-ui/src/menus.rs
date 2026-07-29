@@ -1,4 +1,7 @@
-use gpui::{App, KeyBinding, Menu, MenuItem, NoAction, SystemMenuType, actions};
+use gpui::{App, KeyBinding, Menu, MenuItem, NoAction, actions};
+// Only referenced by the macOS Services submenu below.
+#[cfg(target_os = "macos")]
+use gpui::SystemMenuType;
 
 actions!(
     auru_pm_ui,
@@ -10,7 +13,21 @@ actions!(
         CloseWindow,
         Minimize,
         Zoom,
-        OpenSettings
+        OpenSettings,
+        // One per DAW rather than a single "open" action: each knows whether
+        // it is asking for a folder or a file, so the picker can ask for the
+        // right thing. Adding a DAW means adding a variant here and a menu
+        // line, nothing more.
+        AddAbletonProject,
+        AddDawproject,
+        AddAuruProject,
+        // One per sort order, for the same reason: an action carrying a field
+        // would need its own serialization, and these are a closed set.
+        SortByLastModifiedLocal,
+        SortByLastModifiedRemote,
+        SortByName,
+        SortByRecentlyAdded,
+        SortByAttentionRequired,
     ]
 );
 
@@ -40,7 +57,10 @@ fn build_menus() -> Vec<Menu> {
     vec![
         Menu::new("Auru PM").items(application_menu_items()),
         Menu::new("File").items([
-            disabled_item("Open Project…"),
+            MenuItem::action("Add Ableton Live Project…", AddAbletonProject),
+            MenuItem::action("Add DAWproject…", AddDawproject),
+            MenuItem::action("Add Auru Project…", AddAuruProject),
+            MenuItem::separator(),
             disabled_item("Clone Repository…"),
             MenuItem::separator(),
             disabled_item("Sync All"),

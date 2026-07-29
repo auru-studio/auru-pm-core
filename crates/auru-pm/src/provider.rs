@@ -39,6 +39,12 @@ pub struct Capabilities {
 pub enum AuthMethod {
     /// OAuth 2.0 device-code flow (used by the Auru-hosted reference
     /// provider — no embedded browser required).
+    ///
+    /// Named explicitly because `rename_all = "snake_case"` turns `OAuth`
+    /// into `o_auth`, which is not what [`spec.md`](../spec.md) documents and
+    /// not what a server implementing it would send. The alias keeps anything
+    /// written with the derived spelling readable.
+    #[serde(rename = "oauth_device_code", alias = "o_auth_device_code")]
     OAuthDeviceCode,
     /// Personal access token, pasted by the user into the Add Custom URL
     /// dialog and stored in the OS keychain.
@@ -169,5 +175,49 @@ pub trait ProjectProvider: Send + Sync {
     /// everything" — the same shape the filesystem provider reports.
     async fn permissions(&self, _user: &UserId) -> Result<PermSet> {
         Err(Error::Unsupported("permissions"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_methods_should_use_the_names_the_spec_documents() {
+        // `spec.md` and the OAuth module both say `oauth_device_code`. Serde's
+        // snake_case derive would have produced `o_auth_device_code`, so a
+        // server implementing the published protocol could not be parsed.
+        let json = serde_json::to_string(&AuthMethod::OAuthDeviceCode).expect("encode");
+        assert_eq!(json, r#""oauth_device_code""#);
+
+        assert_eq!(
+            serde_json::to_string(&AuthMethod::Pat).expect("encode"),
+            r#""pat""#
+        );
+        assert_eq!(
+            serde_json::to_string(&AuthMethod::None).expect("encode"),
+            r#""none""#
+        );
+    }
+
+    #[test]
+    fn the_derived_spelling_should_still_be_accepted() {
+        // Anything already written with the accidental name keeps working.
+        let decoded: AuthMethod =
+            serde_json::from_str(r#""o_auth_device_code""#).expect("decode legacy spelling");
+        assert_eq!(decoded, AuthMethod::OAuthDeviceCode);
+    }
+
+    #[test]
+    fn capabilities_should_round_trip_through_the_health_shape() {
+        let capabilities = Capabilities {
+            auth_methods: vec![AuthMethod::OAuthDeviceCode, AuthMethod::Pat],
+            ..Capabilities::default()
+        };
+        let json = serde_json::to_string(&capabilities).expect("encode");
+        assert!(json.contains("oauth_device_code"), "{json}");
+
+        let decoded: Capabilities = serde_json::from_str(&json).expect("decode");
+        assert_eq!(decoded.auth_methods, capabilities.auth_methods);
     }
 }

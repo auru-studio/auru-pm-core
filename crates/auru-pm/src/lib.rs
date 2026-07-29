@@ -30,7 +30,7 @@ pub mod token_store;
 pub use ableton::{
     AbletonBundle, AbletonMetadata, AssetPlan, AssetRef, AssetSummary, BundlePolicy,
     IntegrityProblem, KeyInfo, PathAlias, PlannedAsset, PluginFormat, PluginId, PluginRef,
-    RefClass, TimeSignature, TrackCounts, TrackKind, TrackSummary,
+    RefClass, ScanOptions, TimeSignature, TrackCounts, TrackKind, TrackSummary,
 };
 pub use auru_pm_protocol::WIRE_VERSION;
 pub use canonical::{canonical_encoding, compute_commit_id};

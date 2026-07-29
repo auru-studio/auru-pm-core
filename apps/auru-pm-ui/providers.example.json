@@ -1,0 +1,60 @@
+{
+  "_comment": [
+    "A provider list for driving the desktop app before the hosted registry",
+    "exists. Pass it with:",
+    "",
+    "    auru-pm-ui --providers-file apps/auru-pm-ui/providers.example.json",
+    "",
+    "Fields:",
+    "  id            stable identifier; what a project records as its remote",
+    "  name          shown in the picker",
+    "  endpoint      base URL of an auru-pm-v1 server",
+    "  detail        the line under the name",
+    "  availability  connected | on-your-network | recommended | available",
+    "  auth_methods  oauth_device_code | pat | none — drives the sign-in hint",
+    "  description   longer text, used as `detail` when that is omitted",
+    "  recommended   surfaces the entry in the default list",
+    "",
+    "Nothing here is a credential. Tokens live in the OS keychain and are",
+    "never read from or written to this file."
+  ],
+  "providers": [
+    {
+      "id": "auru-cloud",
+      "name": "Auru Cloud",
+      "endpoint": "https://pm.auru.studio",
+      "detail": "Hosted · eu-west · encrypted at rest",
+      "availability": "recommended",
+      "auth_methods": ["oauth_device_code"],
+      "description": "Hosted backup with encrypted storage",
+      "recommended": true
+    },
+    {
+      "id": "studio-nas",
+      "name": "Studio NAS",
+      "endpoint": "http://studio-nas.local:4242",
+      "detail": "smb://studio-nas/auru-backups",
+      "availability": "on-your-network",
+      "auth_methods": ["none"],
+      "description": "A provider discovered on this network"
+    },
+    {
+      "id": "s3-archive",
+      "name": "S3 Archive",
+      "endpoint": "https://s3-provider.example",
+      "detail": "S3-compatible · bring your own bucket",
+      "availability": "available",
+      "auth_methods": ["pat"],
+      "description": "Bring an existing S3-compatible archive"
+    },
+    {
+      "id": "external-drive",
+      "name": "External folder",
+      "endpoint": "",
+      "detail": "/Volumes/T7/Auru — any drive or shared folder",
+      "availability": "available",
+      "auth_methods": ["none"],
+      "description": "A folder on a drive you already own"
+    }
+  ]
+}

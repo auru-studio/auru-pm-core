@@ -564,6 +564,9 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "gpui_platform",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

@@ -320,6 +320,109 @@ pub struct BundleFile {
 }
 
 /// Whether a directory is an Ableton project folder.
+/// How far to look, and how much to look at, when searching a folder for
+/// projects.
+///
+/// Both limits exist because the folder a person points at is often the top of
+/// a music drive: one real library measured 655 projects across 670 entries.
+/// Walking that is fine; walking a home directory to unbounded depth is not.
+#[derive(Clone, Debug)]
+pub struct ScanOptions {
+    /// Directory levels below the chosen folder to search.
+    ///
+    /// Projects normally sit one level down. The default allows for a couple
+    /// of organising folders — `Ableton Projects/2026/Client Work/…` — without
+    /// turning a mistaken pick of `/` into an exhaustive disk walk.
+    pub max_depth: usize,
+    /// Stop after this many projects, so a pathological tree still returns.
+    pub max_projects: usize,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            max_depth: 4,
+            max_projects: 5_000,
+        }
+    }
+}
+
+/// Find every Ableton project inside `root`.
+///
+/// Returns them sorted by path so the same folder always lists the same way.
+/// `root` itself is included when it is a project.
+///
+/// Three rules keep the count honest:
+///
+/// - A project is not descended into. Its `Backup/` folder holds autosaves
+///   that would otherwise each look like a project of their own — a real
+///   library holds 1,941 `.als` files across 655 projects, so counting sets
+///   rather than projects would overstate it threefold.
+/// - `Backup/` is never treated as a project, even standalone: a project with
+///   a single autosave would otherwise match the "one lone set" rule.
+/// - Hidden folders and symlinks are skipped. Symlinks can point anywhere,
+///   including into a cycle.
+pub fn scan_for_projects(root: &Path, options: &ScanOptions) -> Vec<AbletonBundle> {
+    let mut found = Vec::new();
+    scan_into(root, 0, options, &mut found);
+    found.sort_by(|left, right| left.root.cmp(&right.root));
+    found
+}
+
+fn scan_into(dir: &Path, depth: usize, options: &ScanOptions, found: &mut Vec<AbletonBundle>) {
+    if found.len() >= options.max_projects {
+        return;
+    }
+
+    // A project is a leaf: whatever is inside belongs to it.
+    if looks_like_project_root(dir) {
+        if let Ok(Some(bundle)) = AbletonBundle::from_root(dir) {
+            found.push(bundle);
+        }
+        return;
+    }
+
+    if depth >= options.max_depth {
+        return;
+    }
+
+    let Ok(entries) = fs::read_dir(dir) else {
+        // An unreadable folder is skipped rather than failing the scan — a
+        // music drive routinely contains something the user cannot read.
+        return;
+    };
+
+    let mut children: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| is_scannable_directory(path))
+        .collect();
+    children.sort();
+
+    for child in children {
+        scan_into(&child, depth + 1, options, found);
+        if found.len() >= options.max_projects {
+            return;
+        }
+    }
+}
+
+/// Whether the scan should look inside `path`.
+fn is_scannable_directory(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.is_symlink() || !metadata.is_dir() {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    // `Backup` holds a project's own autosaves; treating it as a project
+    // would double-count every project that has one.
+    !name.starts_with('.') && !name.eq_ignore_ascii_case(BACKUP_DIR)
+}
+
 fn looks_like_project_root(dir: &Path) -> bool {
     if dir.join(PROJECT_INFO_DIR).is_dir() {
         return true;
@@ -468,7 +571,7 @@ mod tests {
         fs::write(path, bytes).expect("write file");
     }
 
-    /// Build a project folder shaped like the real one.
+    /// Build a project folder shaped like the real one, at `root`.
     fn project_folder(root: &Path) -> PathBuf {
         let live_set = root.join("dunno yet.als");
         touch(&live_set, b"set");
@@ -775,6 +878,157 @@ mod tests {
             .expect("detect")
             .expect("is a bundle");
         assert_eq!(bundle.live_set(), root.join("dunno yet.als"));
+    }
+
+    #[test]
+    fn scanning_should_find_every_project_in_a_library() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let library = temp.path().join("Ableton Projects");
+        for name in ["110 riddim Project", "ayy Project", "dunno yet-1 Project"] {
+            project_folder(&library.join(name));
+        }
+
+        let found = scan_for_projects(&library, &ScanOptions::default());
+        let names: Vec<&str> = found
+            .iter()
+            .map(|bundle| {
+                bundle
+                    .root()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("named")
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["110 riddim Project", "ayy Project", "dunno yet-1 Project"],
+            "sorted, so the same folder always lists the same way"
+        );
+    }
+
+    #[test]
+    fn a_projects_own_backups_should_not_count_as_projects() {
+        // The mistake that would triple the count: a real library holds 1,941
+        // `.als` files across 655 projects, nearly all of the difference being
+        // autosaves inside `Backup/`.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let library = temp.path().join("Projects");
+        project_folder(&library.join("Song Project"));
+
+        let found = scan_for_projects(&library, &ScanOptions::default());
+        assert_eq!(found.len(), 1, "one project, not one per autosave");
+        assert!(found[0].root().ends_with("Song Project"));
+    }
+
+    #[test]
+    fn a_lone_backup_folder_should_never_look_like_a_project() {
+        // A `Backup` holding a single autosave matches the "one lone set"
+        // rule that catches unmarked projects, so it needs excluding by name.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backup = temp.path().join("Backup");
+        touch(&backup.join("Song [2026-01-01 000000].als"), b"autosave");
+
+        assert!(scan_for_projects(temp.path(), &ScanOptions::default()).is_empty());
+    }
+
+    #[test]
+    fn scanning_should_reach_projects_filed_under_subfolders() {
+        // People organise. `Projects/2026/Client Work/Song Project` is normal.
+        let temp = tempfile::tempdir().expect("tempdir");
+        project_folder(&temp.path().join("2026/Client Work/Song Project"));
+
+        let found = scan_for_projects(temp.path(), &ScanOptions::default());
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn scanning_should_stop_at_the_depth_limit() {
+        // The guard against a mistaken pick of a home directory turning into
+        // an exhaustive disk walk.
+        let temp = tempfile::tempdir().expect("tempdir");
+        project_folder(&temp.path().join("a/b/c/d/e/Song Project"));
+
+        let shallow = ScanOptions {
+            max_depth: 2,
+            ..ScanOptions::default()
+        };
+        assert!(scan_for_projects(temp.path(), &shallow).is_empty());
+
+        let deep = ScanOptions {
+            max_depth: 12,
+            ..ScanOptions::default()
+        };
+        assert_eq!(scan_for_projects(temp.path(), &deep).len(), 1);
+    }
+
+    #[test]
+    fn scanning_should_honour_the_project_ceiling() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for index in 0..5 {
+            project_folder(&temp.path().join(format!("Song {index} Project")));
+        }
+
+        let capped = ScanOptions {
+            max_projects: 3,
+            ..ScanOptions::default()
+        };
+        assert_eq!(scan_for_projects(temp.path(), &capped).len(), 3);
+    }
+
+    #[test]
+    fn pointing_the_scan_at_one_project_should_find_that_project() {
+        // Someone may pick the project folder itself rather than the library.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("Song Project");
+        project_folder(&project);
+
+        let found = scan_for_projects(&project, &ScanOptions::default());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].root(), project);
+    }
+
+    #[test]
+    fn hidden_folders_and_symlinks_should_be_skipped() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        project_folder(&temp.path().join(".Trash/Deleted Project"));
+
+        #[cfg(unix)]
+        {
+            let real = temp.path().parent().expect("parent").join("elsewhere");
+            project_folder(&real.join("Linked Project"));
+            let _ = std::os::unix::fs::symlink(&real, temp.path().join("link"));
+        }
+
+        assert!(
+            scan_for_projects(temp.path(), &ScanOptions::default()).is_empty(),
+            "neither a hidden folder nor a symlink should be followed"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_folder_should_not_abort_the_scan() {
+        // A music drive routinely holds something the user cannot read; one
+        // such folder must not cost them the rest of their library.
+        let temp = tempfile::tempdir().expect("tempdir");
+        project_folder(&temp.path().join("Song Project"));
+        let blocked = temp.path().join("locked");
+        fs::create_dir_all(&blocked).expect("create");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000));
+        }
+
+        let found = scan_for_projects(temp.path(), &ScanOptions::default());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755));
+        }
+
+        assert_eq!(found.len(), 1, "the readable project is still found");
     }
 
     #[test]
