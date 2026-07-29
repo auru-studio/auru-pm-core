@@ -12,7 +12,7 @@ use std::time::SystemTime;
 
 use auru_pm::{
     AuthorIdentity, BundlePolicy, CommitId, CommitSummary, ConflictChoice, ConflictResolution,
-    ConflictedField, ContentHash, FilesystemProvider, HistoryRange, HttpProvider, ProjectFormat,
+    ConflictedField, ContentHash, FilesystemProvider, HistoryRange, HttpAccount, ProjectFormat,
     ProjectProfile, ProjectProvider, ProjectSnapshot, PushOptions, PushOutcome, RetentionReport,
     RetentionRoots, RetentionRule, SampleManifest, Sidecar, fetch_project_info, flstudio,
     push_with_options, sidecar_path_for, verify_commit_copy,
@@ -136,7 +136,8 @@ fn back_up_prepared_with_resolutions(
         source_revision,
     } = prepared;
     runtime()?.block_on(async move {
-        let provider = open_provider(&listing, &project_path).await?;
+        let (provider, author) =
+            open_provider_for_backup(&listing, &project_path, &display_name).await?;
         let previous_history = if verify_uploads {
             load_history(provider.as_ref()).await.unwrap_or_default()
         } else {
@@ -151,17 +152,7 @@ fn back_up_prepared_with_resolutions(
                 .await
                 .map_err(|error| format!("register project with provider: {error}"))?;
         }
-        let provider_id = listing.entry.id.clone();
-        let author = AuthorIdentity {
-            display_name: if display_name.trim().is_empty() {
-                "Local user".to_owned()
-            } else {
-                display_name.clone()
-            },
-            provider_user_id: "local-user".to_owned(),
-            provider_id: provider_id.clone(),
-            email: None,
-        };
+        let remote_id = listing.entry.id.clone();
 
         let sidecar_path = sidecar_path_for(&project_path);
         let mut push_options = PushOptions::for_snapshot(&snapshot);
@@ -169,7 +160,7 @@ fn back_up_prepared_with_resolutions(
         push_options.conflict_resolutions = conflict_resolutions;
         let outcome = push_with_options(
             provider.as_ref(),
-            &provider_id,
+            &remote_id,
             &[],
             &sidecar_path,
             snapshot.as_bytes(),
@@ -261,6 +252,61 @@ fn back_up_prepared_with_resolutions(
             PushOutcome::NeedsReview { problems, .. } => BackupResult::NeedsReview(problems.len()),
         })
     })
+}
+
+async fn open_provider_for_backup(
+    listing: &ProviderListing,
+    project_path: &Path,
+    local_display_name: &str,
+) -> Result<(Arc<dyn ProjectProvider>, AuthorIdentity), String> {
+    if listing.local_path().is_some() {
+        return Ok((
+            open_provider(listing, project_path).await?,
+            AuthorIdentity {
+                display_name: if local_display_name.trim().is_empty() {
+                    "Local user".to_owned()
+                } else {
+                    local_display_name.to_owned()
+                },
+                provider_user_id: "local-user".to_owned(),
+                provider_id: listing.entry.id.clone(),
+                email: None,
+            },
+        ));
+    }
+
+    let handle = persisted_project_handle(listing, project_path)?;
+    let account = http_account(listing, &handle).await?;
+    let identity = match account.identity().await {
+        Ok(identity) => identity,
+        Err(auru_pm::Error::NotFound(_)) if account.authentication().is_none() => {
+            // Compatibility with pre-authentication `auru-pm-v1` providers,
+            // which had no `/v1/me` identity endpoint.
+            return Ok((
+                Arc::new(account.open_project(handle)),
+                AuthorIdentity {
+                    display_name: if local_display_name.trim().is_empty() {
+                        "Local user".to_owned()
+                    } else {
+                        local_display_name.to_owned()
+                    },
+                    provider_user_id: "local-user".to_owned(),
+                    provider_id: listing.entry.id.clone(),
+                    email: None,
+                },
+            ));
+        }
+        Err(error) => return Err(format!("read authenticated identity: {error}")),
+    };
+    Ok((
+        Arc::new(account.open_project(handle)),
+        AuthorIdentity {
+            display_name: identity.display_name,
+            provider_user_id: identity.user_id,
+            provider_id: identity.provider_id,
+            email: identity.email,
+        },
+    ))
 }
 
 pub fn resolve_backup(
@@ -576,10 +622,7 @@ async fn provider_account(listing: &ProviderListing) -> Result<ProviderAccount, 
             root.join(".auru-pm").join("projects"),
         ));
     }
-    let token = auru_pm::token_store::load_provider_token(&listing.entry.id)
-        .ok()
-        .flatten();
-    ProviderAccount::connect_http(&listing.entry.endpoint, token)
+    ProviderAccount::connect_http_stored(&listing.entry.endpoint, &listing.entry.id)
         .await
         .map_err(|error| format!("connect to {}: {error}", listing.entry.name))
 }
@@ -596,18 +639,21 @@ async fn open_provider(
         return Ok(Arc::new(provider));
     }
 
-    let token = auru_pm::token_store::load_token(&listing.entry.id, &handle)
+    let account = http_account(listing, &handle).await?;
+    Ok(Arc::new(account.open_project(handle)))
+}
+
+async fn http_account(listing: &ProviderListing, handle: &str) -> Result<HttpAccount, String> {
+    let project_token = auru_pm::token_store::load_token(&listing.entry.id, handle)
         .ok()
-        .flatten()
-        .or_else(|| {
-            auru_pm::token_store::load_provider_token(&listing.entry.id)
-                .ok()
-                .flatten()
-        });
-    let provider = HttpProvider::open(&listing.entry.endpoint, &handle, token)
-        .await
-        .map_err(|error| format!("connect to {}: {error}", listing.entry.name))?;
-    Ok(Arc::new(provider))
+        .flatten();
+    let account = if project_token.is_some() {
+        HttpAccount::connect(&listing.entry.endpoint, project_token).await
+    } else {
+        HttpAccount::connect_stored(&listing.entry.endpoint, &listing.entry.id).await
+    }
+    .map_err(|error| format!("connect to {}: {error}", listing.entry.name))?;
+    Ok(account)
 }
 
 async fn restore_from_provider(

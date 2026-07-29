@@ -1646,13 +1646,49 @@ impl ProjectManager {
                 }
                 cx.notify();
             }
-            AuthMethod::OAuthDeviceCode => {
+            auth_method
+            @ (AuthMethod::OAuthAuthorizationCodePkce | AuthMethod::OAuthDeviceCode) => {
                 self.auth_phase = AuthPhase::Waiting;
                 cx.notify();
-                let receiver = auru_pm::start_device_flow(endpoint, "auru-pm-desktop".to_owned());
                 cx.spawn(async move |this, cx| {
+                    let receiver = match auru_pm::HttpProvider::probe_health(&endpoint).await {
+                        Ok(health) => match health.authentication {
+                            Some(configuration) => {
+                                auru_pm::start_standard_oauth_flow(configuration)
+                            }
+                            None if auth_method == AuthMethod::OAuthDeviceCode => {
+                                // Compatibility with providers implementing the original
+                                // Auru-proxied device-code endpoints.
+                                auru_pm::start_device_flow(endpoint, "auru-pm-desktop".to_owned())
+                            }
+                            None => {
+                                _ = this.update(cx, |this, cx| {
+                                    this.auth_phase = AuthPhase::Failed(
+                                        "The provider did not publish its OAuth configuration."
+                                            .to_owned(),
+                                    );
+                                    cx.notify();
+                                });
+                                return;
+                            }
+                        },
+                        Err(error) => {
+                            _ = this.update(cx, |this, cx| {
+                                this.auth_phase = AuthPhase::Failed(format!(
+                                    "Couldn't read the provider's sign-in configuration: {error}"
+                                ));
+                                cx.notify();
+                            });
+                            return;
+                        }
+                    };
                     loop {
                         match receiver.try_recv() {
+                            Ok(OAuthProgress::AuthorizationUrl(url)) => {
+                                _ = this.update(cx, |_, cx| {
+                                    cx.open_url(&url);
+                                });
+                            }
                             Ok(OAuthProgress::DeviceCode(code)) => {
                                 _ = this.update(cx, |this, cx| {
                                     this.auth_phase = AuthPhase::DeviceCode {
@@ -1678,6 +1714,25 @@ impl ProjectManager {
                                         },
                                         Err(error) => AuthPhase::Failed(format!(
                                             "Signed in, but couldn't store the token: {error}"
+                                        )),
+                                    };
+                                    cx.notify();
+                                });
+                                return;
+                            }
+                            Ok(OAuthProgress::Credential(credential)) => {
+                                let stored = auru_pm::token_store::store_provider_credential(
+                                    &provider_id,
+                                    &credential,
+                                );
+                                _ = this.update(cx, |this, cx| {
+                                    this.auth_phase = match stored {
+                                        Ok(()) => AuthPhase::Complete {
+                                            detail: "The provider confirmed this browser sign-in."
+                                                .to_owned(),
+                                        },
+                                        Err(error) => AuthPhase::Failed(format!(
+                                            "Signed in, but couldn't store the credential: {error}"
                                         )),
                                     };
                                     cx.notify();
@@ -3961,6 +4016,7 @@ impl ProjectManager {
             );
         };
         let auth_method = provider.preferred_auth_method();
+        let auth_hint = AuthHint::for_method(&auth_method);
 
         let phase_content = match &self.auth_phase {
             AuthPhase::Ready => {
@@ -3972,10 +4028,10 @@ impl ProjectManager {
                         // The same hint shown against the provider in the
                         // picker, expanded — so what was promised there is
                         // what happens here.
-                        .child(AuthHint::for_method(&auth_method).detail),
+                        .child(auth_hint.detail),
                 );
 
-                if auth_method == AuthMethod::Pat {
+                if auth_hint.accepts_credential {
                     content = content.child(
                         div()
                             .flex()
@@ -4008,11 +4064,7 @@ impl ProjectManager {
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.begin_provider_auth(provider_index, window, cx);
                             }))
-                            .child(match auth_method {
-                                AuthMethod::OAuthDeviceCode => "BEGIN PROVIDER SIGN-IN →",
-                                AuthMethod::Pat => "CONNECT SECURELY →",
-                                AuthMethod::None => "CONNECT →",
-                            }),
+                            .child(auth_hint.action),
                     )
                     .into_any_element()
             }
@@ -4037,7 +4089,7 @@ impl ProjectManager {
                         .text_size(px(8.0))
                         .line_height(relative(1.5))
                         .text_color(faint())
-                        .child("Requesting a sign-in code from the provider."),
+                        .child("Preparing a secure browser sign-in with the provider."),
                 )
                 .into_any_element(),
             AuthPhase::DeviceCode {
@@ -4203,62 +4255,60 @@ impl ProjectManager {
                 .into_any_element(),
         };
 
-        let panel =
-            div()
-                .flex()
-                .w(px(520.0))
-                .flex_col()
-                .border_1()
-                .border_color(line())
-                .bg(panel())
-                .shadow_lg()
-                .child(
-                    div()
-                        .flex()
-                        .h(px(50.0))
-                        .items_center()
-                        .justify_between()
-                        .border_b_1()
-                        .border_color(line())
-                        .px_5()
-                        .text_size(px(10.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(bright())
-                        .child("PROVIDER AUTHENTICATION")
-                        .child(
-                            div()
-                                .id("cancel-provider-auth")
-                                .cursor_pointer()
-                                .text_color(faint())
-                                .hover(|this| this.text_color(bright()))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.cancel_provider_auth(cx);
-                                }))
-                                .child("×"),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_4()
-                        .p_6()
-                        .child(div().text_size(px(8.0)).text_color(green()).child(
-                            match auth_method {
-                                AuthMethod::OAuthDeviceCode => "OAUTH DEVICE CODE",
-                                AuthMethod::Pat => "PERSONAL ACCESS TOKEN",
-                                AuthMethod::None => "NO AUTHENTICATION",
-                            },
-                        ))
-                        .child(
-                            div()
-                                .font_family(DISPLAY_FONT)
-                                .text_size(px(30.0))
-                                .text_color(bright())
-                                .child(format!("Connect {}", provider.entry.name)),
-                        )
-                        .child(phase_content),
-                );
+        let panel = div()
+            .flex()
+            .w(px(520.0))
+            .flex_col()
+            .border_1()
+            .border_color(line())
+            .bg(panel())
+            .shadow_lg()
+            .child(
+                div()
+                    .flex()
+                    .h(px(50.0))
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(line())
+                    .px_5()
+                    .text_size(px(10.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(bright())
+                    .child("PROVIDER AUTHENTICATION")
+                    .child(
+                        div()
+                            .id("cancel-provider-auth")
+                            .cursor_pointer()
+                            .text_color(faint())
+                            .hover(|this| this.text_color(bright()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cancel_provider_auth(cx);
+                            }))
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .p_6()
+                    .child(
+                        div()
+                            .text_size(px(8.0))
+                            .text_color(green())
+                            .child(auth_hint.eyebrow),
+                    )
+                    .child(
+                        div()
+                            .font_family(DISPLAY_FONT)
+                            .text_size(px(30.0))
+                            .text_color(bright())
+                            .child(format!("Connect {}", provider.entry.name)),
+                    )
+                    .child(phase_content),
+            );
 
         overlay_backdrop(panel)
     }

@@ -28,7 +28,7 @@ auru-pm-protocol = { path = "crates/auru-pm-protocol" }
 async-trait = "0.1"
 base64 = "0.22"
 blake3 = "1"
-keyring-core = "1"
+keyring = { version = "3.6.3", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

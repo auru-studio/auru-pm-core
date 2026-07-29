@@ -67,26 +67,50 @@ pub struct AuthHint {
     pub summary: &'static str,
     /// What actually happens next, for the connect screen.
     pub detail: &'static str,
+    /// Compact standards label shown above the connect screen.
+    pub eyebrow: &'static str,
+    /// Call-to-action shown on the connect button.
+    pub action: &'static str,
+    /// Whether the connect screen needs a credential input.
+    pub accepts_credential: bool,
 }
 
 impl AuthHint {
     pub const fn for_method(method: &AuthMethod) -> Self {
         match method {
+            AuthMethod::OAuthAuthorizationCodePkce => Self {
+                summary: "Sign in with your browser",
+                detail: "Auru opens your provider's sign-in page in your browser and waits \
+                         for its secure loopback callback. Your password is never typed into \
+                         this app or stored here.",
+                eyebrow: "OAUTH + PKCE",
+                action: "SIGN IN WITH BROWSER →",
+                accepts_credential: false,
+            },
             AuthMethod::OAuthDeviceCode => Self {
                 summary: "Sign in with your browser",
                 detail: "Auru shows you a short code and opens your browser. \
                          Your password is never typed into this app or stored here.",
+                eyebrow: "OAUTH DEVICE CODE",
+                action: "BEGIN PROVIDER SIGN-IN →",
+                accepts_credential: false,
             },
             AuthMethod::Pat => Self {
                 summary: "Needs an access token",
                 detail: "Create an access token in your provider's account settings and \
                          paste it here. It is kept in your operating system's keychain, \
                          not in Auru's own files.",
+                eyebrow: "PERSONAL ACCESS TOKEN",
+                action: "CONNECT SECURELY →",
+                accepts_credential: true,
             },
             AuthMethod::None => Self {
                 summary: "No sign-in needed",
                 detail: "This provider is on your own machine or network, so there is \
                          nothing to sign in to.",
+                eyebrow: "NO AUTHENTICATION",
+                action: "CONNECT →",
+                accepts_credential: false,
             },
         }
     }
@@ -516,6 +540,7 @@ mod tests {
         // The hint is shown before someone commits to a provider, so each
         // method needs a summary and a fuller explanation.
         for method in [
+            AuthMethod::OAuthAuthorizationCodePkce,
             AuthMethod::OAuthDeviceCode,
             AuthMethod::Pat,
             AuthMethod::None,
@@ -523,6 +548,8 @@ mod tests {
             let hint = AuthHint::for_method(&method);
             assert!(!hint.summary.is_empty());
             assert!(hint.detail.len() > hint.summary.len());
+            assert!(!hint.eyebrow.is_empty());
+            assert!(!hint.action.is_empty());
         }
 
         assert_eq!(

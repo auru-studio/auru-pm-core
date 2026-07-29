@@ -9,9 +9,52 @@ pub const WIRE_VERSION: &str = "auru-pm-v1";
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HealthResponse<C> {
     pub protocol: String,
+    /// Stable identifier used in commit author identities and sidecars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub capabilities: C,
+    /// Standards-based OAuth/OIDC settings safe to publish to desktop clients.
+    ///
+    /// Absent for unauthenticated providers and legacy providers whose
+    /// authentication flow is described only by `capabilities.auth_methods`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authentication: Option<OAuthClientConfiguration>,
+}
+
+/// Public OAuth configuration for one PM server.
+///
+/// Endpoint URLs are deliberately absent: clients discover them from the
+/// issuer's RFC 8414 / OpenID Connect metadata instead of trusting duplicated
+/// configuration.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OAuthClientConfiguration {
+    pub issuer: String,
+    pub audience: String,
+    pub client_id: String,
+    pub required_scope: String,
+    pub redirect_uri: String,
+    pub flows: Vec<OAuthFlow>,
+}
+
+/// OAuth grants a provider permits its public desktop client to use.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthFlow {
+    #[serde(rename = "authorization_code_pkce")]
+    AuthorizationCodePkce,
+    DeviceAuthorization,
+}
+
+/// Identity derived by the provider from a verified bearer token.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthenticatedIdentity {
+    pub provider_id: String,
+    pub user_id: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
 }
 
 /// Response containing a project's current commit.
@@ -192,5 +235,35 @@ mod tests {
             1,
             "HEAD survives even when every commit predates the cutoff"
         );
+    }
+
+    #[test]
+    fn oauth_health_metadata_should_round_trip_and_remain_optional() {
+        let configured = HealthResponse {
+            protocol: WIRE_VERSION.to_owned(),
+            provider_id: Some("studio-pm".to_owned()),
+            name: Some("Studio PM".to_owned()),
+            capabilities: serde_json::json!({}),
+            authentication: Some(OAuthClientConfiguration {
+                issuer: "https://auth.example.com".to_owned(),
+                audience: "auru-pm".to_owned(),
+                client_id: "auru-desktop".to_owned(),
+                required_scope: "openid".to_owned(),
+                redirect_uri: "http://127.0.0.1:43827/oauth/callback".to_owned(),
+                flows: vec![
+                    OAuthFlow::AuthorizationCodePkce,
+                    OAuthFlow::DeviceAuthorization,
+                ],
+            }),
+        };
+        let encoded = serde_json::to_string(&configured).expect("health response");
+        let decoded: HealthResponse<serde_json::Value> =
+            serde_json::from_str(&encoded).expect("decode health response");
+        assert_eq!(decoded, configured);
+
+        let legacy: HealthResponse<serde_json::Value> =
+            serde_json::from_str(r#"{"protocol":"auru-pm-v1","capabilities":{}}"#)
+                .expect("legacy health response");
+        assert!(legacy.authentication.is_none());
     }
 }

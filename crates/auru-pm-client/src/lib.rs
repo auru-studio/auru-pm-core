@@ -13,7 +13,7 @@ use auru_pm::{Error, FilesystemProvider, HttpAccount, ProjectProvider, ProviderP
 #[derive(Clone, Debug)]
 pub enum ProviderAccount {
     Http {
-        account: HttpAccount,
+        account: Box<HttpAccount>,
     },
     Filesystem {
         /// Parent containing one repository directory per project handle.
@@ -25,7 +25,14 @@ impl ProviderAccount {
     /// Connect an HTTP provider account and cache its advertised capabilities.
     pub async fn connect_http(endpoint: &str, token: Option<String>) -> Result<Self> {
         Ok(Self::Http {
-            account: HttpAccount::connect(endpoint, token).await?,
+            account: Box::new(HttpAccount::connect(endpoint, token).await?),
+        })
+    }
+
+    /// Connect with a refreshable account credential held in the OS keychain.
+    pub async fn connect_http_stored(endpoint: &str, credential_id: &str) -> Result<Self> {
+        Ok(Self::Http {
+            account: Box::new(HttpAccount::connect_stored(endpoint, credential_id).await?),
         })
     }
 
@@ -73,12 +80,12 @@ fn filesystem_project_path(root: &Path, handle: &str) -> Result<PathBuf> {
 }
 
 pub use auru_pm::token_store::{
-    delete_provider_token, delete_token, load_provider_token, load_token, store_provider_token,
-    store_token,
+    ProviderCredential, delete_provider_token, delete_token, load_provider_credential,
+    load_provider_token, load_token, store_provider_credential, store_provider_token, store_token,
 };
 pub use auru_pm::{
     DeviceCodeResponse, OAuthProgress, RegistryEntry, fetch_registry, resolve_endpoint,
-    start_device_flow,
+    start_device_flow, start_standard_oauth_flow,
 };
 pub use auru_pm_protocol::WIRE_VERSION;
 

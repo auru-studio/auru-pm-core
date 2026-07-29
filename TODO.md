@@ -84,7 +84,14 @@ described, it was read out of a real project rather than from documentation.
   uncommitted real-project corpus.
 - The reference server now persists state and blobs under `--data-dir` using
   failure-atomic state replacement and applies a configurable per-client
-  request limit. Authentication remains intentionally deferred.
+  request limit.
+- The reference server now supports standards-based OAuth/OIDC without
+  provider SDKs: Authorization Code + PKCE (and optional discovered device
+  authorization), JWT/JWKS validation with key rotation, or explicitly
+  configured RFC 7662 introspection. Projects and blob entitlements are private
+  to `(issuer, subject)`, commit authors are bound to `/v1/me`, legacy ownership
+  migration is explicit, and refreshable credentials remain in the OS
+  keychain.
 
 ---
 
@@ -130,18 +137,21 @@ The app fetches `AURU_REGISTRY_URL` in the background with a 24-hour cache;
 
 ### 2.2 OAuth and token storage — **resolved 2026-07-29**
 
-PAT and device-code OAuth tokens are stored as provider-account credentials in
-the OS keychain. Project-scoped credentials remain supported by the core.
-OAuth completion is confirmed by the provider. The protocol has no
-provider-wide PAT validation endpoint, so PAT copy now says honestly that the
-token will be checked by the first project request.
+PATs and versioned OAuth credential bundles are stored as provider-account
+credentials in the OS keychain. Authorization Code + PKCE uses standard issuer
+discovery and a fixed loopback callback; direct discovered device authorization
+and the older provider-proxied device flow remain supported. Access tokens
+refresh before expiry or once after a 401, and refresh-token rotation is saved
+atomically back to the keychain. Project-scoped PATs remain supported.
 
-### 2.3 The reference server has no authentication
+### 2.3 Reference-server authentication — **resolved 2026-07-29**
 
-`auru-pm-server` advertises `auth_methods: ["none"]`
-and is still a conformance target rather than a deployable service.
-Persistence and per-client rate limiting are implemented. Authentication is
-the remaining gap and is intentionally reserved for its own design session.
+`auru-pm-server` loads versioned TOML, publishes non-secret OAuth client
+metadata from public health, derives `/v1/me` exclusively from verified bearer
+tokens, supports either strict JWT/JWKS or opaque-token introspection, and
+isolates projects and CAS entitlements by `(issuer, subject)`. The
+unauthenticated compatibility mode is loopback-only unless its unsafe
+non-loopback override is explicitly enabled.
 
 ### 2.4 `auru-pm-client` — **resolved 2026-07-29**
 
@@ -154,8 +164,8 @@ The desktop app consumes this API for filesystem and HTTP recovery.
 `list_members` and `permissions` return `Error::Unsupported` on every provider,
 and `Capabilities::members` / `permissions` are always false. The trait hooks
 are deliberate placeholders for the teams plan; nothing consumes them yet.
-This is deferred with authentication because member identity and authorization
-semantics must be designed together.
+Member sharing and authorization semantics need their own teams/ACL design;
+the authenticated server is intentionally owner-only for now.
 
 ---
 

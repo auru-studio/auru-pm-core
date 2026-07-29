@@ -26,12 +26,37 @@ methods a provider supports before prompting the user.
 
 Auth methods (declared in `/v1/health`):
 
+- `authorization_code_pkce` — OAuth 2.0 Authorization Code for a public native
+  client, with PKCE S256 and an exact loopback redirect URI.
 - `oauth_device_code` — OAuth 2.0 device-code flow (RFC 8628). Used by
-  the Auru-hosted reference; the client opens a browser to the URL
-  returned by the provider and polls until the user authenticates.
+  providers that publish a device authorization endpoint.
 - `pat` — opaque personal access token, pasted into the "Add Custom URL"
   dialog. Stored in the OS keychain keyed by `(provider_id, project_id)`.
-- `none` — no token required. Local filesystem / trusted intranet.
+- `none` — no token required. Local filesystem or loopback development server.
+
+An OAuth-enabled health response includes a public `authentication` descriptor:
+
+```json
+{
+  "issuer": "https://identity.example.com",
+  "audience": "auru-pm",
+  "client_id": "auru-pm-desktop",
+  "required_scope": "openid",
+  "redirect_uri": "http://127.0.0.1:43827/oauth/callback",
+  "flows": ["authorization_code_pkce"]
+}
+```
+
+Endpoint URLs are deliberately absent. Clients discover them from the exact
+issuer using OpenID Connect discovery or RFC 8414 metadata and reject issuer
+mismatches. A server validates access tokens using one operator-selected
+strategy—JWT/JWKS or RFC 7662 introspection—and never guesses or falls back
+between them.
+
+The authenticated identity key is `(issuer, sub)`, never email. `GET /v1/me`
+returns the provider id, subject, display name, and optional email derived from
+the verified token. Commit author provider/user ids must match it; display name
+and email must also match when present.
 
 ## Project handles
 
@@ -79,6 +104,7 @@ Public. Returns provider metadata.
 ```json
 {
   "protocol": "auru-pm-v1",
+  "provider_id": "studio-pm",
   "name": "Auru Cloud",
   "capabilities": {
     "project_listing": true,
@@ -87,8 +113,30 @@ Public. Returns provider metadata.
     "branches": false,
     "server_side_merge": false,
     "history_retention": true,
-    "auth_methods": ["oauth_device_code"]
+    "project_scoped_blobs": true,
+    "auth_methods": ["authorization_code_pkce"]
+  },
+  "authentication": {
+    "issuer": "https://identity.example.com",
+    "audience": "auru-pm",
+    "client_id": "auru-pm-desktop",
+    "required_scope": "openid",
+    "redirect_uri": "http://127.0.0.1:43827/oauth/callback",
+    "flows": ["authorization_code_pkce"]
   }
+}
+```
+
+### `GET /v1/me`
+
+Authenticated. Returns only identity derived from the verified bearer token:
+
+```json
+{
+  "provider_id": "studio-pm",
+  "user_id": "user_123",
+  "display_name": "Alice Example",
+  "email": "alice@example.com"
 }
 ```
 
@@ -222,7 +270,7 @@ Response:
 `objects_removed` and `bytes_freed` may be zero when the provider uses a grace
 period or asynchronous garbage collection.
 
-### `POST /v1/blobs/has`
+### `POST /v1/projects/{handle}/blobs/has`
 
 Body: `{ "hashes": ["blake3:...", ...] }`.
 
@@ -230,7 +278,7 @@ Response: `{ "present": [true, false, ...] }` — same order and length as
 the input. Used by the push flow to skip uploading blobs the provider
 already has.
 
-### `PUT /v1/blobs/{hash}`
+### `PUT /v1/projects/{handle}/blobs/{hash}`
 
 Upload a blob. `Content-Length` required; resumable uploads use standard
 `Content-Range` semantics. Provider MUST verify the uploaded bytes hash
@@ -238,11 +286,17 @@ to the URL's `{hash}` — mismatch is `400 bad_request`.
 
 Idempotent: re-uploading an existing hash is `200 OK`.
 
-### `GET /v1/blobs/{hash}`
+### `GET /v1/projects/{handle}/blobs/{hash}`
 
 Download a blob. Body is the raw bytes; `Content-Type:
 application/octet-stream`. `404` if absent. Clients MUST verify the downloaded
 bytes hash to `{hash}` before using them.
+
+Providers advertising `project_scoped_blobs: true` must authorize blob
+existence, upload entitlement, and download through the named project. Physical
+CAS storage may still deduplicate equal bytes across projects, but that must
+never reveal existence or grant access. The client retains the old global
+`/v1/blobs/*` routes only for servers that omit this capability.
 
 ### `GET /v1/projects/{handle}/members` *(capability: `members`)*
 
@@ -262,9 +316,12 @@ Response: [`PermSet`](./provider.rs).
 { "can_read": true, "can_write": true, "can_admin": false }
 ```
 
-### `POST /v1/auth/device/code` *(OAuth device-code auth only)*
+### `POST /v1/auth/device/code` *(legacy compatibility only)*
 
-Start the RFC 8628 device authorization flow. Body:
+Older Auru providers proxied RFC 8628 through PM-specific endpoints. New
+providers publish the standard device authorization and token endpoints via
+issuer discovery; clients call those endpoints directly. The legacy request
+body is:
 
 ```json
 { "client_id": "auru-desktop" }

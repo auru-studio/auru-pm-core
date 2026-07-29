@@ -51,12 +51,12 @@ pub use discovery::{DiscoveredProject, read_headline};
 pub use error::{Error, Result};
 pub use filesystem::FilesystemProvider;
 pub use hash::{ContentHash, ParseHashError};
-pub use http::{HttpAccount, HttpProvider};
+pub use http::{HttpAccount, HttpProvider, ProviderHealth};
 pub use merge::{
     ConflictChoice, ConflictResolution, ConflictedField, MergeOutcome, merge3, merge3_json_bytes,
     resolve_conflicts,
 };
-pub use oauth::{DeviceCodeResponse, OAuthProgress, start_device_flow};
+pub use oauth::{DeviceCodeResponse, OAuthProgress, start_device_flow, start_standard_oauth_flow};
 pub use plugin_registry::{
     AURU_PLUGIN_REGISTRY_URL, PluginAvailability, PluginEntry, PluginRegistry, PluginSearchPaths,
     PluginSource, ResolvedPlugin,

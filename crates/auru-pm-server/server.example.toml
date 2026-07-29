@@ -1,0 +1,31 @@
+# Auru PM server configuration, schema version 1.
+version = 1
+provider_id = "studio-pm"
+listen = "127.0.0.1:4242"
+public_base_url = "https://pm.example.com"
+data_dir = "./auru-pm-server-data"
+requests_per_minute = 600
+
+[authentication]
+mode = "oauth"
+# The exact issuer published by your OAuth 2.0 / OpenID Connect provider.
+# For Clerk this is the Frontend API URL for the instance.
+issuer = "https://identity.example.com"
+# The audience your provider puts in access tokens for this PM server.
+audience = "auru-pm"
+# Register this as a public/native client: it must not have a client secret.
+desktop_client_id = "auru-pm-desktop"
+# `openid` works with providers that do not support application-defined scopes.
+required_scope = "openid"
+# Register this exact redirect URI with the identity provider.
+redirect_uri = "http://127.0.0.1:43827/oauth/callback"
+flows = ["authorization_code_pkce"]
+
+# Required only when enabling OAuth over a data directory created by an older
+# unauthenticated server. Set it to the provider subject that owns all existing
+# projects, start once, then it may remain for auditability.
+# legacy_owner_subject = "user_..."
+
+[authentication.validation]
+# Access tokens are JWTs verified from the issuer's discovered JWKS.
+strategy = "jwt"

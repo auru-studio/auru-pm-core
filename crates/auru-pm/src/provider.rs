@@ -58,12 +58,22 @@ pub struct Capabilities {
     /// Whether the provider can enforce destructive history-retention rules.
     #[serde(default)]
     pub history_retention: bool,
+    /// Whether blob operations are authorized through the project namespace.
+    ///
+    /// `false` preserves compatibility with servers predating private
+    /// per-project blob entitlements, which exposed `/v1/blobs/*`.
+    #[serde(default)]
+    pub project_scoped_blobs: bool,
 }
 
 /// Authentication scheme advertised by a provider via `/v1/health`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
+    /// OAuth 2.0 Authorization Code grant for a public desktop client, with
+    /// PKCE S256 and an exact loopback redirect URI.
+    #[serde(rename = "authorization_code_pkce")]
+    OAuthAuthorizationCodePkce,
     /// OAuth 2.0 device-code flow (used by the Auru-hosted reference
     /// provider — no embedded browser required).
     ///
@@ -235,6 +245,10 @@ mod tests {
 
     #[test]
     fn auth_methods_should_use_the_names_the_spec_documents() {
+        assert_eq!(
+            serde_json::to_string(&AuthMethod::OAuthAuthorizationCodePkce).expect("encode"),
+            r#""authorization_code_pkce""#
+        );
         // `spec.md` and the OAuth module both say `oauth_device_code`. Serde's
         // snake_case derive would have produced `o_auth_device_code`, so a
         // server implementing the published protocol could not be parsed.

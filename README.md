@@ -35,8 +35,43 @@ cargo run -p auru-pm-server -- \
 ```
 
 The server persists project state and content-addressed blobs and applies a
-per-client request limit. It still deliberately advertises
-`auth_methods: ["none"]`; don't expose it to an untrusted network.
+per-client request limit. With no `--config`, it retains the development
+default: no authentication and a loopback-only listener.
+
+## Standards-based authentication
+
+For a deployable server, copy
+[`server.example.toml`](crates/auru-pm-server/server.example.toml), register its
+fixed loopback redirect URI as a public/native OAuth client with your identity
+provider, and run:
+
+```sh
+cargo run -p auru-pm-server -- --config ./server.toml
+```
+
+The provider must publish OAuth 2.0 Authorization Server Metadata (RFC 8414) or
+OpenID Connect discovery. The desktop uses Authorization Code with PKCE S256;
+device authorization is also supported when both the config and discovery
+document advertise it. The server validates tokens using exactly one
+configured strategy:
+
+- `strategy = "jwt"` discovers and caches the provider's JWKS, refreshing once
+  when key rotation presents an unknown `kid`.
+- `strategy = "introspection"` validates opaque tokens with RFC 7662. Add
+  `endpoint = "https://..."` only when discovery does not publish one, plus
+  `client_id` and `client_secret_env`. Put the secret in that named environment
+  variable, never in TOML.
+
+Issuer, audience, subject, expiry/activity, and `required_scope` are enforced.
+`openid` is the default scope so providers such as Clerk that do not generally
+offer custom OAuth scopes can still be configured without a vendor adapter.
+The external reverse proxy owns TLS; `public_base_url` and all identity-provider
+endpoints must use HTTPS, while the server itself listens on private HTTP.
+
+Projects are private to the identity key `(issuer, subject)`. Existing data
+from an older unauthenticated server is not assigned implicitly: OAuth startup
+refuses until `legacy_owner_subject` explicitly names its owner. Access and
+refresh tokens are stored only in the desktop OS keychain.
 
 ## License
 

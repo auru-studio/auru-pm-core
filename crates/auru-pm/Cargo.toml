@@ -15,15 +15,37 @@ base64.workspace = true
 blake3.workspace = true
 flate2 = "1"
 fs2 = "0.4"
-keyring-core.workspace = true
 quick-xml = "0.37"
+rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 thiserror.workspace = true
 # tokio needed in regular deps for tokio::time::sleep in oauth.rs polling loop.
-tokio = { version = "1", features = ["rt", "time", "macros"] }
+tokio = { version = "1", features = ["io-util", "net", "rt", "sync", "time", "macros"] }
+url = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { workspace = true, features = [
+    "crypto-rust",
+    "linux-native-sync-persistent",
+    "vendored",
+] }
+
+[target.'cfg(any(target_os = "freebsd", target_os = "openbsd"))'.dependencies]
+keyring = { workspace = true, features = [
+    "crypto-rust",
+    "sync-secret-service",
+    "vendored",
+] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { workspace = true, features = ["windows-native"] }
 
 [dev-dependencies]
 axum = "0.7"

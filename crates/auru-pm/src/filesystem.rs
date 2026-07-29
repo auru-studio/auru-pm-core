@@ -433,6 +433,7 @@ impl ProjectProvider for FilesystemProvider {
             // negotiate. Blobs are still stored compressed by the CAS.
             compressed_uploads: false,
             history_retention: true,
+            project_scoped_blobs: true,
         }
     }
 
