@@ -16,10 +16,11 @@ use auru_pm::{
     RetentionRule,
 };
 use gpui::{
-    Anchor, AnyElement, App, Bounds, Context, Div, ElementId, Entity, FocusHandle, FontWeight,
-    Hsla, InteractiveElement, Interactivity, IntoElement, ParentElement, Render, RenderOnce,
-    SharedString, Size, Stateful, StyleRefinement, Styled, Subscription, UniformListScrollHandle,
-    Window, WindowBounds, WindowOptions, div, prelude::*, px, relative, rgb, uniform_list,
+    Anchor, AnyElement, App, Bounds, Context, Div, ElementId, Entity, FocusHandle, Focusable,
+    FontWeight, Hsla, InteractiveElement, Interactivity, IntoElement, ParentElement, Render,
+    RenderOnce, SharedString, Size, Stateful, StyleRefinement, Styled, Subscription,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, prelude::*, px, relative,
+    rgb, uniform_list,
 };
 use gpui_component::{
     Root, Selectable, Sizable, Theme, ThemeMode, ThemeTokens, WindowExt,
@@ -64,6 +65,15 @@ const WAVEFORM_HEIGHTS: [f32; 30] = [
 enum Route {
     Library,
     Onboarding,
+}
+
+impl Route {
+    const fn inspection_surface(self) -> inspection::Surface {
+        match self {
+            Self::Library => inspection::Surface::Library,
+            Self::Onboarding => inspection::Surface::Onboarding,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -345,7 +355,10 @@ impl ProjectManager {
         .into_iter()
         .map(|input| {
             cx.subscribe_in(input, window, |_, _, event: &InputEvent, _, cx| {
-                if matches!(event, InputEvent::Change) {
+                if matches!(
+                    event,
+                    InputEvent::Change | InputEvent::Focus | InputEvent::Blur
+                ) {
                     cx.notify();
                 }
             })
@@ -4451,9 +4464,6 @@ impl ProjectManager {
                 });
             });
         }
-        if let Some(inspection) = self.inspection.as_mut() {
-            inspection.set_focused_id(id);
-        }
         cx.notify();
         Ok(())
     }
@@ -4595,12 +4605,14 @@ impl ProjectManager {
         Ok(())
     }
 
-    fn inspection_nodes(&self, cx: &App) -> Vec<gpui_mcp::SemanticNode> {
-        let focused_id = self
-            .inspection
-            .as_ref()
-            .and_then(inspection::InspectionPublisher::focused_id);
-        let focused = |id: &str| focused_id == Some(id);
+    fn inspection_nodes(
+        &self,
+        surface: inspection::Surface,
+        window: &Window,
+        cx: &App,
+    ) -> Vec<gpui_mcp::SemanticNode> {
+        let focused =
+            |input: &Entity<InputState>| input.read(cx).focus_handle(cx).is_focused(window);
         let button = |id: String, label: String, value: Option<String>, enabled: bool| {
             inspection::node(
                 id,
@@ -4613,149 +4625,151 @@ impl ProjectManager {
         };
         let mut nodes = Vec::new();
 
-        match self.route {
-            Route::Library => {
-                let attention = self
-                    .projects
-                    .iter()
-                    .filter(|project| project.status.needs_attention())
-                    .count();
-                nodes.push(inspection::node(
-                    "library",
-                    "region",
-                    "Project library",
-                    Some(format!(
-                        "{} projects; {attention} need attention",
-                        self.projects.len()
-                    )),
-                    false,
-                    &[],
-                ));
-                nodes.push(inspection::node(
-                    "search-projects",
-                    "textbox",
-                    "Search projects",
-                    Some(self.search_input.read(cx).value().to_string()),
-                    focused("search-projects"),
-                    &["focus", "type_text"],
-                ));
-                nodes.push(button(
-                    "backup-all".to_owned(),
-                    "Back up all changes".to_owned(),
-                    None,
-                    self.projects
+        if surface != inspection::Surface::Settings {
+            match self.route {
+                Route::Library => {
+                    let attention = self
+                        .projects
                         .iter()
-                        .any(|project| project.status.action() == ProjectAction::Push),
-                ));
-                nodes.push(button(
-                    "shortcut-refresh".to_owned(),
-                    "Refresh library".to_owned(),
-                    None,
-                    true,
-                ));
-                nodes.push(button(
-                    "open-settings".to_owned(),
-                    "Open settings".to_owned(),
-                    Some(
-                        if self.settings_window.is_some() {
-                            "open"
-                        } else {
-                            "closed"
-                        }
-                        .to_owned(),
-                    ),
-                    true,
-                ));
-
-                let search_query = self.search_input.read(cx).value().to_lowercase();
-                for (index, project) in self
-                    .projects
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, project)| project.matches_search(&search_query))
-                    // The visual list is virtualized too. A bounded semantic
-                    // page keeps a large real library from flooding every MCP
-                    // tree response; narrowing the search exposes later rows.
-                    .take(100)
-                {
-                    let selected = index == self.selected_project;
-                    nodes.push(button(
-                        inspection::stable_id("project", &project.id),
-                        project.name.clone(),
+                        .filter(|project| project.status.needs_attention())
+                        .count();
+                    nodes.push(inspection::node(
+                        "library",
+                        "region",
+                        "Project library",
                         Some(format!(
-                            "{}; {}",
-                            if selected { "selected" } else { "not_selected" },
-                            project.list_status()
+                            "{} projects; {attention} need attention",
+                            self.projects.len()
                         )),
+                        false,
+                        &[],
+                    ));
+                    nodes.push(inspection::node(
+                        "search-projects",
+                        "textbox",
+                        "Search projects",
+                        Some(self.search_input.read(cx).value().to_string()),
+                        focused(&self.search_input),
+                        &["focus", "type_text"],
+                    ));
+                    nodes.push(button(
+                        "backup-all".to_owned(),
+                        "Back up all changes".to_owned(),
+                        None,
+                        self.projects
+                            .iter()
+                            .any(|project| project.status.action() == ProjectAction::Push),
+                    ));
+                    nodes.push(button(
+                        "shortcut-refresh".to_owned(),
+                        "Refresh library".to_owned(),
+                        None,
                         true,
                     ));
-                    if selected {
-                        let action = project.status.action();
+                    nodes.push(button(
+                        "open-settings".to_owned(),
+                        "Open settings".to_owned(),
+                        Some(
+                            if self.settings_window.is_some() {
+                                "open"
+                            } else {
+                                "closed"
+                            }
+                            .to_owned(),
+                        ),
+                        true,
+                    ));
+
+                    let search_query = self.search_input.read(cx).value().to_lowercase();
+                    for (index, project) in self
+                        .projects
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, project)| project.matches_search(&search_query))
+                        // The visual list is virtualized too. A bounded semantic
+                        // page keeps a large real library from flooding every MCP
+                        // tree response; narrowing the search exposes later rows.
+                        .take(100)
+                    {
+                        let selected = index == self.selected_project;
                         nodes.push(button(
-                            inspection::stable_id("project-primary-action", &project.id),
-                            format!("{}: {}", project.name, action.label()),
-                            Some(project.list_status()),
-                            action != ProjectAction::None,
+                            inspection::stable_id("project", &project.id),
+                            project.name.clone(),
+                            Some(format!(
+                                "{}; {}",
+                                if selected { "selected" } else { "not_selected" },
+                                project.list_status()
+                            )),
+                            true,
                         ));
+                        if selected {
+                            let action = project.status.action();
+                            nodes.push(button(
+                                inspection::stable_id("project-primary-action", &project.id),
+                                format!("{}: {}", project.name, action.label()),
+                                Some(project.list_status()),
+                                action != ProjectAction::None,
+                            ));
+                        }
                     }
                 }
-            }
-            Route::Onboarding => {
-                let (position, total) = self.onboarding_step.position();
-                nodes.push(inspection::node(
-                    "onboarding",
-                    "region",
-                    "Auru PM setup",
-                    Some(format!("{position}/{total}")),
-                    false,
-                    &[],
-                ));
-                match self.onboarding_step {
-                    OnboardingStep::Profile => nodes.push(inspection::node(
-                        "display-name-input",
-                        "textbox",
-                        "Display name",
-                        Some(self.display_name_input.read(cx).value().to_string()),
-                        focused("display-name-input"),
-                        &["focus", "type_text"],
-                    )),
-                    OnboardingStep::Provider => nodes.push(button(
-                        "onboarding-choose-provider".to_owned(),
-                        "Choose a backup destination".to_owned(),
-                        Some(format!(
-                            "{} connected",
-                            self.providers
-                                .iter()
-                                .filter(|provider| provider.is_connected())
-                                .count()
+                Route::Onboarding => {
+                    let (position, total) = self.onboarding_step.position();
+                    nodes.push(inspection::node(
+                        "onboarding",
+                        "region",
+                        "Auru PM setup",
+                        Some(format!("{position}/{total}")),
+                        false,
+                        &[],
+                    ));
+                    match self.onboarding_step {
+                        OnboardingStep::Profile => nodes.push(inspection::node(
+                            "display-name-input",
+                            "textbox",
+                            "Display name",
+                            Some(self.display_name_input.read(cx).value().to_string()),
+                            focused(&self.display_name_input),
+                            &["focus", "type_text"],
                         )),
+                        OnboardingStep::Provider => nodes.push(button(
+                            "onboarding-choose-provider".to_owned(),
+                            "Choose a backup destination".to_owned(),
+                            Some(format!(
+                                "{} connected",
+                                self.providers
+                                    .iter()
+                                    .filter(|provider| provider.is_connected())
+                                    .count()
+                            )),
+                            true,
+                        )),
+                        OnboardingStep::Music => nodes.push(button(
+                            "onboarding-watch-folder".to_owned(),
+                            "Choose a project folder".to_owned(),
+                            Some(format!("{} watched", self.state.watched_folders.len())),
+                            !self.scanning,
+                        )),
+                    }
+                    let can_continue = self.onboarding_step != OnboardingStep::Profile
+                        || !self.display_name_input.read(cx).value().trim().is_empty();
+                    nodes.push(button(
+                        "continue-onboarding".to_owned(),
+                        "Continue setup".to_owned(),
+                        None,
+                        can_continue,
+                    ));
+                    nodes.push(button(
+                        "previous-onboarding".to_owned(),
+                        "Previous setup step".to_owned(),
+                        None,
                         true,
-                    )),
-                    OnboardingStep::Music => nodes.push(button(
-                        "onboarding-watch-folder".to_owned(),
-                        "Choose a project folder".to_owned(),
-                        Some(format!("{} watched", self.state.watched_folders.len())),
-                        !self.scanning,
-                    )),
+                    ));
                 }
-                let can_continue = self.onboarding_step != OnboardingStep::Profile
-                    || !self.display_name_input.read(cx).value().trim().is_empty();
-                nodes.push(button(
-                    "continue-onboarding".to_owned(),
-                    "Continue setup".to_owned(),
-                    None,
-                    can_continue,
-                ));
-                nodes.push(button(
-                    "previous-onboarding".to_owned(),
-                    "Previous setup step".to_owned(),
-                    None,
-                    true,
-                ));
             }
         }
 
-        if self.settings_window.is_some() {
+        if surface == inspection::Surface::Settings {
             nodes.push(inspection::node(
                 "settings",
                 "window",
@@ -4793,7 +4807,7 @@ impl ProjectManager {
                 "textbox",
                 "Recorded path prefix",
                 Some(self.path_alias_input.read(cx).value().to_string()),
-                focused("path-alias-input"),
+                focused(&self.path_alias_input),
                 &["focus", "type_text"],
             ));
             nodes.push(button(
@@ -4807,7 +4821,7 @@ impl ProjectManager {
                 "textbox",
                 "Display name",
                 Some(self.display_name_setting.read(cx).value().to_string()),
-                focused("display-name-setting"),
+                focused(&self.display_name_setting),
                 &["focus", "type_text"],
             ));
             nodes.push(button(
@@ -4839,7 +4853,15 @@ impl ProjectManager {
             }
         }
 
-        match self.overlay.overlay {
+        let overlay_host = match surface {
+            inspection::Surface::Settings => OverlayHost::Settings,
+            inspection::Surface::Library | inspection::Surface::Onboarding => OverlayHost::Main,
+        };
+        match self
+            .overlay
+            .visible_for(overlay_host)
+            .unwrap_or(Overlay::None)
+        {
             Overlay::None => {}
             Overlay::ProviderPicker => {
                 nodes.push(inspection::node(
@@ -4908,7 +4930,7 @@ impl ProjectManager {
                             }
                             .to_owned(),
                         ),
-                        focused("credential-input"),
+                        focused(&self.credential_input),
                         &["focus", "type_text"],
                     ));
                 }
@@ -4974,10 +4996,16 @@ impl ProjectManager {
         nodes
     }
 
-    fn publish_inspection(&mut self, surface: &'static str, window: &Window, cx: &Context<Self>) {
-        let nodes = self.inspection_nodes(cx);
+    fn publish_inspection(
+        &mut self,
+        surface: inspection::Surface,
+        window: &Window,
+        cx: &Context<Self>,
+    ) {
+        let nodes = self.inspection_nodes(surface, window, cx);
+        let root_focused = window.is_window_active() && !nodes.iter().any(|node| node.focused);
         if let Some(inspection) = self.inspection.as_mut() {
-            inspection.publish(surface, window, nodes);
+            inspection.publish(surface, window, root_focused, nodes);
         }
     }
 
@@ -4986,12 +5014,9 @@ impl ProjectManager {
             gpui::AnyWindowHandle::from(settings) == window.window_handle()
         });
         let surface = if is_settings {
-            "settings"
+            inspection::Surface::Settings
         } else {
-            match self.route {
-                Route::Library => "library",
-                Route::Onboarding => "onboarding",
-            }
+            self.route.inspection_surface()
         };
         self.publish_inspection(surface, window, cx);
     }
@@ -5001,7 +5026,7 @@ impl ProjectManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.publish_inspection("settings", window, cx);
+        self.publish_inspection(inspection::Surface::Settings, window, cx);
         let content = self.settings_component(cx);
         let overlay = self.render_overlay(OverlayHost::Settings, cx);
 
@@ -5016,11 +5041,7 @@ impl ProjectManager {
 
 impl Render for ProjectManager {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let surface = match self.route {
-            Route::Library => "library",
-            Route::Onboarding => "onboarding",
-        };
-        self.publish_inspection(surface, window, cx);
+        self.publish_inspection(self.route.inspection_surface(), window, cx);
         let content = match self.route {
             Route::Library => self.render_library(cx),
             Route::Onboarding => self.render_onboarding(cx),

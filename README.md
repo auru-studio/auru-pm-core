@@ -92,6 +92,9 @@ provider picker, and authentication state. Click and focus actions are
 dispatched on GPUI's foreground executor; keyboard input, Unicode text,
 scrolling, dragging, and resizing use GPUI's normal event path. Inspection is
 off for every ordinary launch, and each inspected launch receives a new token.
+Runtime screenshot capture is not available on GPUI's current Linux backend;
+the MCP screenshot tool returns an explicit error there instead of writing a
+misleading artifact.
 
 ## License
 

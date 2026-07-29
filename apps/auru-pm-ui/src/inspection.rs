@@ -15,6 +15,24 @@ use gpui_mcp::{
 
 pub const ROOT_ID: &str = "auru-pm";
 
+/// A top-level GPUI window/screen whose semantic tree is currently active.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Surface {
+    Library,
+    Onboarding,
+    Settings,
+}
+
+impl Surface {
+    const fn value(self) -> &'static str {
+        match self {
+            Self::Library => "library",
+            Self::Onboarding => "onboarding",
+            Self::Settings => "settings",
+        }
+    }
+}
+
 /// The two halves needed when inspection starts.
 pub struct RunningInspection {
     pub publisher: InspectionPublisher,
@@ -38,7 +56,6 @@ pub fn start() -> Result<RunningInspection, String> {
             revision: 0,
             published_nodes: Vec::new(),
             active_window: None,
-            focused_id: None,
         },
         actions,
         address,
@@ -55,7 +72,6 @@ pub struct InspectionPublisher {
     revision: u64,
     published_nodes: Vec<SemanticNode>,
     active_window: Option<AnyWindowHandle>,
-    focused_id: Option<String>,
 }
 
 impl InspectionPublisher {
@@ -63,8 +79,9 @@ impl InspectionPublisher {
     /// replace the root bounds used for resize, scroll, and screenshot actions.
     pub fn publish(
         &mut self,
-        surface: &'static str,
+        surface: Surface,
         window: &Window,
+        root_focused: bool,
         mut nodes: Vec<SemanticNode>,
     ) {
         let window_handle = window.window_handle();
@@ -78,23 +95,21 @@ impl InspectionPublisher {
 
         self.active_window = Some(window_handle);
         let viewport = window.viewport_size();
-        nodes.insert(
-            0,
-            node(
-                ROOT_ID,
-                "application",
-                "Auru PM",
-                Some(surface.to_owned()),
-                self.focused_id.is_none(),
-                &["focus"],
-            )
-            .with_bounds(SemanticBounds {
-                x: 0.0,
-                y: 0.0,
-                width: viewport.width.into(),
-                height: viewport.height.into(),
-            }),
+        let mut root = node(
+            ROOT_ID,
+            "application",
+            "Auru PM",
+            Some(surface.value().to_owned()),
+            root_focused,
+            &["focus"],
         );
+        root.bounds = Some(SemanticBounds {
+            x: 0.0,
+            y: 0.0,
+            width: viewport.width.into(),
+            height: viewport.height.into(),
+        });
+        nodes.insert(0, root);
 
         if nodes == self.published_nodes {
             return;
@@ -109,14 +124,6 @@ impl InspectionPublisher {
 
     pub fn active_window(&self) -> Option<AnyWindowHandle> {
         self.active_window
-    }
-
-    pub fn focused_id(&self) -> Option<&str> {
-        self.focused_id.as_deref()
-    }
-
-    pub fn set_focused_id(&mut self, id: impl Into<String>) {
-        self.focused_id = Some(id.into());
     }
 }
 
@@ -153,17 +160,6 @@ pub fn stable_id(prefix: &str, identity: &str) -> String {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{prefix}-{hash:016x}")
-}
-
-trait SemanticNodeExt {
-    fn with_bounds(self, bounds: SemanticBounds) -> Self;
-}
-
-impl SemanticNodeExt for SemanticNode {
-    fn with_bounds(mut self, bounds: SemanticBounds) -> Self {
-        self.bounds = Some(bounds);
-        self
-    }
 }
 
 pub fn gpui_modifiers(modifiers: NormalizedModifiers) -> Modifiers {
@@ -306,6 +302,13 @@ mod tests {
         assert!(mapped.alt);
         assert!(mapped.shift);
         assert!(mapped.function);
+    }
+
+    #[test]
+    fn surface_values_are_stable_protocol_names() {
+        assert_eq!(Surface::Library.value(), "library");
+        assert_eq!(Surface::Onboarding.value(), "onboarding");
+        assert_eq!(Surface::Settings.value(), "settings");
     }
 
     #[test]
