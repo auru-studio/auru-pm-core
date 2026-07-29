@@ -40,6 +40,11 @@ described, it was read out of a real project rather than from documentation.
   objects, while hosted providers can enforce and collect with their own grace
   policy. The desktop persists the preference and reports pruning failures
   without misreporting the already-successful backup as failed.
+- The upload-verification preference now performs an explicit provider-side
+  re-read after each committed backup. It validates the commit id, snapshot,
+  asset manifest, project metadata, every referenced asset hash, and recorded
+  asset sizes; a failed verification is reported as a warning without
+  misreporting the already-successful upload as failed.
 - Production `DEMO` labels, routes, fake actions, and test-helper names were
   removed. The premature recovery route and custom-provider CTA were removed
   rather than claiming to work. The DAWproject oracle fixture still contains a
@@ -256,10 +261,11 @@ small synthetic regression instead.
   the advertised five quiet minutes, or calls the backup coordinator. Until
   that watcher exists, the switch must not be mistaken for automatic
   protection.
-- **“Verify every copy after upload” does not re-read uploads.** The preference
-  now survives restarts, and providers validate hashes at their normal trust
-  boundaries, but the desktop does not perform the explicit post-upload
-  download-and-compare pass promised by the setting copy.
+- **Resolved 2026-07-29:** “Verify every copy after upload” now re-reads the
+  committed object graph through the selected provider and validates the
+  commit, snapshot, manifest, metadata, every asset hash, and asset size. A
+  failed verification produces a warning while retaining the successful
+  backup and its history.
 - **Onboarding is one step, not the designed three.** The provider-connection
   and folder-selection steps from `auru-pm-claude-design` are not built.
 - **Resolved 2026-07-29:** the `project_listing` capability adds

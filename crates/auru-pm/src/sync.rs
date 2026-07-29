@@ -11,8 +11,10 @@ use crate::ableton::BundlePolicy;
 use crate::ableton::validate::IntegrityProblem;
 use crate::canonical::compute_commit_id;
 use crate::commit::{AuthorIdentity, Commit, CommitId, TreeRef};
+use crate::error::{Error, Result};
 use crate::hash::ContentHash;
 use crate::merge::{ConflictResolution, ConflictedField, MergeOutcome, merge3, resolve_conflicts};
+use crate::project_format::ProjectSnapshot;
 use crate::project_info::ProjectInfo;
 use crate::provider::{HeadAdvance, ProjectProvider};
 use crate::sample_manifest::{SampleEntry, SampleManifest, plan_assets};
@@ -53,6 +55,73 @@ pub enum PushOutcome {
         problems: Vec<IntegrityProblem>,
         stash: ContentHash,
     },
+}
+
+/// Re-read a committed backup through its provider and validate every object
+/// needed to restore it.
+pub async fn verify_commit_copy(provider: &dyn ProjectProvider, commit_id: CommitId) -> Result<()> {
+    let commit = provider
+        .get_commit(&commit_id)
+        .await
+        .map_err(|error| Error::Other(format!("re-read commit: {error}")))?;
+    if commit.id != commit_id {
+        return Err(Error::Other(format!(
+            "re-read commit id mismatch: requested {}, received {}",
+            commit_id.0, commit.id.0
+        )));
+    }
+    let computed_id = compute_commit_id(&commit)
+        .map_err(|error| Error::Other(format!("validate commit encoding: {error}")))?;
+    if computed_id != commit_id {
+        return Err(Error::Other(format!(
+            "re-read commit is damaged: expected {}, computed {}",
+            commit_id.0, computed_id.0
+        )));
+    }
+
+    let snapshot = verify_blob(provider, commit.tree.snapshot, "snapshot").await?;
+    ProjectSnapshot::from_canonical_bytes(&snapshot)
+        .map_err(|error| Error::Other(format!("re-read snapshot is invalid: {error}")))?;
+
+    let manifest_bytes = verify_blob(provider, commit.tree.samples, "asset manifest").await?;
+    let manifest: SampleManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| Error::Other(format!("re-read asset manifest is invalid: {error}")))?;
+
+    if let Some(metadata) = commit.metadata {
+        verify_blob(provider, metadata, "project metadata").await?;
+    }
+
+    for entry in manifest.entries {
+        let label = format!("asset `{}`", entry.path);
+        let bytes = verify_blob(provider, entry.hash, &label).await?;
+        let actual_size = bytes.len() as u64;
+        if actual_size != entry.size {
+            return Err(Error::Other(format!(
+                "re-read {label} has the wrong size: expected {} bytes, received {actual_size}",
+                entry.size
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+async fn verify_blob(
+    provider: &dyn ProjectProvider,
+    expected: ContentHash,
+    label: &str,
+) -> Result<Vec<u8>> {
+    let bytes = provider
+        .get_blob(&expected)
+        .await
+        .map_err(|error| Error::Other(format!("re-read {label}: {error}")))?;
+    let actual = ContentHash::of(&bytes);
+    if actual != expected {
+        return Err(Error::Other(format!(
+            "re-read {label} is damaged: expected {expected}, computed {actual}"
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Directory relative references resolve against.
@@ -868,6 +937,50 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn explicit_verification_should_detect_a_missing_uploaded_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let provider = FilesystemProvider::open(dir.path().join("cas")).unwrap();
+        let provider_id = provider.provider_id();
+        let sidecar = dir.path().join("song.dawproject-pm.json");
+        let source = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/interchange/oracle-midi.dawproject"),
+        )
+        .unwrap();
+        let snapshot =
+            ProjectSnapshot::from_source_bytes(ProjectFormat::Dawproject, &source).unwrap();
+        let outcome = rt()
+            .block_on(push_with_freshness_check(
+                &provider,
+                &provider_id,
+                &[],
+                &sidecar,
+                snapshot.as_bytes(),
+                AuthorIdentity {
+                    display_name: "Jake".to_owned(),
+                    provider_user_id: "jake".to_owned(),
+                    provider_id: provider_id.clone(),
+                    email: None,
+                },
+                "Backed up changes",
+                "",
+            ))
+            .unwrap();
+        let PushOutcome::Committed { commit_id, .. } = outcome else {
+            panic!("backup should commit");
+        };
+        let commit = rt().block_on(provider.get_commit(&commit_id)).unwrap();
+        std::fs::remove_file(provider.blobs_cas().path_for(&commit.tree.snapshot)).unwrap();
+
+        let error = rt()
+            .block_on(verify_commit_copy(&provider, commit_id))
+            .expect_err("verification must re-read the uploaded snapshot");
+
+        assert!(error.to_string().contains("snapshot"), "{error}");
+        assert!(error.to_string().contains("not found"), "{error}");
     }
 
     #[test]

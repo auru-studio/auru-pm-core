@@ -76,4 +76,5 @@ pub use sidecar::{RemoteState, SIDECAR_SUFFIX, Sidecar, Stash, sidecar_path_for}
 pub use sync::{
     MirrorResult, PushOutcome, discard_stash, drain_pending_pushes, fetch_project_info,
     push_with_conflict_resolutions, push_with_freshness_check, stashed_snapshot,
+    verify_commit_copy,
 };

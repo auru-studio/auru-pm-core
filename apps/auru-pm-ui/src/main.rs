@@ -910,6 +910,7 @@ impl ProjectManager {
         let project_id = project.id.clone();
         let project_name = project.name.clone();
         let display_name = self.display_name.clone();
+        let verify_uploads = self.verify_uploads;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs() as i64)
@@ -927,7 +928,13 @@ impl ProjectManager {
         cx.notify();
 
         let backup = cx.background_executor().spawn(async move {
-            backend::back_up(provider, project_path, display_name, retention_rule)
+            backend::back_up(
+                provider,
+                project_path,
+                display_name,
+                retention_rule,
+                verify_uploads,
+            )
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = backup.await;
@@ -941,31 +948,48 @@ impl ProjectManager {
                 };
                 match result {
                     Ok(backend::BackupResult::Committed(receipt)) => {
-                        let detail = if let Some(warning) = receipt.retention_warning {
-                            format!("Project bytes and history were stored. {warning}.")
-                        } else if let Some(report) = receipt
-                            .retention
-                            .filter(|report| report.versions_removed > 0)
+                        let (mut detail, verification_failed) = match &receipt.verification {
+                            backend::BackupVerification::Skipped => {
+                                ("Project bytes and history were stored.".to_owned(), false)
+                            }
+                            backend::BackupVerification::Verified => (
+                                "Project bytes and history were stored and verified.".to_owned(),
+                                false,
+                            ),
+                            backend::BackupVerification::Failed(error) => (
+                                format!(
+                                    "Project was stored, but verification could not confirm the \
+                                     copy: {error}."
+                                ),
+                                true,
+                            ),
+                        };
+                        if let Some(warning) = receipt.retention_warning {
+                            detail.push_str(&format!(" {warning}."));
+                        } else if let Some(report) =
+                            receipt.retention.filter(|report| report.versions_removed > 0)
                         {
                             if report.bytes_freed > 0 {
-                                format!(
-                                    "Project stored. Removed {} old version(s) and freed {}.",
+                                detail.push_str(&format!(
+                                    " Removed {} old version(s) and freed {}.",
                                     report.versions_removed,
                                     format_bytes(report.bytes_freed)
-                                )
+                                ));
                             } else {
-                                format!(
-                                    "Project stored. Removed {} old version(s).",
+                                detail.push_str(&format!(
+                                    " Removed {} old version(s).",
                                     report.versions_removed
-                                )
+                                ));
                             }
-                        } else {
-                            "Project bytes and history were stored.".to_owned()
-                        };
+                        }
                         project.finish_transfer(receipt.history);
-                        window.push_notification(
+                        let notification = if verification_failed {
+                            Notification::warning(detail)
+                        } else {
                             Notification::success(detail)
-                                .title(format!("{project_name} backed up")),
+                        };
+                        window.push_notification(
+                            notification.title(format!("{project_name} backed up")),
                             cx,
                         );
                     }

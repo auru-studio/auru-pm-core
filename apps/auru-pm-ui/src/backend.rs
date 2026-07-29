@@ -13,7 +13,7 @@ use auru_pm::{
     AuthorIdentity, CommitId, CommitSummary, ContentHash, FilesystemProvider, HistoryRange,
     HttpProvider, ProjectFormat, ProjectProfile, ProjectProvider, ProjectSnapshot, PushOutcome,
     RetentionReport, RetentionRoots, RetentionRule, SampleManifest, Sidecar, fetch_project_info,
-    flstudio, push_with_freshness_check, sidecar_path_for,
+    flstudio, push_with_freshness_check, sidecar_path_for, verify_commit_copy,
 };
 use auru_pm_client::ProviderAccount;
 
@@ -32,6 +32,14 @@ pub struct BackupReceipt {
     pub history: Vec<CommitSummary>,
     pub retention: Option<RetentionReport>,
     pub retention_warning: Option<String>,
+    pub verification: BackupVerification,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum BackupVerification {
+    Skipped,
+    Verified,
+    Failed(String),
 }
 
 #[derive(Debug)]
@@ -53,9 +61,15 @@ pub fn back_up(
     project_path: PathBuf,
     display_name: String,
     retention_rule: Option<RetentionRule>,
+    verify_uploads: bool,
 ) -> Result<BackupResult, String> {
     runtime()?.block_on(async move {
         let provider = open_provider(&listing, &project_path).await?;
+        let previous_history = if verify_uploads {
+            load_history(provider.as_ref()).await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let snapshot = ProjectSnapshot::load(&project_path)
             .map_err(|error| format!("read {}: {error}", project_path.display()))?;
         if provider.capabilities().project_listing {
@@ -93,7 +107,15 @@ pub fn back_up(
         .await?;
 
         Ok(match outcome {
-            PushOutcome::Committed { .. } => {
+            PushOutcome::Committed { commit_id, .. } => {
+                let mut verification = if verify_uploads {
+                    match verify_commit_copy(provider.as_ref(), commit_id).await {
+                        Ok(()) => BackupVerification::Verified,
+                        Err(error) => BackupVerification::Failed(error.to_string()),
+                    }
+                } else {
+                    BackupVerification::Skipped
+                };
                 let (retention, retention_warning) = match retention_rule {
                     None => (None, None),
                     Some(_) if !provider.capabilities().history_retention => (
@@ -132,10 +154,17 @@ pub fn back_up(
                         }
                     },
                 };
+                let history = load_history_after_backup(
+                    provider.as_ref(),
+                    previous_history,
+                    &mut verification,
+                )
+                .await?;
                 BackupResult::Committed(BackupReceipt {
-                    history: load_history(provider.as_ref()).await?,
+                    history,
                     retention,
                     retention_warning,
+                    verification,
                 })
             }
             PushOutcome::NeedsResolution { conflicts, .. } => {
@@ -144,6 +173,25 @@ pub fn back_up(
             PushOutcome::NeedsReview { problems, .. } => BackupResult::NeedsReview(problems.len()),
         })
     })
+}
+
+async fn load_history_after_backup(
+    provider: &dyn ProjectProvider,
+    previous_history: Vec<CommitSummary>,
+    verification: &mut BackupVerification,
+) -> Result<Vec<CommitSummary>, String> {
+    match (load_history(provider).await, verification) {
+        (Ok(history), _) => Ok(history),
+        (Err(error), BackupVerification::Failed(detail)) => {
+            detail.push_str(&format!("; re-read backup history: {error}"));
+            Ok(previous_history)
+        }
+        (Err(error), verification @ BackupVerification::Verified) => {
+            *verification = BackupVerification::Failed(format!("re-read backup history: {error}"));
+            Ok(previous_history)
+        }
+        (Err(error), BackupVerification::Skipped) => Err(error),
+    }
 }
 
 /// Read history for a project from the provider recorded in its sidecar.
@@ -796,13 +844,24 @@ mod tests {
         let destination = temp.path().join("Backups");
         let listing = local_listing(&destination);
 
-        let BackupResult::Committed(BackupReceipt { history, .. }) =
-            back_up(listing.clone(), project.clone(), "Jake".to_owned(), None).expect("backup")
+        let BackupResult::Committed(BackupReceipt {
+            history,
+            verification,
+            ..
+        }) = back_up(
+            listing.clone(),
+            project.clone(),
+            "Jake".to_owned(),
+            None,
+            true,
+        )
+        .expect("backup")
         else {
             panic!("first backup should commit");
         };
 
         assert_eq!(history.len(), 1);
+        assert_eq!(verification, BackupVerification::Verified);
         assert_eq!(
             Sidecar::load(&sidecar_path_for(&project))
                 .expect("sidecar")
@@ -823,6 +882,56 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_verification_should_preserve_history_when_the_commit_cannot_be_re_read() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("Song.dawproject");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../crates/auru-pm/tests/fixtures/interchange/oracle-midi.dawproject"),
+            &project,
+        )
+        .expect("project");
+        let destination = temp.path().join("Backups");
+        let listing = local_listing(&destination);
+        let BackupResult::Committed(BackupReceipt { history, .. }) = back_up(
+            listing.clone(),
+            project.clone(),
+            "Jake".to_owned(),
+            None,
+            false,
+        )
+        .expect("backup") else {
+            panic!("backup should commit");
+        };
+        let sidecar = Sidecar::load(&sidecar_path_for(&project)).expect("sidecar");
+        let handle = sidecar
+            .provider_handles
+            .get(&listing.entry.id)
+            .expect("provider handle");
+        let stored = FilesystemProvider::open(destination.join(".auru-pm/projects").join(handle))
+            .expect("stored project");
+        let commits = auru_pm::Cas::open(stored.root().join("commits")).expect("commit store");
+        std::fs::remove_file(commits.path_for(&history[0].id.0)).expect("remove uploaded commit");
+        let mut verification = BackupVerification::Failed("re-read commit: not found".to_owned());
+
+        let retained = runtime()
+            .expect("runtime")
+            .block_on(load_history_after_backup(
+                &stored,
+                history.clone(),
+                &mut verification,
+            ))
+            .expect("a committed upload with a verification warning remains successful");
+
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].id, history[0].id);
+        let BackupVerification::Failed(error) = verification else {
+            panic!("history failure should remain a verification warning");
+        };
+        assert!(error.contains("re-read backup history"), "{error}");
+    }
+
+    #[test]
     fn a_successful_backup_should_apply_the_selected_retention_rule() {
         let temp = tempfile::tempdir().expect("tempdir");
         let project = temp.path().join("Song.auru");
@@ -839,9 +948,14 @@ mod tests {
                 .expect("project json"),
             )
             .expect("project");
-            let BackupResult::Committed(receipt) =
-                back_up(listing.clone(), project.clone(), "Jake".to_owned(), rule).expect("backup")
-            else {
+            let BackupResult::Committed(receipt) = back_up(
+                listing.clone(),
+                project.clone(),
+                "Jake".to_owned(),
+                rule,
+                false,
+            )
+            .expect("backup") else {
                 panic!("each revision should commit");
             };
 
@@ -878,7 +992,7 @@ mod tests {
         .expect("project");
         let listing = local_listing(&temp.path().join("Backups"));
         let BackupResult::Committed(BackupReceipt { history, .. }) =
-            back_up(listing.clone(), project, "Jake".to_owned(), None).expect("backup")
+            back_up(listing.clone(), project, "Jake".to_owned(), None, false).expect("backup")
         else {
             panic!("first backup should commit");
         };
@@ -936,6 +1050,7 @@ mod tests {
             restored.project_file.clone(),
             "Jake".to_owned(),
             None,
+            false,
         )
         .expect("back up recovered project")
         else {
@@ -997,7 +1112,7 @@ mod tests {
         .expect("project");
         let listing = local_listing(&temp.path().join("Backups"));
         let BackupResult::Committed(BackupReceipt { history, .. }) =
-            back_up(listing.clone(), project, "Jake".to_owned(), None).expect("backup")
+            back_up(listing.clone(), project, "Jake".to_owned(), None, false).expect("backup")
         else {
             panic!("backup should commit even when a referenced sample is already missing");
         };
@@ -1026,9 +1141,14 @@ mod tests {
         let original = br#"{"version":8,"channels":[]}"#;
         std::fs::write(&project, original).expect("project");
         let listing = local_listing(&temp.path().join("Backups"));
-        let BackupResult::Committed(BackupReceipt { history, .. }) =
-            back_up(listing.clone(), project.clone(), "Jake".to_owned(), None).expect("backup")
-        else {
+        let BackupResult::Committed(BackupReceipt { history, .. }) = back_up(
+            listing.clone(),
+            project.clone(),
+            "Jake".to_owned(),
+            None,
+            false,
+        )
+        .expect("backup") else {
             panic!("first backup should commit");
         };
 
@@ -1086,9 +1206,14 @@ mod tests {
         let project = temp.path().join("Beat.flp");
         std::fs::write(&project, source).expect("project");
         let listing = local_listing(&temp.path().join("Backups"));
-        let BackupResult::Committed(BackupReceipt { history, .. }) =
-            back_up(listing.clone(), project.clone(), "Jake".to_owned(), None).expect("backup")
-        else {
+        let BackupResult::Committed(BackupReceipt { history, .. }) = back_up(
+            listing.clone(),
+            project.clone(),
+            "Jake".to_owned(),
+            None,
+            false,
+        )
+        .expect("backup") else {
             panic!("first backup should commit");
         };
 
