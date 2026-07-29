@@ -30,6 +30,7 @@ pub enum PluginFormat {
     Vst2,
     Vst3,
     AudioUnit,
+    Clap,
     /// Built into the DAW.
     Native,
     /// A hosted plugin whose binary could not be identified.
@@ -42,14 +43,38 @@ impl PluginFormat {
             Self::Vst2 => "VST2",
             Self::Vst3 => "VST3",
             Self::AudioUnit => "AU",
+            Self::Clap => "CLAP",
             Self::Native => "Built-in",
             Self::Unknown => "Plugin",
         }
     }
 
-    /// Whether the plugin is supplied by Ableton rather than a third party.
+    /// Whether the plugin is supplied by its DAW rather than a third party.
     pub const fn is_native(self) -> bool {
         matches!(self, Self::Native)
+    }
+
+    const fn registry_key(self) -> &'static str {
+        match self {
+            Self::Vst2 => "vst2",
+            Self::Vst3 => "vst3",
+            Self::AudioUnit => "au",
+            Self::Clap => "clap",
+            Self::Native => "native",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn from_registry_key(value: &str) -> Option<Self> {
+        match value {
+            "vst2" => Some(Self::Vst2),
+            "vst3" => Some(Self::Vst3),
+            "au" => Some(Self::AudioUnit),
+            "clap" => Some(Self::Clap),
+            "native" => Some(Self::Native),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
     }
 }
 
@@ -64,6 +89,8 @@ pub enum PluginId {
     /// Audio Unit. Live records no numeric identity we can rely on, so the
     /// name carries it.
     AudioUnit { name: String },
+    /// CLAP's reverse-DNS textual plugin identifier.
+    Clap { plugin_id: String },
     /// A Live device, identified by its XML tag.
     Native { device: String },
     /// A plugin identified only by the file it was loaded from.
@@ -80,6 +107,20 @@ pub enum PluginId {
     /// Kept apart from [`Self::Native`] so that a stock FL effect and a Live
     /// device that happen to share a name cannot resolve to each other.
     FlNative { device: String },
+    /// A built-in device recorded through the DAW-neutral DAWproject schema.
+    ///
+    /// Scoped separately from Live and FL native devices so two DAWs using the
+    /// same display name cannot resolve to one another accidentally.
+    DawprojectBuiltin {
+        application: String,
+        device_id: String,
+    },
+    /// A hosted DAWproject device whose standard identifier could not be
+    /// converted into one of the stronger identities above.
+    Dawproject {
+        format: PluginFormat,
+        device_id: String,
+    },
 }
 
 impl fmt::Display for PluginId {
@@ -93,9 +134,23 @@ impl fmt::Display for PluginId {
                 tuid[0], tuid[1], tuid[2], tuid[3]
             ),
             Self::AudioUnit { name } => write!(formatter, "au:{name}"),
+            Self::Clap { plugin_id } => write!(formatter, "clap:{plugin_id}"),
             Self::Native { device } => write!(formatter, "live:{device}"),
             Self::Vst2ByFile { file_name } => write!(formatter, "vst2file:{file_name}"),
             Self::FlNative { device } => write!(formatter, "fl:{device}"),
+            Self::DawprojectBuiltin {
+                application,
+                device_id,
+            } => {
+                write!(formatter, "dawproject-builtin:{application}:{device_id}")
+            }
+            Self::Dawproject { format, device_id } => {
+                write!(
+                    formatter,
+                    "dawproject:{}:{device_id}",
+                    format.registry_key()
+                )
+            }
         }
     }
 }
@@ -144,6 +199,9 @@ impl std::str::FromStr for PluginId {
             "au" if !rest.is_empty() => Ok(Self::AudioUnit {
                 name: rest.to_owned(),
             }),
+            "clap" if !rest.is_empty() => Ok(Self::Clap {
+                plugin_id: rest.to_owned(),
+            }),
             "live" if !rest.is_empty() => Ok(Self::Native {
                 device: rest.to_owned(),
             }),
@@ -153,6 +211,26 @@ impl std::str::FromStr for PluginId {
             "fl" if !rest.is_empty() => Ok(Self::FlNative {
                 device: rest.to_owned(),
             }),
+            "dawproject-builtin" => {
+                let (application, device_id) = rest.split_once(':').ok_or_else(invalid)?;
+                if application.is_empty() || device_id.is_empty() {
+                    return Err(invalid());
+                }
+                Ok(Self::DawprojectBuiltin {
+                    application: application.to_owned(),
+                    device_id: device_id.to_owned(),
+                })
+            }
+            "dawproject" => {
+                let (format, device_id) = rest.split_once(':').ok_or_else(invalid)?;
+                if format.is_empty() || device_id.is_empty() {
+                    return Err(invalid());
+                }
+                Ok(Self::Dawproject {
+                    format: PluginFormat::from_registry_key(format).ok_or_else(invalid)?,
+                    device_id: device_id.to_owned(),
+                })
+            }
             _ => Err(invalid()),
         }
     }
@@ -484,8 +562,19 @@ mod tests {
             PluginId::AudioUnit {
                 name: "Some AU".to_owned(),
             },
+            PluginId::Clap {
+                plugin_id: "org.example.synth".to_owned(),
+            },
             PluginId::Native {
                 device: "Eq8".to_owned(),
+            },
+            PluginId::DawprojectBuiltin {
+                application: "Bitwig Studio".to_owned(),
+                device_id: "vendor.device".to_owned(),
+            },
+            PluginId::Dawproject {
+                format: PluginFormat::Vst3,
+                device_id: "not-a-uuid".to_owned(),
             },
         ] {
             let key = id.to_string();
@@ -509,6 +598,8 @@ mod tests {
             "vst3:1-2-3-4-5",
             "au:",
             "live:",
+            "dawproject-builtin:device",
+            "dawproject:not-a-format:device",
             "something:else",
             "no-scheme",
         ] {

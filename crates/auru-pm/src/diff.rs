@@ -420,6 +420,8 @@ pub enum ChangeTag {
     Warp,
     ClipBpm,
     Loop,
+    /// Notes, audio events, warps, or other clip contents changed.
+    Content,
     PluginPreset,
     // Channel-level mix/routing changes
     Volume,
@@ -446,6 +448,7 @@ impl ChangeTag {
             ChangeTag::Warp => "WARP ALGORITHM",
             ChangeTag::ClipBpm => "CLIP BPM",
             ChangeTag::Loop => "LOOP",
+            ChangeTag::Content => "CONTENT",
             ChangeTag::PluginPreset => "PRESET",
             ChangeTag::Volume => "VOLUME",
             ChangeTag::Pan => "PAN",
@@ -531,6 +534,9 @@ pub fn structured_diff(ancestor: &Value, current: &Value) -> ProjectDiff {
     // Likewise for FL Studio: `None` means "not an FL project we can read",
     // which must fall through rather than report no changes.
     if let Some(diff) = crate::flstudio::diff::structured_diff(ancestor, current) {
+        return diff;
+    }
+    if let Some(diff) = crate::dawproject::diff::structured_diff(ancestor, current) {
         return diff;
     }
     if is_external_snapshot(ancestor) || is_external_snapshot(current) {

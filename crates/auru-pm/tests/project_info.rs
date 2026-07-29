@@ -105,6 +105,29 @@ async fn an_ableton_commit_should_describe_its_project() {
 }
 
 #[tokio::test]
+async fn a_dawproject_commit_should_describe_its_project() {
+    let source = include_bytes!("fixtures/interchange/oracle-midi.dawproject");
+    let snapshot = ProjectSnapshot::from_source_bytes(auru_pm::ProjectFormat::Dawproject, source)
+        .expect("normalize DAWproject");
+    let (_root, provider, commit) =
+        commit_project("oracle-midi.dawproject", snapshot.as_bytes()).await;
+
+    let info = fetch_project_info(&provider, &commit)
+        .await
+        .expect("fetch summary")
+        .expect("a DAWproject commit should carry a summary");
+
+    assert_eq!(info.headline(), "123 BPM · 5/4");
+    let dawproject = info.dawproject.as_ref().expect("DAWproject detail");
+    assert_eq!(dawproject.title.as_deref(), Some("Untitled"));
+    assert_eq!(dawproject.application_name.as_deref(), Some("Auru"));
+    assert_eq!(dawproject.tracks.total(), 1);
+    assert_eq!(dawproject.tracks.notes, 1);
+    assert_eq!(dawproject.tracks.master, 1);
+    assert_eq!(dawproject.clip_count, 1);
+}
+
+#[tokio::test]
 async fn the_summary_should_not_grow_with_the_size_of_the_project() {
     // The whole justification. A real Live Set's bulk is device and parameter
     // state — one project measured 7 MB of canonical JSON across ~100,000

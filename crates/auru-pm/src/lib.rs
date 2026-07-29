@@ -10,6 +10,7 @@ pub mod ableton;
 pub mod canonical;
 pub mod cas;
 pub mod commit;
+pub mod dawproject;
 pub mod diff;
 pub mod discovery;
 pub mod error;
@@ -38,6 +39,10 @@ pub use auru_pm_protocol::WIRE_VERSION;
 pub use canonical::{canonical_encoding, compute_commit_id};
 pub use cas::{Cas, GcReport, collect_reachable, collect_reachable_with_roots};
 pub use commit::{AuthorIdentity, Commit, CommitId, CommitSummary, HistoryRange, TreeRef};
+pub use dawproject::{
+    DawprojectAssetRef, DawprojectAssetSummary, DawprojectMetadata, DawprojectTrackCounts,
+    DawprojectTrackKind, DawprojectTrackSummary,
+};
 pub use diff::{
     ChangeKind, ChangeRow, ChangeTag, ChannelDiff, ChannelKind, ProjectDiff, structured_diff,
     summarize_diff,

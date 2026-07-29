@@ -44,6 +44,10 @@ described, it was read out of a real project rather than from documentation.
   removed. The premature recovery route and custom-provider CTA were removed
   rather than claiming to work. The DAWproject oracle fixture still contains a
   clip named `Demo`; that is inert test data inside the archive, not product UI.
+- DAWproject now has a schema-backed metadata reader, embedded-media manifest
+  entries, VST2/VST3/CLAP/AU plugin inventory, missing-plugin UI dispatch, and
+  per-track structured version diffs. The existing oracle is exercised through
+  commit metadata and the desktop detail model.
 
 ---
 
@@ -179,15 +183,31 @@ reference format.
 
 ### 3.3 DAWproject
 
-Effectively unsupported beyond storage. It normalises, commits, merges, and
-restores, but:
+**Implemented 2026-07-29; one storage follow-up remains.** The semantic reader
+follows the official DAWproject 1.0 schema and now supplies:
 
-- No metadata reader — `ProjectInfo::from_snapshot` returns `None`, so the
-  library shows no tempo, key, or track count.
-- No asset extraction — samples inside a `.dawproject` are not planned or
-  vendored, the same class of gap as 1.2.
-- No plugin inventory.
-- No structured diff — falls through to the format-agnostic summary.
+- `ProjectInfo` metadata for title/credits, exporting application, tempo, time
+  signature, tracks, clips, scenes, markers, arrangement extent, plugins, and
+  media. The 1.0 schema has no project-wide key, so the UI leaves it blank.
+- One manifest/CAS object per referenced embedded media file. Restore fetches
+  those objects and hydrates the archive from them; external files and missing
+  archive entries remain explicitly distinguishable. The v1 canonical
+  snapshot also retains an inline fallback so the existing provider-free
+  `ProjectSnapshot::restore_bytes` API stays valid.
+- Stable plugin identities from the interchange format: VST2 decimal IDs,
+  VST3 UUIDs, CLAP textual IDs, AU IDs, and DAW-scoped built-ins. The desktop
+  now runs these through the normal missing-plugin resolver.
+- Structured version diffs for musical metadata, tracks, clips, clip content,
+  mix parameters, devices, plugin inventory, and embedded resources. Unknown
+  XML still emits a generic change rather than disappearing.
+
+The committed oracle is deliberately small and Auru-generated. A project
+exported by a production DAW is still wanted as an interoperability fixture,
+especially one containing embedded audio and third-party plugin state.
+
+- **Remaining:** making embedded media truly lazy, rather than storing the v1
+  inline fallback as well as its CAS object, requires a versioned snapshot
+  wrapper that can declare provider-hydrated archive resources.
 - **Resolved 2026-07-29:** discovery now offers `.dawproject` files (and native
   `.auru` files) alongside Ableton and FL projects.
 
@@ -292,4 +312,5 @@ Real-project proofs, run by hand:
 
 ```bash
 cargo run --example flp_roundtrip -- "/path/to/Project.flp"
+cargo run --example dawproject_inspect -- "/path/to/Project.dawproject"
 ```

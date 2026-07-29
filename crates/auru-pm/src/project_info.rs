@@ -11,14 +11,14 @@
 //! [`crate::Commit::metadata`], so a client can show a project without ever
 //! fetching the project.
 //!
-//! The envelope is format-agnostic on purpose. Ableton is the only format with
-//! anything to say today; adding another later fills in a new field rather
-//! than changing the shape of a commit.
+//! The envelope is format-agnostic on purpose. Each DAW fills its own field
+//! rather than forcing genuinely different concepts into one lossy shape.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ableton::AbletonMetadata;
+use crate::dawproject::DawprojectMetadata;
 use crate::flstudio::FlStudioMetadata;
 use crate::hash::ContentHash;
 use crate::project_format::ProjectFormat;
@@ -46,22 +46,34 @@ pub struct ProjectInfo {
     /// struct would mean inventing values neither format records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flstudio: Option<FlStudioMetadata>,
+    /// Present for open DAWproject projects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dawproject: Option<DawprojectMetadata>,
 }
 
 impl ProjectInfo {
     /// Derive the summary for a canonical snapshot.
     ///
-    /// `None` when there is nothing worth summarizing — a native Auru project
-    /// or a DAWproject, whose detail this crate does not yet read. Returning
-    /// `None` rather than an empty summary keeps commits for those formats
-    /// byte-identical to what they were before this existed.
+    /// `None` when there is nothing worth summarizing — currently a native
+    /// Auru project, whose reader is deliberately deferred until this crate is
+    /// reintegrated with Auru itself.
     pub fn from_snapshot(snapshot: &Value) -> Option<Self> {
+        if let Some(dawproject) = crate::dawproject::metadata_from_value(snapshot) {
+            return Some(Self {
+                schema: PROJECT_INFO_SCHEMA,
+                format: ProjectFormat::Dawproject,
+                ableton: None,
+                flstudio: None,
+                dawproject: Some(dawproject),
+            });
+        }
         if let Some(flstudio) = crate::flstudio::metadata_from_value(snapshot) {
             return Some(Self {
                 schema: PROJECT_INFO_SCHEMA,
                 format: ProjectFormat::FlStudio,
                 ableton: None,
                 flstudio: Some(flstudio),
+                dawproject: None,
             });
         }
         let ableton = crate::ableton::metadata_from_value(snapshot)?;
@@ -70,6 +82,7 @@ impl ProjectInfo {
             format: ProjectFormat::AbletonLiveSet,
             ableton: Some(ableton),
             flstudio: None,
+            dawproject: None,
         })
     }
 
@@ -109,24 +122,46 @@ impl ProjectInfo {
     /// Skips anything the set did not declare rather than inventing defaults —
     /// a project with no key should say nothing about its key.
     pub fn headline(&self) -> String {
+        if let Some(dawproject) = &self.dawproject {
+            return musical_headline(
+                self.format,
+                dawproject.tempo,
+                dawproject.time_signature,
+                None,
+            );
+        }
         let Some(ableton) = &self.ableton else {
             return self.format.to_string();
         };
-        let mut parts = Vec::new();
-        if let Some(tempo) = ableton.tempo {
-            parts.push(format!("{} BPM", format_tempo(tempo)));
-        }
-        if let Some(signature) = ableton.time_signature {
-            parts.push(signature.to_string());
-        }
-        if let Some(key) = &ableton.key {
-            parts.push(key.label());
-        }
-        if parts.is_empty() {
-            self.format.to_string()
-        } else {
-            parts.join(" · ")
-        }
+        musical_headline(
+            self.format,
+            ableton.tempo,
+            ableton.time_signature,
+            ableton.key.as_ref().map(|key| key.label()),
+        )
+    }
+}
+
+fn musical_headline(
+    format: ProjectFormat,
+    tempo: Option<f64>,
+    time_signature: Option<crate::TimeSignature>,
+    key: Option<String>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(tempo) = tempo {
+        parts.push(format!("{} BPM", format_tempo(tempo)));
+    }
+    if let Some(signature) = time_signature {
+        parts.push(signature.to_string());
+    }
+    if let Some(key) = key {
+        parts.push(key);
+    }
+    if parts.is_empty() {
+        format.to_string()
+    } else {
+        parts.join(" · ")
     }
 }
 
@@ -216,18 +251,11 @@ mod tests {
     }
 
     #[test]
-    fn non_ableton_projects_should_produce_no_summary() {
-        // Native Auru and DAWproject commits must stay exactly as they were
-        // before summaries existed.
+    fn native_projects_should_produce_no_summary() {
+        // Native Auru is deliberately deferred until the crate is reintegrated
+        // with Auru itself.
         let native = serde_json::json!({ "bpm": 120, "channels": [], "version": 8 });
         assert!(ProjectInfo::from_snapshot(&native).is_none());
-
-        let dawproject = serde_json::json!({
-            "auru_pm_snapshot": 1,
-            "format": "dawproject",
-            "project": { "root": { "tag": "Project" } }
-        });
-        assert!(ProjectInfo::from_snapshot(&dawproject).is_none());
     }
 
     #[test]

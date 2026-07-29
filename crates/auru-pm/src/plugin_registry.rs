@@ -241,13 +241,17 @@ pub struct PluginSearchPaths {
 
 impl PluginSearchPaths {
     /// Conventional plugin locations for the running platform, plus anything
-    /// in `AURU_VST_PATHS` (separated the way `PATH` is).
+    /// in `AURU_VST_PATHS` and CLAP's standard `CLAP_PATH` (both separated the
+    /// way `PATH` is).
     pub fn detect() -> Self {
         let mut directories: Vec<PathBuf> = Vec::new();
 
-        if let Ok(extra) = std::env::var("AURU_VST_PATHS") {
-            directories
-                .extend(std::env::split_paths(&extra).filter(|path| !path.as_os_str().is_empty()));
+        for variable in ["AURU_VST_PATHS", "CLAP_PATH"] {
+            if let Ok(extra) = std::env::var(variable) {
+                directories.extend(
+                    std::env::split_paths(&extra).filter(|path| !path.as_os_str().is_empty()),
+                );
+            }
         }
 
         let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -255,20 +259,28 @@ impl PluginSearchPaths {
             directories.push(PathBuf::from("/Library/Audio/Plug-Ins/VST3"));
             directories.push(PathBuf::from("/Library/Audio/Plug-Ins/VST"));
             directories.push(PathBuf::from("/Library/Audio/Plug-Ins/Components"));
+            directories.push(PathBuf::from("/Library/Audio/Plug-Ins/CLAP"));
             if let Some(home) = &home {
                 directories.push(home.join("Library/Audio/Plug-Ins/VST3"));
                 directories.push(home.join("Library/Audio/Plug-Ins/VST"));
+                directories.push(home.join("Library/Audio/Plug-Ins/CLAP"));
             }
         } else if cfg!(target_os = "windows") {
             directories.push(PathBuf::from("C:/Program Files/Common Files/VST3"));
             directories.push(PathBuf::from("C:/Program Files/VSTPlugins"));
             directories.push(PathBuf::from("C:/Program Files/Steinberg/VSTPlugins"));
+            directories.push(PathBuf::from("C:/Program Files/Common Files/CLAP"));
+            if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+                directories.push(PathBuf::from(local_app_data).join("Programs/Common/CLAP"));
+            }
         } else {
             directories.push(PathBuf::from("/usr/lib/vst3"));
             directories.push(PathBuf::from("/usr/lib/lxvst"));
+            directories.push(PathBuf::from("/usr/lib/clap"));
             if let Some(home) = &home {
                 directories.push(home.join(".vst3"));
                 directories.push(home.join(".vst"));
+                directories.push(home.join(".clap"));
             }
         }
 
@@ -479,6 +491,22 @@ mod tests {
         PluginSearchPaths {
             directories: vec![std::path::PathBuf::from("/nonexistent-auru-test")],
         }
+    }
+
+    #[test]
+    fn conventional_search_paths_should_include_clap() {
+        let paths = PluginSearchPaths::detect();
+        let expected = if cfg!(target_os = "macos") {
+            Path::new("/Library/Audio/Plug-Ins/CLAP")
+        } else if cfg!(target_os = "windows") {
+            Path::new("C:/Program Files/Common Files/CLAP")
+        } else {
+            Path::new("/usr/lib/clap")
+        };
+        assert!(
+            paths.directories.iter().any(|path| path == expected),
+            "CLAP's standard location should be searched: {paths:?}"
+        );
     }
 
     #[test]

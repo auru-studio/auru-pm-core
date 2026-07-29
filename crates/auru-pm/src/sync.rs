@@ -154,8 +154,8 @@ fn now_epoch_secs() -> i64 {
 ///   the User Library rack — gathered in so the commit restores to a project
 ///   that actually opens elsewhere. See [`crate::ableton::assets`].
 /// - A loose `.als` with no project folder, and DAWproject, contribute
-///   nothing: the first has no folder to walk, the second embeds its media in
-///   the snapshot already.
+///   no filesystem assets: the first has no folder to walk, while the second's
+///   embedded media is decoded directly from the canonical archive wrapper.
 ///
 /// `project_root` is where relative references resolve from. It is derived
 /// from the sidecar's location, which sits beside the project file.
@@ -202,6 +202,29 @@ async fn build_sample_manifest(
             origin: asset.origin,
         });
         blobs.push((hash, bytes));
+    }
+
+    // DAWproject carries media inside its ZIP rather than beside the project
+    // file, so there is no filesystem path for `plan_assets` to return. Store
+    // each referenced embedded file as its own object too so the manifest can
+    // inventory and address it independently. Provider restore hydrates from
+    // these objects; the canonical archive remains self-contained as a v1
+    // fallback for `ProjectSnapshot::restore_bytes`. Removing that duplicate
+    // copy is a future snapshot-schema change, not something to do silently.
+    for asset in crate::dawproject::embedded_assets_from_value(snapshot) {
+        let hash = ContentHash::of(&asset.data);
+        primary
+            .put_blob(&hash, &asset.data)
+            .await
+            .map_err(|e| format!("put embedded asset blob '{}': {e}", asset.path))?;
+        manifest.insert(SampleEntry {
+            path: asset.path,
+            hash,
+            size: asset.data.len() as u64,
+            kind: asset.kind,
+            origin: None,
+        });
+        blobs.push((hash, asset.data));
     }
 
     Ok((manifest, blobs))
@@ -833,8 +856,11 @@ pub async fn drain_pending_pushes(
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Cursor, Write};
+
     use super::*;
     use crate::filesystem::FilesystemProvider;
+    use crate::{ProjectFormat, ProjectSnapshot};
     use tempfile::TempDir;
 
     fn rt() -> tokio::runtime::Runtime {
@@ -930,6 +956,60 @@ mod tests {
         assert_eq!(manifest.entries.len(), 1);
         assert_eq!(blobs.len(), 1);
         assert_eq!(manifest.entries[0].path, present.to_str().unwrap());
+    }
+
+    #[test]
+    fn dawproject_embedded_media_is_stored_as_an_individual_asset() {
+        let dir = TempDir::new().unwrap();
+        let provider = FilesystemProvider::open(dir.path().join("cas")).unwrap();
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        archive.start_file("project.xml", options).unwrap();
+        archive
+            .write_all(
+                br#"<Project version="1.0">
+                    <Application name="Test" version="1"/>
+                    <Arrangement><Lanes><Clips>
+                      <Clip time="0" duration="1">
+                        <Audio channels="2" duration="1" sampleRate="48000">
+                          <File path="audio/take.wav"/>
+                        </Audio>
+                      </Clip>
+                    </Clips></Lanes></Arrangement>
+                  </Project>"#,
+            )
+            .unwrap();
+        archive.start_file("audio/take.wav", options).unwrap();
+        archive.write_all(b"embedded-audio").unwrap();
+        let source = archive.finish().unwrap().into_inner();
+        let snapshot = ProjectSnapshot::from_source_bytes(ProjectFormat::Dawproject, &source)
+            .expect("normalize DAWproject");
+        let value = serde_json::from_slice(snapshot.as_bytes()).expect("canonical JSON");
+
+        let (manifest, blobs) = rt()
+            .block_on(build_sample_manifest(
+                &provider,
+                &value,
+                None,
+                &BundlePolicy::default(),
+            ))
+            .expect("manifest");
+
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(manifest.entries[0].path, "audio/take.wav");
+        assert_eq!(manifest.entries[0].hash, ContentHash::of(b"embedded-audio"));
+        assert_eq!(
+            blobs,
+            vec![(
+                ContentHash::of(b"embedded-audio"),
+                b"embedded-audio".to_vec()
+            )]
+        );
+        assert_eq!(
+            rt().block_on(provider.get_blob(&manifest.entries[0].hash))
+                .expect("stored asset"),
+            b"embedded-audio"
+        );
     }
 
     #[test]

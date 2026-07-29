@@ -389,7 +389,9 @@ fn missing_plugins_for(snapshot: &ProjectSnapshot) -> Vec<MissingPlugin> {
             .restore_bytes()
             .ok()
             .and_then(|bytes| flstudio::read_plugins(&bytes).ok()),
-        _ => ableton::read_plugins(snapshot).ok(),
+        ProjectFormat::Dawproject => auru_pm::dawproject::read_plugins(snapshot).ok(),
+        ProjectFormat::AbletonLiveSet => ableton::read_plugins(snapshot).ok(),
+        ProjectFormat::Auru => None,
     };
 
     plugins
@@ -460,6 +462,9 @@ impl ProjectDetail {
         if let Some(fl) = info.flstudio.as_ref() {
             return Some(Self::from_flstudio(fl));
         }
+        if let Some(dawproject) = info.dawproject.as_ref() {
+            return Some(Self::from_dawproject(dawproject));
+        }
         let ableton = info.ableton.as_ref()?;
         Some(Self {
             tempo: ableton.tempo,
@@ -502,6 +507,31 @@ impl ProjectDetail {
             live_version: fl.version.clone(),
             files_total: fl.assets.total,
             files_gathered: fl.assets.vendored(),
+        }
+    }
+
+    fn from_dawproject(metadata: &auru_pm::DawprojectMetadata) -> Self {
+        let bars = metadata.time_signature.and_then(|signature| {
+            let beats_per_bar = signature.beats_per_bar();
+            (beats_per_bar > 0.0).then(|| metadata.arrangement_end_beats / beats_per_bar)
+        });
+        Self {
+            tempo: metadata.tempo,
+            time_signature: metadata
+                .time_signature
+                .map(|signature| (signature.numerator, signature.denominator)),
+            // DAWproject 1.0 has no project-wide key field.
+            key: None,
+            in_key: false,
+            tracks_total: metadata.tracks.total(),
+            tracks_midi: metadata.tracks.notes + metadata.tracks.hybrid,
+            tracks_audio: metadata.tracks.audio + metadata.tracks.hybrid,
+            tracks_return: metadata.tracks.effect,
+            clip_count: metadata.clip_count,
+            bars,
+            live_version: metadata.application_label(),
+            files_total: metadata.assets.total(),
+            files_gathered: metadata.assets.embedded,
         }
     }
 
@@ -2344,6 +2374,25 @@ mod tests {
     }
 
     #[test]
+    fn dawproject_detail_should_come_from_the_real_file() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/auru-pm/tests/fixtures/interchange/oracle-midi.dawproject");
+
+        let loaded = Project::detail_for(&path);
+        let detail = loaded.detail.expect("detail");
+        assert_eq!(detail.tempo, Some(123.0));
+        assert_eq!(detail.time_signature, Some((5, 4)));
+        assert_eq!(detail.tracks_total, 1, "the master is not a song track");
+        assert_eq!(detail.tracks_midi, 1);
+        assert_eq!(detail.clip_count, 1);
+        assert_eq!(detail.made_with(), "Auru 0.0.1");
+        assert_eq!(
+            detail.key, None,
+            "DAWproject 1.0 has no project-wide key field"
+        );
+    }
+
+    #[test]
     fn every_import_kind_should_have_its_own_action_and_prompt() {
         // Adding a DAW means adding a variant and nothing else; this catches a
         // variant that was added without being given a menu line.
@@ -2362,9 +2411,10 @@ mod tests {
     fn a_format_without_readable_detail_should_yield_none() {
         let info = ProjectInfo {
             schema: auru_pm::PROJECT_INFO_SCHEMA,
-            format: ProjectFormat::Dawproject,
+            format: ProjectFormat::Auru,
             ableton: None,
             flstudio: None,
+            dawproject: None,
         };
         assert!(ProjectDetail::from_project_info(&info).is_none());
     }

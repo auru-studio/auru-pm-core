@@ -445,19 +445,56 @@ async fn restore_from_provider(
             restore_auru(provider, &commit, &snapshot, &restore_root, &file_name).await
         }
         ProjectFormat::Dawproject => {
-            std::fs::create_dir_all(&restore_root)
-                .map_err(|error| format!("create restore folder: {error}"))?;
-            let project_file = restore_root.join(file_name);
-            snapshot
-                .restore_to_path(&project_file)
-                .map_err(|error| format!("restore project: {error}"))?;
-            Ok(RestoreResult {
-                project_file,
-                files_written: 0,
-                unavailable: 0,
-            })
+            restore_dawproject(provider, &commit, &snapshot, &restore_root, &file_name).await
         }
     }
+}
+
+async fn restore_dawproject(
+    provider: &dyn ProjectProvider,
+    commit: &auru_pm::Commit,
+    snapshot: &ProjectSnapshot,
+    restore_root: &Path,
+    file_name: &str,
+) -> Result<RestoreResult, String> {
+    let manifest_bytes = provider
+        .get_blob(&commit.tree.samples)
+        .await
+        .map_err(|error| format!("fetch DAWproject media list: {error}"))?;
+    let manifest: SampleManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| format!("read DAWproject media list: {error}"))?;
+    let embedded = auru_pm::dawproject::read_asset_refs(snapshot)
+        .map_err(|error| format!("read DAWproject media: {error}"))?
+        .into_iter()
+        .filter(|asset| asset.embedded)
+        .map(|asset| asset.path)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut fetched = BTreeMap::new();
+    for entry in manifest
+        .entries
+        .iter()
+        .filter(|entry| embedded.contains(&entry.path))
+    {
+        if let Ok(bytes) = provider.get_blob(&entry.hash).await {
+            fetched.insert(entry.path.clone(), bytes);
+        }
+    }
+    let hydrated = auru_pm::dawproject::hydrate_embedded_assets(snapshot, &fetched)
+        .map_err(|error| format!("hydrate DAWproject media: {error}"))?;
+
+    std::fs::create_dir_all(restore_root)
+        .map_err(|error| format!("create restore folder: {error}"))?;
+    let project_file = restore_root.join(file_name);
+    hydrated
+        .restore_to_path(&project_file)
+        .map_err(|error| format!("restore project: {error}"))?;
+    Ok(RestoreResult {
+        project_file,
+        files_written: fetched.len(),
+        // Version-one snapshots keep an inline fallback for every embedded
+        // entry, so a missing remote media blob does not make restore partial.
+        unavailable: 0,
+    })
 }
 
 async fn restore_auru(

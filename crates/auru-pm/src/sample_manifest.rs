@@ -153,8 +153,9 @@ impl SampleManifest {
 ///   everything referenced from outside it, gathered in.
 /// - **FL Studio** — every sample referenced by the event stream, gathered
 ///   into a `Samples/` folder for a self-contained restore.
-/// - **Anything else** — nothing. A loose `.als` has no folder to walk, and
-///   DAWproject already embeds its media inside the snapshot.
+/// - **Anything else** — nothing. A loose `.als` has no folder to walk.
+///   DAWproject's inline media has no source path, so the push coordinator
+///   decodes it directly rather than routing it through this filesystem plan.
 pub fn plan_assets(
     snapshot: &Value,
     project_root: Option<&Path>,
@@ -380,7 +381,8 @@ mod tests {
 
     #[test]
     fn plan_assets_should_stay_empty_for_dawproject() {
-        // DAWproject embeds its media inside the snapshot already.
+        // Inline bytes have no filesystem source path. The push coordinator
+        // adds them to the same manifest through dawproject's archive reader.
         let snapshot = serde_json::json!({
             "auru_pm_snapshot": 1,
             "format": "dawproject",
