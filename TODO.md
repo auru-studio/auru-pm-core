@@ -16,6 +16,10 @@ described, it was read out of a real project rather than from documentation.
   or conflict outcomes. The timer-based backup simulation is gone.
 - FL Studio commits now dispatch through `flstudio::plan_bundle_assets`; a
   regression test proves a canonical FL snapshot produces a sample manifest.
+- FL zipped-project exports can now rescue uniquely named samples unpacked
+  beside the `.flp` when their recorded Windows temp paths have expired,
+  without treating the containing folder as owned or guessing between
+  duplicate basenames.
 - Provider connections persist. PATs and OAuth tokens are stored in the OS
   keychain, and OAuth uses the real device-code progress stream.
 - Provider-scoped project handles persist in the sidecar, so moving a project
@@ -174,13 +178,15 @@ the authenticated server is intentionally owner-only for now.
 ### 3.1 FL Studio
 
 - **Mixer inserts merge coarsely.** FL delimits inserts with no cursor event —
-  in a real project the entire mixer arrives as one 56 KB blob under event 225 —
-  so `tree.rs` leaves them ungrouped rather than inventing a boundary the merge
-  would then act on. Correct but coarse: any mixer edit conflicts wholesale.
-  Needs event 225's internal layout worked out against more real projects.
+  sampled event-225 payloads range from roughly 6.9 KB in FL 25 to 56 KB in an
+  older project — so `tree.rs` leaves them ungrouped rather than inventing a
+  boundary the merge would then act on. Correct but coarse: any mixer edit
+  conflicts wholesale. Needs event 225's internal layout worked out against
+  deliberately varied mixer projects.
 - **Time signature is inferred from two events seen only as 4/4.** Events 17 and
-  18 read as numerator and denominator, but both sampled projects are in 4/4, so
-  the mapping is unconfirmed. A project in 3/4 or 6/8 would settle it.
+  18 read as numerator and denominator, but the supplied FL 25 projects also
+  store `[4]` and `[4]`, so the mapping remains unconfirmed. A project in 3/4
+  or 6/8 would settle it.
 - **No note-level or playlist diff.** Pattern contents and playlist arrangement
   are stored as opaque payloads and not compared. Deliberate for now — a diff
   reporting thousands of changed floats would bury the real change — but it means
@@ -188,10 +194,20 @@ the authenticated server is intentionally owner-only for now.
 - **Plugin binary paths are found by scanning, not parsing.** `binary_path`
   ([plugins.rs](crates/auru-pm/src/flstudio/plugins.rs)) hunts for a printable
   run ending in a known extension inside event 213. It works on both real
-  projects but is a heuristic; a plugin storing paths differently is identified
-  only by its display name.
-- **`ProjDataPath` (event 202) is ignored.** Both sampled projects leave it
-  empty. A project that uses FL's project-data folder is untested.
+  projects and the supplied FL 25 pair, including VST2 and VST3 instances, but
+  is a heuristic; a plugin storing paths differently is identified only by its
+  display name.
+- **`ProjDataPath` (event 202) is ignored.** The supplied FL 25 pair also leave
+  it empty. A project that uses FL's project-data folder is untested.
+
+**Production interoperability proof, 2026-07-29:** two FL Studio 25.2.4.5242
+projects (71 KB/5 channels and 77 MB/29 channels) round-trip byte-exactly
+through the event codec, canonical snapshot, commit path, and corpus verifier.
+Together their reports contain 30 plugin inventory entries across FL-native,
+VST2, and VST3 devices. All 17 referenced samples point at expired Windows
+Image-Line temp paths but have exact-name copies beside their `.flp`;
+path-aware planning now finds all 17. The larger project's 76 MB plugin-state
+event also survives unchanged.
 
 ### 3.2 Ableton
 
@@ -352,9 +368,10 @@ small synthetic regression instead.
   are `cargo run --example` commands a person has to run.
 
   `corpus_roundtrip` now provides a single verifier for private/local corpora,
-  and was run against both supplied Bitwig exports. CI also checks the desktop
-  workspace and the committed synthetic interchange oracle. A sanitized,
-  redistributable Live/FL corpus is still required to close this item.
+  and was run against both supplied Bitwig exports and the supplied FL 25
+  projects. CI also checks the desktop workspace and the committed synthetic
+  interchange oracle. A sanitized, redistributable Live/FL corpus is still
+  required to close this item.
 
   This remains high-value. Every serious bug found so far came
   from running a real file, and none would have been caught by a hand-written

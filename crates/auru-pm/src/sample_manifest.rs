@@ -152,7 +152,9 @@ impl SampleManifest {
 /// - **Ableton Live Set with a project folder** — the folder's contents plus
 ///   everything referenced from outside it, gathered in.
 /// - **FL Studio** — every sample referenced by the event stream, gathered
-///   into a `Samples/` folder for a self-contained restore.
+///   into a `Samples/` folder for a self-contained restore. A unique matching
+///   file beside the `.flp` can rescue a zipped-project export whose recorded
+///   temporary path has expired.
 /// - **Anything else** — nothing. A loose `.als` has no folder to walk.
 ///   DAWproject's inline media has no source path, so the push coordinator
 ///   decodes it directly rather than routing it through this filesystem plan.
@@ -168,7 +170,7 @@ pub fn plan_assets(
         };
     }
     if snapshot_format(snapshot) == Some(crate::ProjectFormat::FlStudio) {
-        return flstudio_assets_from_value(snapshot, policy);
+        return flstudio_assets_from_value(snapshot, project_root, policy);
     }
     // Native: the manifest path stays the raw clip path, which keeps existing
     // commits and their ids byte-identical.
@@ -200,7 +202,11 @@ fn snapshot_format(snapshot: &Value) -> Option<crate::ProjectFormat> {
 /// Planning remains best-effort like the Ableton path: a snapshot that cannot
 /// be reconstructed contributes no assets rather than making the project
 /// impossible to commit.
-fn flstudio_assets_from_value(snapshot: &Value, policy: &BundlePolicy) -> Vec<PlannedAsset> {
+fn flstudio_assets_from_value(
+    snapshot: &Value,
+    project_directory: Option<&Path>,
+    policy: &BundlePolicy,
+) -> Vec<PlannedAsset> {
     let source = serde_json::to_vec(snapshot)
         .ok()
         .and_then(|bytes| crate::ProjectSnapshot::from_canonical_bytes(&bytes).ok())
@@ -208,19 +214,23 @@ fn flstudio_assets_from_value(snapshot: &Value, policy: &BundlePolicy) -> Vec<Pl
     let Some(source) = source else {
         return Vec::new();
     };
-    crate::flstudio::plan_bundle_assets(&source, &policy.path_aliases)
-        .map(|plan| {
-            plan.assets
-                .into_iter()
-                .map(|asset| PlannedAsset {
-                    source: asset.source,
-                    bundle_path: asset.bundle_path,
-                    kind: asset.kind,
-                    origin: Some(asset.origin),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    crate::flstudio::plan_bundle_assets_from_directory(
+        &source,
+        project_directory,
+        &policy.path_aliases,
+    )
+    .map(|plan| {
+        plan.assets
+            .into_iter()
+            .map(|asset| PlannedAsset {
+                source: asset.source,
+                bundle_path: asset.bundle_path,
+                kind: asset.kind,
+                origin: Some(asset.origin),
+            })
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Collect the distinct sample file paths referenced by a native Auru project
@@ -262,6 +272,37 @@ pub fn sample_paths_in_snapshot(snapshot: &Value) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fl_snapshot_with_samples(paths: &[&str]) -> Value {
+        use crate::flstudio::events::{Event, Header, Stream};
+        use crate::flstudio::refs::EVENT_SAMPLE_PATH;
+        use crate::{ProjectFormat, ProjectSnapshot};
+
+        let mut events = vec![Event::new(
+            crate::flstudio::events::EVENT_VERSION,
+            b"25.2.4.5242\0".to_vec(),
+        )];
+        for path in paths {
+            let mut encoded_path = Vec::new();
+            for unit in path.encode_utf16() {
+                encoded_path.extend_from_slice(&unit.to_le_bytes());
+            }
+            encoded_path.extend_from_slice(&[0, 0]);
+            events.push(Event::new(EVENT_SAMPLE_PATH, encoded_path));
+        }
+        let source = Stream {
+            header: Header {
+                format: 0,
+                channels: 1,
+                ppq: 96,
+            },
+            events,
+        }
+        .encode();
+        let snapshot = ProjectSnapshot::from_source_bytes(ProjectFormat::FlStudio, &source)
+            .expect("normalize FL project");
+        serde_json::from_slice(snapshot.as_bytes()).expect("snapshot JSON")
+    }
 
     fn entry(path: &str, bytes: &[u8]) -> SampleEntry {
         SampleEntry {
@@ -444,6 +485,37 @@ mod tests {
         assert_eq!(
             planned[0].origin.as_deref(),
             Some(sample.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn an_fl_backup_should_rescue_a_unique_sample_beside_the_project() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sibling = temp.path().join("Basic 808 Kick.wav");
+        std::fs::write(&sibling, b"audio").expect("write sibling sample");
+        let recorded = r"C:\Users\one\AppData\Local\Temp\Image-Line\{GUID}\Basic 808 Kick.wav";
+        let snapshot = fl_snapshot_with_samples(&[recorded]);
+
+        let planned = plan_assets(&snapshot, Some(temp.path()), &BundlePolicy::default());
+
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].source, sibling);
+        assert_eq!(planned[0].bundle_path, "Samples/Basic 808 Kick.wav");
+        assert_eq!(planned[0].origin.as_deref(), Some(recorded));
+    }
+
+    #[test]
+    fn an_fl_backup_should_not_guess_between_duplicate_sibling_names() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("Kick.wav"), b"audio").expect("write sibling sample");
+        let snapshot =
+            fl_snapshot_with_samples(&[r"D:\Pack One\Kick.wav", r"E:\Pack Two\Kick.wav"]);
+
+        let planned = plan_assets(&snapshot, Some(temp.path()), &BundlePolicy::default());
+
+        assert!(
+            planned.is_empty(),
+            "one sibling file cannot safely stand in for two different samples"
         );
     }
 

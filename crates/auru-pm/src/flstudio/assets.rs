@@ -1,8 +1,10 @@
 //! Deciding which of a project's files to capture, and where they land.
 //!
-//! An FL project has no folder of its own, so there is nowhere a sample could
-//! already be "inside". Every file a project depends on is somewhere else on
-//! the machine, and capturing it is the only way it survives a move.
+//! An `.flp` does not own its containing folder, so planning must never sweep
+//! that folder like an Ableton bundle. FL's zipped-project export does unpack
+//! referenced samples beside the project, though. A unique exact-basename
+//! match there is therefore a safe fallback when the recorded temp path has
+//! expired; ambiguous names remain unresolved rather than guessed.
 //!
 //! Nothing here writes anything. Planning is deliberately separate from doing:
 //! a plan can be shown to someone — *this is what will be uploaded, this is
@@ -10,8 +12,8 @@
 //! the same promise the watch-folder screen makes, and it only holds if
 //! working out the cost does not have side effects.
 
-use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use crate::ableton::PathAlias;
 use crate::sample_manifest::AssetKind;
@@ -84,10 +86,27 @@ impl AssetPlan {
 /// `aliases` translate paths written on another machine — a project saved on
 /// Windows referring to `D:\Packs` resolves against a drive mounted here.
 pub fn plan(refs: &[AssetRef], aliases: &[PathAlias]) -> AssetPlan {
+    plan_from_directory(refs, None, aliases)
+}
+
+/// Plan assets with the directory containing the `.flp` available as a
+/// conservative fallback for self-contained exports.
+pub fn plan_from_directory(
+    refs: &[AssetRef],
+    project_directory: Option<&Path>,
+    aliases: &[PathAlias],
+) -> AssetPlan {
     let mut plan = AssetPlan::default();
     let mut taken: BTreeSet<String> = BTreeSet::new();
+    let references = refs::distinct(refs);
+    let mut sibling_name_counts = BTreeMap::new();
+    for reference in &references {
+        *sibling_name_counts
+            .entry(reference.file_name().to_ascii_lowercase())
+            .or_insert(0_usize) += 1;
+    }
 
-    for reference in refs::distinct(refs) {
+    for reference in references {
         if !reference.class.should_vendor() {
             if reference.class == RefClass::Missing {
                 plan.unresolved.push(UnresolvedAsset {
@@ -99,28 +118,42 @@ pub fn plan(refs: &[AssetRef], aliases: &[PathAlias]) -> AssetPlan {
             continue;
         }
 
-        let Some(source) = reference.local_path(aliases) else {
-            plan.unresolved.push(UnresolvedAsset {
-                recorded_path: reference.recorded_path.clone(),
-                class: reference.class,
-                reason: "this path is on another machine; set a path alias to find it".to_owned(),
-            });
-            continue;
-        };
-        if !source.is_file() {
+        let recorded_source = reference.local_path(aliases);
+        let sibling_name_is_unique =
+            sibling_name_counts.get(&reference.file_name().to_ascii_lowercase()) == Some(&1);
+        let sibling_candidate =
+            project_directory.map(|directory| directory.join(reference.file_name()));
+        let ambiguous_sibling = !sibling_name_is_unique
+            && sibling_candidate
+                .as_ref()
+                .is_some_and(|candidate| candidate.is_file());
+        let sibling_source = sibling_candidate
+            .filter(|_| sibling_name_is_unique)
+            .filter(|candidate| candidate.is_file());
+        let source = recorded_source
+            .as_ref()
+            .filter(|candidate| candidate.is_file())
+            .cloned()
+            .or(sibling_source);
+        let Some(source) = source else {
             plan.unresolved.push(UnresolvedAsset {
                 recorded_path: reference.recorded_path.clone(),
                 class: reference.class,
                 // The honest phrasing for a fragile ref: it is not that we
                 // cannot find it, it is that it is already gone.
-                reason: if reference.class == RefClass::Fragile {
+                reason: if ambiguous_sibling {
+                    "a file with this name is beside the project, but more than one reference shares the name"
+                        .to_owned()
+                } else if reference.class == RefClass::Fragile {
                     "this was in temporary space and has already been deleted".to_owned()
+                } else if recorded_source.is_none() {
+                    "this path is on another machine; set a path alias to find it".to_owned()
                 } else {
                     "no file at this path on this machine".to_owned()
                 },
             });
             continue;
-        }
+        };
 
         let bundle_path = unique_destination(reference.file_name(), &mut taken);
         plan.assets.push(PlannedAsset {

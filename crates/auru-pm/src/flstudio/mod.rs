@@ -3,18 +3,18 @@
 //! The counterpart to [`crate::ableton`], for a format that shares none of its
 //! assumptions. Where a Live Set is compressed XML inside a project folder, an
 //! FL project is a single `.flp` file holding a binary event stream, and it
-//! has no folder at all — the files sampled during design sat loose among
-//! unrelated downloads.
+//! does not own its containing folder — projects sampled during design sat
+//! loose among unrelated downloads, while zipped-project exports unpacked
+//! referenced samples beside the `.flp`.
 //!
 //! Two consequences shape everything here:
 //!
 //! - **The commit unit is the file, not its folder.** Treating the containing
 //!   directory as the project would sweep in whatever else happens to live
-//!   beside it. Assets are read where they are and only ever materialised
-//!   beside the project on *restore*; a backup never reorganises anyone's
-//!   files.
+//!   beside it. The only sibling read is a unique exact-basename fallback for
+//!   an asset the project already references; backup never reorganises files.
 //! - **The event stream round-trips byte for byte.** Verified against real
-//!   projects from FL 12 and FL 20. That is a stronger guarantee than the
+//!   projects from FL 12, FL 20, and FL 25. That is a stronger guarantee than the
 //!   Ableton path offers, and it is worth keeping — see [`events`].
 //!
 //! Reading is separated from rewriting, as in [`crate::ableton`], so a failure
@@ -41,6 +41,24 @@ pub fn plan_bundle_assets(
     aliases: &[crate::ableton::PathAlias],
 ) -> Result<AssetPlan> {
     Ok(assets::plan(&read_asset_refs(source)?, aliases))
+}
+
+/// Work out what a backup captures when the directory containing the `.flp`
+/// is known.
+///
+/// The directory is not treated as owned by the project. It is used only to
+/// recover a referenced file with the exact same basename, as produced by
+/// FL's zipped-project export.
+pub fn plan_bundle_assets_from_directory(
+    source: &[u8],
+    project_directory: Option<&std::path::Path>,
+    aliases: &[crate::ableton::PathAlias],
+) -> Result<AssetPlan> {
+    Ok(assets::plan_from_directory(
+        &read_asset_refs(source)?,
+        project_directory,
+        aliases,
+    ))
 }
 
 /// Read project detail from a `.flp`.

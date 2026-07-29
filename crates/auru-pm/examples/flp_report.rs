@@ -5,6 +5,7 @@
 //! ```
 
 use auru_pm::flstudio;
+use std::path::Path;
 
 fn main() {
     let paths: Vec<String> = std::env::args().skip(1).collect();
@@ -61,11 +62,21 @@ fn main() {
         }
 
         let assets = &meta.assets;
+        let plan =
+            flstudio::plan_bundle_assets_from_directory(&source, Path::new(path).parent(), &[])
+                .expect("metadata already proved the event stream is readable");
         println!(
-            "\n  assets   {} distinct file(s) · {} would be captured",
+            "\n  assets   {} distinct file(s) · {} need capture · {} found now",
             assets.total,
-            assets.vendored()
+            assets.vendored(),
+            plan.assets.len(),
         );
+        if !plan.unresolved.is_empty() {
+            println!(
+                "    {:>4}  unresolved and omitted from a backup",
+                plan.unresolved.len()
+            );
+        }
         for (label, count) in [
             ("in the project folder", assets.project_relative),
             ("elsewhere on this machine", assets.external),
