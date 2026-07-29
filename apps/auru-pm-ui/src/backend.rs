@@ -11,10 +11,11 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use auru_pm::{
-    AuthorIdentity, CommitId, CommitSummary, ContentHash, FilesystemProvider, HistoryRange,
-    HttpProvider, ProjectFormat, ProjectProfile, ProjectProvider, ProjectSnapshot, PushOutcome,
-    RetentionReport, RetentionRoots, RetentionRule, SampleManifest, Sidecar, fetch_project_info,
-    flstudio, push_with_freshness_check, sidecar_path_for, verify_commit_copy,
+    AuthorIdentity, BundlePolicy, CommitId, CommitSummary, ConflictChoice, ConflictResolution,
+    ConflictedField, ContentHash, FilesystemProvider, HistoryRange, HttpProvider, ProjectFormat,
+    ProjectProfile, ProjectProvider, ProjectSnapshot, PushOptions, PushOutcome, RetentionReport,
+    RetentionRoots, RetentionRule, SampleManifest, Sidecar, fetch_project_info, flstudio,
+    push_with_options, sidecar_path_for, verify_commit_copy,
 };
 use auru_pm_client::ProviderAccount;
 
@@ -24,7 +25,7 @@ use crate::model::RemoteProjectSeed;
 #[derive(Debug)]
 pub enum BackupResult {
     Committed(BackupReceipt),
-    NeedsResolution(usize),
+    NeedsResolution(Box<ConflictBackup>),
     NeedsReview(usize),
 }
 
@@ -40,11 +41,28 @@ pub struct BackupReceipt {
 ///
 /// Preparation is deliberately separate from publication so the UI can
 /// durably record the exact file revision before the coordinator commits it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PreparedBackup {
     project_path: PathBuf,
     snapshot: ProjectSnapshot,
     source_revision: Option<SystemTime>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConflictBackup {
+    conflicts: Vec<ConflictedField>,
+    listing: ProviderListing,
+    prepared: PreparedBackup,
+    display_name: String,
+    retention_rule: Option<RetentionRule>,
+    verify_uploads: bool,
+    bundle_policy: BundlePolicy,
+}
+
+impl ConflictBackup {
+    pub fn conflicts(&self) -> &[ConflictedField] {
+        &self.conflicts
+    }
 }
 
 impl PreparedBackup {
@@ -90,11 +108,32 @@ pub fn back_up_prepared(
     display_name: String,
     retention_rule: Option<RetentionRule>,
     verify_uploads: bool,
+    bundle_policy: BundlePolicy,
+) -> Result<BackupResult, String> {
+    back_up_prepared_with_resolutions(
+        listing,
+        prepared,
+        display_name,
+        retention_rule,
+        verify_uploads,
+        bundle_policy,
+        None,
+    )
+}
+
+fn back_up_prepared_with_resolutions(
+    listing: ProviderListing,
+    prepared: PreparedBackup,
+    display_name: String,
+    retention_rule: Option<RetentionRule>,
+    verify_uploads: bool,
+    bundle_policy: BundlePolicy,
+    conflict_resolutions: Option<Vec<ConflictResolution>>,
 ) -> Result<BackupResult, String> {
     let PreparedBackup {
         project_path,
         snapshot,
-        ..
+        source_revision,
     } = prepared;
     runtime()?.block_on(async move {
         let provider = open_provider(&listing, &project_path).await?;
@@ -117,7 +156,7 @@ pub fn back_up_prepared(
             display_name: if display_name.trim().is_empty() {
                 "Local user".to_owned()
             } else {
-                display_name
+                display_name.clone()
             },
             provider_user_id: "local-user".to_owned(),
             provider_id: provider_id.clone(),
@@ -125,7 +164,10 @@ pub fn back_up_prepared(
         };
 
         let sidecar_path = sidecar_path_for(&project_path);
-        let outcome = push_with_freshness_check(
+        let mut push_options = PushOptions::for_snapshot(&snapshot);
+        push_options.bundle_policy = bundle_policy.clone();
+        push_options.conflict_resolutions = conflict_resolutions;
+        let outcome = push_with_options(
             provider.as_ref(),
             &provider_id,
             &[],
@@ -134,6 +176,7 @@ pub fn back_up_prepared(
             author,
             "Backed up changes",
             "",
+            &push_options,
         )
         .await?;
 
@@ -165,12 +208,14 @@ pub fn back_up_prepared(
                             )),
                         ),
                         Ok(sidecar) => {
+                            let mut protected_blobs = Vec::new();
+                            if let Some(stash) = sidecar.stash {
+                                protected_blobs.push(stash.snapshot);
+                                protected_blobs.extend(stash.resources.into_values());
+                            }
                             let protected = RetentionRoots {
                                 commits: sidecar.pending_pushes,
-                                blobs: sidecar
-                                    .stash
-                                    .map(|stash| vec![stash.snapshot])
-                                    .unwrap_or_default(),
+                                blobs: protected_blobs,
                             };
                             match provider.prune_history(rule, &protected).await {
                                 Ok(report) => (Some(report), None),
@@ -199,11 +244,52 @@ pub fn back_up_prepared(
                 })
             }
             PushOutcome::NeedsResolution { conflicts, .. } => {
-                BackupResult::NeedsResolution(conflicts.len())
+                BackupResult::NeedsResolution(Box::new(ConflictBackup {
+                    conflicts,
+                    listing,
+                    prepared: PreparedBackup {
+                        project_path,
+                        snapshot,
+                        source_revision,
+                    },
+                    display_name,
+                    retention_rule,
+                    verify_uploads,
+                    bundle_policy,
+                }))
             }
             PushOutcome::NeedsReview { problems, .. } => BackupResult::NeedsReview(problems.len()),
         })
     })
+}
+
+pub fn resolve_backup(
+    conflict: &ConflictBackup,
+    choices: Vec<ConflictChoice>,
+) -> Result<BackupResult, String> {
+    if choices.len() != conflict.conflicts.len() {
+        return Err(format!(
+            "expected {} conflict choice(s), received {}",
+            conflict.conflicts.len(),
+            choices.len()
+        ));
+    }
+    let resolutions = conflict
+        .conflicts
+        .iter()
+        .cloned()
+        .zip(choices)
+        .map(|(conflict, choice)| ConflictResolution { conflict, choice })
+        .collect();
+    back_up_prepared_with_resolutions(
+        conflict.listing.clone(),
+        conflict.prepared.clone(),
+        conflict.display_name.clone(),
+        conflict.retention_rule,
+        conflict.verify_uploads,
+        conflict.bundle_policy.clone(),
+        Some(resolutions),
+    )
 }
 
 #[cfg(test)]
@@ -221,6 +307,7 @@ fn back_up(
         display_name,
         retention_rule,
         verify_uploads,
+        BundlePolicy::default(),
     )
 }
 
@@ -583,17 +670,17 @@ async fn restore_dawproject(
         .map_err(|error| format!("fetch DAWproject media list: {error}"))?;
     let manifest: SampleManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| format!("read DAWproject media list: {error}"))?;
-    let embedded = auru_pm::dawproject::read_asset_refs(snapshot)
-        .map_err(|error| format!("read DAWproject media: {error}"))?
+    let resource_paths = auru_pm::dawproject::archive_resource_paths(snapshot)
+        .map_err(|error| format!("read DAWproject resources: {error}"))?
         .into_iter()
-        .filter(|asset| asset.embedded)
-        .map(|asset| asset.path)
         .collect::<std::collections::BTreeSet<_>>();
+    let requires_hydration = auru_pm::dawproject::requires_resource_hydration(snapshot)
+        .map_err(|error| format!("read DAWproject resource storage: {error}"))?;
     let mut fetched = BTreeMap::new();
     for entry in manifest
         .entries
         .iter()
-        .filter(|entry| embedded.contains(&entry.path))
+        .filter(|entry| resource_paths.contains(&entry.path))
     {
         if let Ok(bytes) = provider.get_blob(&entry.hash).await {
             fetched.insert(entry.path.clone(), bytes);
@@ -611,9 +698,11 @@ async fn restore_dawproject(
     Ok(RestoreResult {
         project_file,
         files_written: fetched.len(),
-        // Version-one snapshots keep an inline fallback for every embedded
-        // entry, so a missing remote media blob does not make restore partial.
-        unavailable: 0,
+        unavailable: if requires_hydration {
+            resource_paths.len().saturating_sub(fetched.len())
+        } else {
+            0
+        },
     })
 }
 
@@ -1027,12 +1116,65 @@ mod tests {
             "Jake".to_owned(),
             None,
             false,
+            BundlePolicy::default(),
         )
         .expect("commit the already prepared revision") else {
             panic!("prepared backup should commit");
         };
 
         assert!(!receipt.history.is_empty());
+    }
+
+    #[test]
+    fn a_conflicted_backup_should_resume_with_one_choice_per_field() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let destination = temp.path().join("Backups");
+        let listing = local_listing(&destination);
+        let local = temp.path().join("Local.auru");
+        let remote = temp.path().join("Remote.auru");
+        let project = |tempo| {
+            serde_json::to_vec(&serde_json::json!({
+                "version": 8,
+                "tempo": tempo,
+                "channels": []
+            }))
+            .expect("project")
+        };
+        std::fs::write(&local, project(120)).expect("local project");
+        let BackupResult::Committed(_) = back_up(
+            listing.clone(),
+            local.clone(),
+            "Local".to_owned(),
+            None,
+            false,
+        )
+        .expect("initial backup") else {
+            panic!("initial backup should commit");
+        };
+        std::fs::copy(&local, &remote).expect("remote working copy");
+        std::fs::copy(sidecar_path_for(&local), sidecar_path_for(&remote)).expect("remote sidecar");
+
+        std::fs::write(&remote, project(140)).expect("remote edit");
+        let BackupResult::Committed(_) =
+            back_up(listing.clone(), remote, "Remote".to_owned(), None, false)
+                .expect("remote backup")
+        else {
+            panic!("remote backup should commit");
+        };
+        std::fs::write(&local, project(128)).expect("local edit");
+        let BackupResult::NeedsResolution(conflict) =
+            back_up(listing, local, "Local".to_owned(), None, false).expect("conflicted backup")
+        else {
+            panic!("divergent tempo edits should conflict");
+        };
+        assert_eq!(conflict.conflicts().len(), 1);
+
+        let BackupResult::Committed(_) =
+            resolve_backup(&conflict, vec![auru_pm::ConflictChoice::Remote])
+                .expect("resolved backup")
+        else {
+            panic!("a complete set of choices should commit");
+        };
     }
 
     #[test]

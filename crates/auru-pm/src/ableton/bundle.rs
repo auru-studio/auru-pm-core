@@ -216,10 +216,30 @@ impl AbletonBundle {
     }
 
     fn from_root(root: &Path) -> Result<Option<Self>> {
-        if !looks_like_project_root(root) {
+        let entries = fs::read_dir(root)?
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        Self::from_root_entries(root, &entries)
+    }
+
+    pub(crate) fn from_root_entries(root: &Path, entries: &[PathBuf]) -> Result<Option<Self>> {
+        let has_project_info = entries.iter().any(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == PROJECT_INFO_DIR)
+                && path.is_dir()
+        });
+        let mut live_sets = entries
+            .iter()
+            .filter(|path| path.is_file() && is_live_set(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        live_sets.sort();
+        if !has_project_info && live_sets.len() != 1 {
             return Ok(None);
         }
-        let live_set = choose_live_set(root)?;
+        let live_set = choose_live_set_from(root, live_sets)?;
         Ok(Some(Self {
             root: root.to_path_buf(),
             live_set,
@@ -368,6 +388,13 @@ pub struct ScanOptions {
     pub max_depth: usize,
     /// Stop after this many projects, so a pathological tree still returns.
     pub max_projects: usize,
+    /// Stop after visiting this many directories, including the chosen root.
+    pub max_directories: usize,
+    /// Directory names to prune below the chosen root.
+    ///
+    /// The defaults cover conventional sample-pack folders. Choosing one of
+    /// those folders directly still scans it; only children are pruned.
+    pub excluded_directory_names: Vec<String>,
 }
 
 impl Default for ScanOptions {
@@ -375,6 +402,12 @@ impl Default for ScanOptions {
         Self {
             max_depth: 4,
             max_projects: 5_000,
+            max_directories: 25_000,
+            excluded_directory_names: vec![
+                "Packs".to_owned(),
+                "Sample Packs".to_owned(),
+                "Samples".to_owned(),
+            ],
         }
     }
 }
@@ -396,21 +429,39 @@ impl Default for ScanOptions {
 ///   including into a cycle.
 pub fn scan_for_projects(root: &Path, options: &ScanOptions) -> Vec<AbletonBundle> {
     let mut found = Vec::new();
-    scan_into(root, 0, options, &mut found);
+    let mut visited_directories = 0;
+    scan_into(root, 0, options, &mut visited_directories, &mut found);
     found.sort_by(|left, right| left.root.cmp(&right.root));
     found
 }
 
-fn scan_into(dir: &Path, depth: usize, options: &ScanOptions, found: &mut Vec<AbletonBundle>) {
-    if found.len() >= options.max_projects {
+fn scan_into(
+    dir: &Path,
+    depth: usize,
+    options: &ScanOptions,
+    visited_directories: &mut usize,
+    found: &mut Vec<AbletonBundle>,
+) {
+    if found.len() >= options.max_projects || *visited_directories >= options.max_directories {
         return;
     }
+    *visited_directories += 1;
 
-    // A project is a leaf: whatever is inside belongs to it.
-    if looks_like_project_root(dir) {
-        if let Ok(Some(bundle)) = AbletonBundle::from_root(dir) {
-            found.push(bundle);
-        }
+    let Ok(entries) = fs::read_dir(dir) else {
+        // An unreadable folder is skipped rather than failing the scan — a
+        // music drive routinely contains something the user cannot read.
+        return;
+    };
+    let entries = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+
+    // A project is a leaf: whatever is inside belongs to it. Reuse the
+    // directory entries already read for traversal instead of opening every
+    // directory a second time just to detect Ableton.
+    if let Ok(Some(bundle)) = AbletonBundle::from_root_entries(dir, &entries) {
+        found.push(bundle);
         return;
     }
 
@@ -418,29 +469,22 @@ fn scan_into(dir: &Path, depth: usize, options: &ScanOptions, found: &mut Vec<Ab
         return;
     }
 
-    let Ok(entries) = fs::read_dir(dir) else {
-        // An unreadable folder is skipped rather than failing the scan — a
-        // music drive routinely contains something the user cannot read.
-        return;
-    };
-
     let mut children: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| is_scannable_directory(path))
+        .into_iter()
+        .filter(|path| is_scannable_directory(path, options))
         .collect();
     children.sort();
 
     for child in children {
-        scan_into(&child, depth + 1, options, found);
-        if found.len() >= options.max_projects {
+        scan_into(&child, depth + 1, options, visited_directories, found);
+        if found.len() >= options.max_projects || *visited_directories >= options.max_directories {
             return;
         }
     }
 }
 
 /// Whether the scan should look inside `path`.
-fn is_scannable_directory(path: &Path) -> bool {
+fn is_scannable_directory(path: &Path, options: &ScanOptions) -> bool {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return false;
     };
@@ -452,7 +496,12 @@ fn is_scannable_directory(path: &Path) -> bool {
     };
     // `Backup` holds a project's own autosaves; treating it as a project
     // would double-count every project that has one.
-    !name.starts_with('.') && !name.eq_ignore_ascii_case(BACKUP_DIR)
+    !name.starts_with('.')
+        && !name.eq_ignore_ascii_case(BACKUP_DIR)
+        && !options
+            .excluded_directory_names
+            .iter()
+            .any(|excluded| name.eq_ignore_ascii_case(excluded))
 }
 
 fn looks_like_project_root(dir: &Path) -> bool {
@@ -504,8 +553,7 @@ fn top_level_live_sets(dir: &Path) -> Result<Vec<PathBuf>> {
 /// or `dunno yet-1 Project` when disambiguated), so the set whose stem is a
 /// prefix of the folder name is the right one. Autosaves live in `Backup/` and
 /// are never top-level, so they cannot be picked by accident.
-fn choose_live_set(root: &Path) -> Result<PathBuf> {
-    let sets = top_level_live_sets(root)?;
+fn choose_live_set_from(root: &Path, sets: Vec<PathBuf>) -> Result<PathBuf> {
     match sets.len() {
         0 => Err(Error::ProjectFormat(format!(
             "'{}' contains no Ableton Live Set",

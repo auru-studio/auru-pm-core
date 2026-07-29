@@ -9,7 +9,7 @@ The repository is usable without Auru. The DAW remains closed source, while this
 - `crates/auru-pm` contains snapshots, commits, diffs, merges, the local store, and provider traits.
 - `crates/auru-pm-protocol` names the wire version and shared HTTP payloads.
 - `crates/auru-pm-client` is the client-facing entry point. It currently re-exports the HTTP provider from the core crate so downstream code has a stable dependency before that implementation moves.
-- `crates/auru-pm-server` runs the development HTTP server. It stores data in memory for now, so restarting it clears every blob and commit.
+- `crates/auru-pm-server` runs the persistent reference HTTP server.
 - `apps/auru-pm-ui` is the GPUI desktop client. It remains a standalone nested Cargo workspace until `gpui-audio-components` has its first public revision.
 
 Native `.auru` compatibility tests stay in the private Auru repository because they depend on its project model. Public tests use DAWproject, Ableton Live Set, and protocol fixtures.
@@ -25,13 +25,18 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Run the temporary in-memory server on port 4242:
+Run the reference server on port 4242:
 
 ```sh
-cargo run -p auru-pm-server -- --port 4242
+cargo run -p auru-pm-server -- \
+  --port 4242 \
+  --data-dir ./auru-pm-server-data \
+  --requests-per-minute 600
 ```
 
-The server has no authentication and doesn't write to disk yet. Don't expose it to the internet.
+The server persists project state and content-addressed blobs and applies a
+per-client request limit. It still deliberately advertises
+`auth_methods: ["none"]`; don't expose it to an untrusted network.
 
 ## License
 

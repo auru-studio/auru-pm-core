@@ -18,6 +18,7 @@ use std::fmt;
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use flate2::Compression;
@@ -29,8 +30,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
+use crate::hash::ContentHash;
 
-const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+const MIN_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const MAX_XML_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 100_000;
 const MAX_ARCHIVE_ENTRY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -118,9 +121,10 @@ impl fmt::Display for ProjectFormat {
 
 /// A project normalized into canonical JSON bytes for the PM snapshot CAS.
 ///
-/// Use [`Self::load`] for a project on disk, pass [`Self::as_bytes`] to the
-/// existing push APIs, and use [`Self::restore_to_path`] when checking out an
-/// old version.
+/// Use [`Self::load`] for a project on disk, pass [`Self::as_bytes`] to a push
+/// API, and construct [`crate::PushOptions`] with
+/// [`crate::PushOptions::for_snapshot`] so detached DAWproject resources travel
+/// with it. Use [`Self::restore_to_path`] when checking out an old version.
 ///
 /// ```
 /// use auru_pm::{ProjectFormat, ProjectSnapshot};
@@ -133,10 +137,22 @@ impl fmt::Display for ProjectFormat {
 /// assert!(snapshot.as_bytes().starts_with(b"{"));
 /// # Ok::<(), auru_pm::Error>(())
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ProjectSnapshot {
     format: ProjectFormat,
     canonical_bytes: Vec<u8>,
+    detached_resources: Arc<BTreeMap<String, Vec<u8>>>,
+}
+
+impl fmt::Debug for ProjectSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProjectSnapshot")
+            .field("format", &self.format)
+            .field("canonical_bytes", &self.canonical_bytes.len())
+            .field("detached_resources", &self.detached_resources.len())
+            .finish()
+    }
 }
 
 impl ProjectSnapshot {
@@ -149,15 +165,16 @@ impl ProjectSnapshot {
 
     /// Normalize source project bytes of a known format.
     pub fn from_source_bytes(format: ProjectFormat, source: &[u8]) -> Result<Self> {
-        let value = match format {
-            ProjectFormat::Auru => parse_auru(source)?,
+        let (value, detached_resources) = match format {
+            ProjectFormat::Auru => (parse_auru(source)?, BTreeMap::new()),
             ProjectFormat::Dawproject => encode_dawproject(source)?,
-            ProjectFormat::AbletonLiveSet => encode_ableton(source)?,
-            ProjectFormat::FlStudio => encode_flstudio(source)?,
+            ProjectFormat::AbletonLiveSet => (encode_ableton(source)?, BTreeMap::new()),
+            ProjectFormat::FlStudio => (encode_flstudio(source)?, BTreeMap::new()),
         };
         Ok(Self {
             format,
             canonical_bytes: canonical_json(value)?,
+            detached_resources: Arc::new(detached_resources),
         })
     }
 
@@ -165,6 +182,9 @@ impl ProjectSnapshot {
     ///
     /// Native Auru JSON has no wrapper and is recognized as Auru. External
     /// snapshots carry an `auru_pm_snapshot` marker and their source format.
+    /// A provider-fetched DAWproject v2 snapshot contains descriptors rather
+    /// than archive-resource bytes; hydrate it with
+    /// [`crate::dawproject::hydrate_embedded_assets`] before restoring.
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self> {
         let value: Value = serde_json::from_slice(bytes)?;
         let format = portable_snapshot_format(&value)?.unwrap_or(ProjectFormat::Auru);
@@ -175,6 +195,7 @@ impl ProjectSnapshot {
         Ok(Self {
             format,
             canonical_bytes: canonical_json(value)?,
+            detached_resources: Arc::new(BTreeMap::new()),
         })
     }
 
@@ -184,13 +205,25 @@ impl ProjectSnapshot {
     }
 
     /// Canonical JSON stored as the commit's snapshot blob.
+    ///
+    /// DAWproject v2 resources are deliberately not part of these bytes. Use
+    /// [`crate::PushOptions::for_snapshot`] while this snapshot still owns its
+    /// detached resource handle.
     pub fn as_bytes(&self) -> &[u8] {
         &self.canonical_bytes
     }
 
     /// Consume the snapshot and return its canonical JSON bytes.
+    ///
+    /// This discards any detached DAWproject v2 resource handle. Construct
+    /// [`crate::PushOptions`] first when the bytes will be pushed, or keep the
+    /// `ProjectSnapshot` when they will be restored locally.
     pub fn into_bytes(self) -> Vec<u8> {
         self.canonical_bytes
+    }
+
+    pub(crate) fn detached_resources_handle(&self) -> Arc<BTreeMap<String, Vec<u8>>> {
+        Arc::clone(&self.detached_resources)
     }
 
     /// Deserialize the external-format wrapper backing this snapshot.
@@ -220,17 +253,36 @@ impl ProjectSnapshot {
         Ok(Self {
             format,
             canonical_bytes: canonical_json(value)?,
+            detached_resources: Arc::new(BTreeMap::new()),
+        })
+    }
+
+    pub(crate) fn from_portable_with_resources(
+        portable: PortableSnapshot,
+        detached_resources: BTreeMap<String, Vec<u8>>,
+    ) -> Result<Self> {
+        portable.validate()?;
+        let format = portable.format;
+        let value = serde_json::to_value(portable)?;
+        Ok(Self {
+            format,
+            canonical_bytes: canonical_json(value)?,
+            detached_resources: Arc::new(detached_resources),
         })
     }
 
     /// Reconstruct source project bytes from this canonical snapshot.
+    ///
+    /// A DAWproject loaded from disk already owns its resource bytes. One
+    /// reconstructed from provider canonical bytes must first be hydrated with
+    /// [`crate::dawproject::hydrate_embedded_assets`].
     pub fn restore_bytes(&self) -> Result<Vec<u8>> {
         match self.format {
             ProjectFormat::Auru => Ok(self.canonical_bytes.clone()),
             ProjectFormat::Dawproject => {
                 let snapshot: PortableSnapshot = serde_json::from_slice(&self.canonical_bytes)?;
                 snapshot.validate()?;
-                decode_dawproject(&snapshot)
+                decode_dawproject(&snapshot, &self.detached_resources)
             }
             ProjectFormat::AbletonLiveSet => {
                 let snapshot: PortableSnapshot = serde_json::from_slice(&self.canonical_bytes)?;
@@ -268,6 +320,11 @@ pub fn snapshot_project(path: &Path) -> Result<ProjectSnapshot> {
 }
 
 /// Reconstruct a project file from canonical PM snapshot JSON.
+///
+/// This byte-only convenience cannot restore a detached DAWproject v2
+/// snapshot fetched from a provider. Fetch its manifest resources, hydrate a
+/// [`ProjectSnapshot`] with [`crate::dawproject::hydrate_embedded_assets`], and
+/// call [`ProjectSnapshot::restore_to_path`] instead.
 pub fn restore_project(snapshot_bytes: &[u8], path: &Path) -> Result<ProjectFormat> {
     let snapshot = ProjectSnapshot::from_canonical_bytes(snapshot_bytes)?;
     snapshot.restore_to_path(path)?;
@@ -292,10 +349,11 @@ pub(crate) struct PortableSnapshot {
 
 impl PortableSnapshot {
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.auru_pm_snapshot != SNAPSHOT_SCHEMA_VERSION {
+        if !(MIN_SNAPSHOT_SCHEMA_VERSION..=SNAPSHOT_SCHEMA_VERSION).contains(&self.auru_pm_snapshot)
+        {
             return Err(Error::ProjectFormat(format!(
-                "unsupported external snapshot schema {}; expected {}",
-                self.auru_pm_snapshot, SNAPSHOT_SCHEMA_VERSION
+                "unsupported external snapshot schema {}; expected {} or {}",
+                self.auru_pm_snapshot, MIN_SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_SCHEMA_VERSION
             )));
         }
         if self.format == ProjectFormat::Auru {
@@ -316,6 +374,29 @@ impl PortableSnapshot {
                     resource.id
                 )));
             }
+            match self.auru_pm_snapshot {
+                1 if resource.data.is_none() => {
+                    return Err(Error::ProjectFormat(format!(
+                        "version-one DAWproject resource '{}' is missing inline data",
+                        resource.id
+                    )));
+                }
+                2 => {
+                    if resource.hash.is_none() || resource.size.is_none() {
+                        return Err(Error::ProjectFormat(format!(
+                            "version-two DAWproject resource '{}' is missing its hash or size",
+                            resource.id
+                        )));
+                    }
+                    if resource.data.is_some() {
+                        return Err(Error::ProjectFormat(format!(
+                            "version-two DAWproject resource '{}' must not contain inline data",
+                            resource.id
+                        )));
+                    }
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -325,7 +406,12 @@ impl PortableSnapshot {
 pub(crate) struct ArchiveResource {
     /// Archive path doubles as the stable array identity for three-way merge.
     pub(crate) id: String,
-    pub(crate) data: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) data: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) hash: Option<ContentHash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) size: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -676,7 +762,7 @@ fn encode_ableton(source: &[u8]) -> Result<Value> {
         source.to_vec()
     };
     let snapshot = PortableSnapshot {
-        auru_pm_snapshot: SNAPSHOT_SCHEMA_VERSION,
+        auru_pm_snapshot: MIN_SNAPSHOT_SCHEMA_VERSION,
         format: ProjectFormat::AbletonLiveSet,
         project: XmlDocument::parse(&xml, "Ableton Live Set")?,
         metadata: None,
@@ -709,7 +795,7 @@ fn encode_flstudio(source: &[u8]) -> Result<Value> {
     crate::flstudio::redact(&mut stream);
 
     let snapshot = PortableSnapshot {
-        auru_pm_snapshot: SNAPSHOT_SCHEMA_VERSION,
+        auru_pm_snapshot: MIN_SNAPSHOT_SCHEMA_VERSION,
         format: ProjectFormat::FlStudio,
         project: crate::flstudio::tree::to_document(&stream),
         metadata: None,
@@ -728,7 +814,7 @@ fn decode_flstudio(snapshot: &PortableSnapshot) -> Result<Vec<u8>> {
     crate::flstudio::from_tree(&snapshot.project)
 }
 
-fn encode_dawproject(source: &[u8]) -> Result<Value> {
+fn encode_dawproject(source: &[u8]) -> Result<(Value, BTreeMap<String, Vec<u8>>)> {
     let reader = Cursor::new(source);
     let mut archive = zip::ZipArchive::new(reader)
         .map_err(|error| Error::ProjectFormat(format!("invalid DAWproject ZIP: {error}")))?;
@@ -742,6 +828,7 @@ fn encode_dawproject(source: &[u8]) -> Result<Value> {
     let mut project = None;
     let mut metadata = None;
     let mut resources = Vec::new();
+    let mut detached_resources = BTreeMap::new();
     let mut paths = BTreeSet::new();
 
     for index in 0..archive.len() {
@@ -779,10 +866,17 @@ fn encode_dawproject(source: &[u8]) -> Result<Value> {
             "metadata.xml" => {
                 metadata = Some(XmlDocument::parse(&bytes, "DAWproject metadata.xml")?);
             }
-            _ => resources.push(ArchiveResource {
-                id: path,
-                data: base64::engine::general_purpose::STANDARD.encode(bytes),
-            }),
+            _ => {
+                let hash = ContentHash::of(&bytes);
+                let size = bytes.len() as u64;
+                detached_resources.insert(path.clone(), bytes);
+                resources.push(ArchiveResource {
+                    id: path,
+                    data: None,
+                    hash: Some(hash),
+                    size: Some(size),
+                });
+            }
         }
     }
 
@@ -796,10 +890,14 @@ fn encode_dawproject(source: &[u8]) -> Result<Value> {
         metadata,
         resources,
     };
-    serde_json::to_value(snapshot).map_err(Error::from)
+    let value = serde_json::to_value(snapshot).map_err(Error::from)?;
+    Ok((value, detached_resources))
 }
 
-fn decode_dawproject(snapshot: &PortableSnapshot) -> Result<Vec<u8>> {
+fn decode_dawproject(
+    snapshot: &PortableSnapshot,
+    detached_resources: &BTreeMap<String, Vec<u8>>,
+) -> Result<Vec<u8>> {
     if snapshot.format != ProjectFormat::Dawproject {
         return Err(Error::ProjectFormat(format!(
             "expected DAWproject snapshot, found {}",
@@ -826,20 +924,47 @@ fn decode_dawproject(snapshot: &PortableSnapshot) -> Result<Vec<u8>> {
 
     for resource in &snapshot.resources {
         validate_archive_path(&resource.id)?;
-        let data = base64::engine::general_purpose::STANDARD
-            .decode(&resource.data)
-            .map_err(|error| {
-                Error::ProjectFormat(format!(
-                    "invalid base64 for DAWproject entry '{}': {error}",
-                    resource.id
-                ))
-            })?;
+        let data = if let Some(data) = detached_resources.get(&resource.id) {
+            data.clone()
+        } else if let Some(encoded) = &resource.data {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|error| {
+                    Error::ProjectFormat(format!(
+                        "invalid base64 for DAWproject entry '{}': {error}",
+                        resource.id
+                    ))
+                })?
+        } else {
+            return Err(Error::ProjectFormat(format!(
+                "DAWproject entry '{}' has not been hydrated from its asset blob",
+                resource.id
+            )));
+        };
         if data.len() as u64 > MAX_ARCHIVE_ENTRY_BYTES {
             return Err(Error::ProjectFormat(format!(
                 "DAWproject entry '{}' exceeds the {} MiB limit",
                 resource.id,
                 MAX_ARCHIVE_ENTRY_BYTES / (1024 * 1024)
             )));
+        }
+        if let Some(expected_size) = resource.size {
+            if data.len() as u64 != expected_size {
+                return Err(Error::ProjectFormat(format!(
+                    "DAWproject entry '{}' has the wrong size: expected {expected_size}, received {}",
+                    resource.id,
+                    data.len()
+                )));
+            }
+        }
+        if let Some(expected_hash) = resource.hash {
+            let actual_hash = ContentHash::of(&data);
+            if actual_hash != expected_hash {
+                return Err(Error::ProjectFormat(format!(
+                    "DAWproject entry '{}' has the wrong content hash: expected {expected_hash}, received {actual_hash}",
+                    resource.id
+                )));
+            }
         }
         archive
             .start_file(&resource.id, options)
@@ -860,9 +985,11 @@ fn portable_snapshot_format(value: &Value) -> Result<Option<ProjectFormat>> {
     let marker = marker.as_u64().ok_or_else(|| {
         Error::ProjectFormat("auru_pm_snapshot marker must be an integer".to_owned())
     })?;
-    if marker != u64::from(SNAPSHOT_SCHEMA_VERSION) {
+    if !(u64::from(MIN_SNAPSHOT_SCHEMA_VERSION)..=u64::from(SNAPSHOT_SCHEMA_VERSION))
+        .contains(&marker)
+    {
         return Err(Error::ProjectFormat(format!(
-            "unsupported external snapshot schema {marker}; expected {SNAPSHOT_SCHEMA_VERSION}"
+            "unsupported external snapshot schema {marker}; expected {MIN_SNAPSHOT_SCHEMA_VERSION} or {SNAPSHOT_SCHEMA_VERSION}"
         )));
     }
     let format = value
@@ -1063,6 +1190,24 @@ mod tests {
 
         let snapshot = ProjectSnapshot::from_source_bytes(ProjectFormat::Dawproject, &source)
             .expect("valid DAWproject");
+        let canonical: Value =
+            serde_json::from_slice(snapshot.as_bytes()).expect("canonical snapshot");
+        assert_eq!(canonical["auru_pm_snapshot"], 2);
+        assert_eq!(canonical["resources"][0]["id"], "audio/kick.wav");
+        assert_eq!(canonical["resources"][0]["size"], 15);
+        assert!(canonical["resources"][0].get("hash").is_some());
+        assert!(
+            canonical["resources"][0].get("data").is_none(),
+            "v2 canonical snapshots must not duplicate resource bytes as base64"
+        );
+
+        let fetched = ProjectSnapshot::from_canonical_bytes(snapshot.as_bytes())
+            .expect("stored canonical snapshot");
+        let error = fetched
+            .restore_bytes()
+            .expect_err("a detached v2 snapshot needs its asset blobs");
+        assert!(error.to_string().contains("audio/kick.wav"));
+
         let restored = snapshot.restore_bytes().expect("restore DAWproject");
         let mut restored =
             zip::ZipArchive::new(Cursor::new(restored)).expect("restored ZIP should open");
@@ -1073,6 +1218,33 @@ mod tests {
             .read_to_end(&mut audio)
             .expect("restored audio bytes");
         assert_eq!(audio, b"RIFF-test-audio");
+    }
+
+    #[test]
+    fn dawproject_v2_snapshot_should_reject_inline_resource_data() {
+        let cursor = Cursor::new(Vec::new());
+        let mut archive = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default();
+        archive.start_file("project.xml", options).unwrap();
+        archive
+            .write_all(br#"<Project version="1.0"><Structure/></Project>"#)
+            .unwrap();
+        archive.start_file("audio/take.wav", options).unwrap();
+        archive.write_all(b"resource bytes").unwrap();
+        let source = archive.finish().unwrap().into_inner();
+        let mut value: Value = serde_json::from_slice(
+            ProjectSnapshot::from_source_bytes(ProjectFormat::Dawproject, &source)
+                .expect("valid DAWproject")
+                .as_bytes(),
+        )
+        .expect("snapshot JSON");
+        value["resources"][0]["data"] =
+            Value::String(base64::engine::general_purpose::STANDARD.encode(b"duplicate bytes"));
+        let bytes = serde_json::to_vec(&value).unwrap();
+
+        let error = ProjectSnapshot::from_canonical_bytes(&bytes)
+            .expect_err("v2 must have one canonical resource representation");
+        assert!(error.to_string().contains("must not contain inline data"));
     }
 
     #[test]

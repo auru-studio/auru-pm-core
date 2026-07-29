@@ -119,7 +119,8 @@ pub type ScanOptions = ableton::ScanOptions;
 /// between runs.
 pub fn scan_for_projects(root: &Path, options: &ScanOptions) -> Vec<DiscoveredProject> {
     let mut found = Vec::new();
-    scan_into(root, 0, options, &mut found);
+    let mut visited_directories = 0;
+    scan_into(root, 0, options, &mut visited_directories, &mut found);
     found.sort_by(|left, right| left.project_file().cmp(right.project_file()));
     found.truncate(options.max_projects);
     found
@@ -131,14 +132,32 @@ pub fn scan_for_projects(root: &Path, options: &ScanOptions) -> Vec<DiscoveredPr
 /// files — doubles the directory reads on a tree that is mostly sample packs,
 /// and on a real music drive that was the difference between a scan taking a
 /// tenth of a second and taking a second.
-fn scan_into(dir: &Path, depth: usize, options: &ScanOptions, found: &mut Vec<DiscoveredProject>) {
-    if found.len() >= options.max_projects {
+fn scan_into(
+    dir: &Path,
+    depth: usize,
+    options: &ScanOptions,
+    visited_directories: &mut usize,
+    found: &mut Vec<DiscoveredProject>,
+) {
+    if found.len() >= options.max_projects || *visited_directories >= options.max_directories {
         return;
     }
+    *visited_directories += 1;
+
+    let Ok(entries) = fs::read_dir(dir) else {
+        // A music drive routinely holds something the user cannot read; that
+        // is not a reason to abandon the whole scan.
+        return;
+    };
+    let entries = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
 
     // An Ableton project folder is a leaf: whatever is inside belongs to it,
-    // including any `.flp` someone bounced into it.
-    if let Ok(Some(bundle)) = AbletonBundle::detect(dir) {
+    // including any `.flp` someone bounced into it. Reuse this directory read
+    // for detection and traversal.
+    if let Ok(Some(bundle)) = AbletonBundle::from_root_entries(dir, &entries) {
         found.push(DiscoveredProject::Ableton(bundle));
         return;
     }
@@ -147,19 +166,12 @@ fn scan_into(dir: &Path, depth: usize, options: &ScanOptions, found: &mut Vec<Di
         return;
     }
 
-    let Ok(entries) = fs::read_dir(dir) else {
-        // A music drive routinely holds something the user cannot read; that
-        // is not a reason to abandon the whole scan.
-        return;
-    };
-
     let mut files = Vec::new();
     let mut directories = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in entries {
         if let Some(format) = standalone_format(&path) {
             files.push((path, format));
-        } else if is_scannable(&path) {
+        } else if is_scannable(&path, options) {
             directories.push(path);
         }
     }
@@ -175,15 +187,15 @@ fn scan_into(dir: &Path, depth: usize, options: &ScanOptions, found: &mut Vec<Di
             }),
     );
     for child in directories {
-        scan_into(&child, depth + 1, options, found);
-        if found.len() >= options.max_projects {
+        scan_into(&child, depth + 1, options, visited_directories, found);
+        if found.len() >= options.max_projects || *visited_directories >= options.max_directories {
             return;
         }
     }
 }
 
 /// Whether the scan should descend into `path`.
-fn is_scannable(path: &Path) -> bool {
+fn is_scannable(path: &Path, options: &ScanOptions) -> bool {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return false;
     };
@@ -205,6 +217,10 @@ fn is_scannable(path: &Path) -> bool {
     // it on the way down and stops there, which costs one check per directory
     // instead of two.
     !name.eq_ignore_ascii_case("Backup")
+        && !options
+            .excluded_directory_names
+            .iter()
+            .any(|excluded| name.eq_ignore_ascii_case(excluded))
 }
 
 fn standalone_format(path: &Path) -> Option<ProjectFormat> {
@@ -376,6 +392,45 @@ mod tests {
             ..ScanOptions::default()
         };
         assert_eq!(scan_for_projects(temp.path(), &options).len(), 3);
+    }
+
+    #[test]
+    fn conventional_sample_pack_folders_should_be_pruned() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_flp(&temp.path().join("Projects").join("Song.flp"));
+        write_flp(
+            &temp
+                .path()
+                .join("Sample Packs")
+                .join("Deep")
+                .join("Pack Song.flp"),
+        );
+
+        let found = scan_for_projects(temp.path(), &ScanOptions::default());
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name(), "Song");
+    }
+
+    #[test]
+    fn a_directory_budget_should_stop_in_stable_path_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_flp(&temp.path().join("A").join("First.flp"));
+        write_flp(&temp.path().join("B").join("Second.flp"));
+        let options = ScanOptions {
+            max_directories: 2,
+            excluded_directory_names: Vec::new(),
+            ..ScanOptions::default()
+        };
+
+        let names = || {
+            scan_for_projects(temp.path(), &options)
+                .into_iter()
+                .map(|project| project.name())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(), ["First"]);
+        assert_eq!(names(), names());
     }
 
     #[test]

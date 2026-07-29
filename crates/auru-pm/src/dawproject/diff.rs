@@ -796,7 +796,9 @@ mod tests {
               </Project>"#,
             vec![ArchiveResource {
                 id: "audio/take.wav".to_owned(),
-                data: "b2xk".to_owned(),
+                data: Some("b2xk".to_owned()),
+                hash: None,
+                size: None,
             }],
         );
         let after = snapshot_with_resources(
@@ -807,7 +809,9 @@ mod tests {
               </Project>"#,
             vec![ArchiveResource {
                 id: "audio/take.wav".to_owned(),
-                data: "bmV3".to_owned(),
+                data: Some("bmV3".to_owned()),
+                hash: None,
+                size: None,
             }],
         );
 

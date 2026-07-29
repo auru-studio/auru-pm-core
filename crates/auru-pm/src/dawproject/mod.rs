@@ -19,7 +19,9 @@ pub use meta::{
 };
 
 use crate::error::{Error, Result};
+use crate::hash::ContentHash;
 use crate::project_format::{PortableSnapshot, ProjectFormat, ProjectSnapshot, XmlDocument};
+use crate::sample_manifest::AssetKind;
 
 /// Read project detail from a DAWproject snapshot.
 pub fn read_metadata(snapshot: &ProjectSnapshot) -> Result<DawprojectMetadata> {
@@ -41,20 +43,44 @@ pub fn read_plugins(snapshot: &ProjectSnapshot) -> Result<Vec<crate::PluginRef>>
 
 /// Replace embedded archive resources with bytes fetched from the asset CAS.
 ///
-/// Version-one canonical snapshots remain self-contained, so callers can use
-/// this opportunistically and fall back to the inline copy when a remote blob
-/// is unavailable.
+/// Version-one canonical snapshots remain self-contained. Version two stores
+/// resource hashes and sizes in canonical JSON, so every resource must be
+/// supplied here before restore.
 pub fn hydrate_embedded_assets(
     snapshot: &ProjectSnapshot,
     assets: &BTreeMap<String, Vec<u8>>,
 ) -> Result<ProjectSnapshot> {
-    let mut portable = portable(snapshot)?;
-    for resource in &mut portable.resources {
-        if let Some(bytes) = assets.get(&resource.id) {
-            resource.data = base64::engine::general_purpose::STANDARD.encode(bytes);
-        }
-    }
-    ProjectSnapshot::from_portable(portable)
+    let portable = portable(snapshot)?;
+    let detached = portable
+        .resources
+        .iter()
+        .filter_map(|resource| {
+            assets
+                .get(&resource.id)
+                .map(|bytes| (resource.id.clone(), bytes.clone()))
+        })
+        .collect();
+    ProjectSnapshot::from_portable_with_resources(portable, detached)
+}
+
+/// Paths of all opaque archive entries stored outside a version-two canonical
+/// DAWproject snapshot, including media and plugin state.
+pub fn archive_resource_paths(snapshot: &ProjectSnapshot) -> Result<Vec<String>> {
+    let portable = portable(snapshot)?;
+    Ok(portable
+        .resources
+        .into_iter()
+        .map(|resource| resource.id)
+        .collect())
+}
+
+/// Whether restoring this snapshot requires every archive resource to be
+/// fetched first. Version-one snapshots have inline fallback bytes.
+pub fn requires_resource_hydration(snapshot: &ProjectSnapshot) -> Result<bool> {
+    Ok(portable(snapshot)?
+        .resources
+        .iter()
+        .any(|resource| resource.data.is_none()))
 }
 
 pub(crate) struct SnapshotParts {
@@ -88,13 +114,72 @@ pub(crate) fn metadata_from_value(snapshot: &serde_json::Value) -> Option<Dawpro
     ))
 }
 
-pub(crate) fn embedded_assets_from_value(
+pub(crate) struct SnapshotResource {
+    pub path: String,
+    pub hash: ContentHash,
+    pub size: u64,
+    pub kind: AssetKind,
+    pub inline_data: Option<Vec<u8>>,
+}
+
+pub(crate) fn snapshot_resources_from_value(
     snapshot: &serde_json::Value,
-) -> Vec<assets::EmbeddedAsset> {
-    let Some(parts) = snapshot_parts_from_value(snapshot) else {
-        return Vec::new();
-    };
-    assets::embedded_from_value(&parts.project.root, snapshot)
+) -> Result<Vec<SnapshotResource>> {
+    if snapshot_parts_from_value(snapshot).is_none() {
+        return Ok(Vec::new());
+    }
+    snapshot
+        .get("resources")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|resource| {
+            let path = resource
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    Error::ProjectFormat("DAWproject resource is missing its path".to_owned())
+                })?
+                .to_owned();
+            let inline_data = resource
+                .get("data")
+                .and_then(serde_json::Value::as_str)
+                .map(|encoded| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .map_err(|error| {
+                            Error::ProjectFormat(format!(
+                                "invalid base64 for DAWproject entry '{path}': {error}"
+                            ))
+                        })
+                })
+                .transpose()?;
+            let hash = match resource.get("hash") {
+                Some(hash) => serde_json::from_value(hash.clone())?,
+                None => ContentHash::of(inline_data.as_deref().ok_or_else(|| {
+                    Error::ProjectFormat(format!(
+                        "DAWproject resource '{path}' has neither inline data nor a content hash"
+                    ))
+                })?),
+            };
+            let size = resource
+                .get("size")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| inline_data.as_ref().map(|bytes| bytes.len() as u64))
+                .ok_or_else(|| {
+                    Error::ProjectFormat(format!(
+                        "DAWproject resource '{path}' has no recorded size"
+                    ))
+                })?;
+            Ok(SnapshotResource {
+                kind: assets::classify(&path),
+                path,
+                hash,
+                size,
+                inline_data,
+            })
+        })
+        .collect()
 }
 
 fn portable(snapshot: &ProjectSnapshot) -> Result<PortableSnapshot> {
@@ -283,22 +368,24 @@ mod tests {
     fn embedded_media_should_be_available_as_individual_assets() {
         let snapshot = full_snapshot();
         let value = serde_json::from_slice(snapshot.as_bytes()).expect("canonical JSON");
-        let assets = embedded_assets_from_value(&value);
+        let assets = snapshot_resources_from_value(&value).expect("snapshot resources");
 
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0].path, "audio/vocal.wav");
-        assert_eq!(assets[0].data, b"RIFF-real-audio");
+        assert_eq!(assets[0].size, 15);
+        assert_eq!(
+            snapshot.detached_resources_handle()["audio/vocal.wav"],
+            b"RIFF-real-audio"
+        );
     }
 
     #[test]
     fn embedded_media_should_hydrate_from_individual_asset_blobs() {
         let snapshot = full_snapshot();
+        assert!(requires_resource_hydration(&snapshot).expect("storage mode"));
         let hydrated = hydrate_embedded_assets(
             &snapshot,
-            &BTreeMap::from([(
-                "audio/vocal.wav".to_owned(),
-                b"audio-fetched-from-cas".to_vec(),
-            )]),
+            &BTreeMap::from([("audio/vocal.wav".to_owned(), b"RIFF-real-audio".to_vec())]),
         )
         .expect("hydrate");
         let restored = hydrated.restore_bytes().expect("restore");
@@ -310,7 +397,55 @@ mod tests {
             .read_to_end(&mut audio)
             .expect("read embedded audio");
 
-        assert_eq!(audio, b"audio-fetched-from-cas");
+        assert_eq!(audio, b"RIFF-real-audio");
+    }
+
+    #[test]
+    fn version_one_inline_media_should_remain_restorable() {
+        let snapshot = full_snapshot();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(snapshot.as_bytes()).expect("canonical JSON");
+        value["auru_pm_snapshot"] = serde_json::json!(1);
+        let resource = value["resources"][0]
+            .as_object_mut()
+            .expect("resource object");
+        resource.remove("hash");
+        resource.remove("size");
+        resource.insert(
+            "data".to_owned(),
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(b"RIFF-real-audio")),
+        );
+        let bytes = serde_json::to_vec(&value).expect("version-one snapshot");
+        let snapshot =
+            ProjectSnapshot::from_canonical_bytes(&bytes).expect("read version-one snapshot");
+        assert!(!requires_resource_hydration(&snapshot).expect("storage mode"));
+        let restored = snapshot
+            .restore_bytes()
+            .expect("restore version-one snapshot");
+        let mut archive = zip::ZipArchive::new(Cursor::new(restored)).expect("ZIP");
+        let mut audio = Vec::new();
+        archive
+            .by_name("audio/vocal.wav")
+            .expect("embedded audio")
+            .read_to_end(&mut audio)
+            .expect("read embedded audio");
+
+        assert_eq!(audio, b"RIFF-real-audio");
+
+        let hydrated = hydrate_embedded_assets(
+            &snapshot,
+            &BTreeMap::from([("audio/vocal.wav".to_owned(), b"fetched-v1-audio".to_vec())]),
+        )
+        .expect("hydrate version-one snapshot");
+        let restored = hydrated.restore_bytes().expect("restore hydrated v1");
+        let mut archive = zip::ZipArchive::new(Cursor::new(restored)).expect("ZIP");
+        let mut audio = Vec::new();
+        archive
+            .by_name("audio/vocal.wav")
+            .expect("embedded audio")
+            .read_to_end(&mut audio)
+            .expect("read embedded audio");
+        assert_eq!(audio, b"fetched-v1-audio");
     }
 
     #[test]

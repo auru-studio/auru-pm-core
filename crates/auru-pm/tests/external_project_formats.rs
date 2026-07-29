@@ -1,8 +1,11 @@
+use std::collections::BTreeMap;
+use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
 use auru_pm::{
     AuthorIdentity, FilesystemProvider, ProjectFormat, ProjectProvider, ProjectSnapshot,
-    PushOutcome, push_with_freshness_check, restore_project, sidecar_path_for, snapshot_project,
+    PushOptions, PushOutcome, SampleManifest, push_with_freshness_check, push_with_options,
+    restore_project, sidecar_path_for, snapshot_project,
 };
 use tempfile::TempDir;
 
@@ -56,7 +59,14 @@ async fn assert_pm_round_trip(format: ProjectFormat, source: &[u8], file_name: &
         .get_commit(&commit_id)
         .await
         .expect("fetch external project commit");
-    assert_eq!(commit.format_version, 1);
+    assert_eq!(
+        commit.format_version,
+        if format == ProjectFormat::Dawproject {
+            2
+        } else {
+            1
+        }
+    );
     let stored = provider
         .get_blob(&commit.tree.snapshot)
         .await
@@ -91,4 +101,87 @@ async fn ableton_live_set_should_survive_commit_fetch_and_restore() {
         .restore_bytes()
         .expect("create gzip Ableton fixture");
     assert_pm_round_trip(ProjectFormat::AbletonLiveSet, &source, "song.als").await;
+}
+
+#[tokio::test]
+async fn dawproject_v2_resources_should_travel_as_individual_provider_blobs() {
+    let root = TempDir::new().expect("temporary project root");
+    let project_path = root.path().join("audio-song.dawproject");
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default();
+    writer.start_file("project.xml", options).expect("project");
+    writer
+        .write_all(
+            br#"<Project version="1.0"><Arrangement><Lanes><Clips><Clip><Audio><File path="audio/take.wav"/></Audio></Clip></Clips></Lanes></Arrangement></Project>"#,
+        )
+        .expect("project XML");
+    writer
+        .start_file("audio/take.wav", options)
+        .expect("resource");
+    writer.write_all(b"RIFF-provider-asset").expect("resource");
+    std::fs::write(
+        &project_path,
+        writer.finish().expect("finish archive").into_inner(),
+    )
+    .expect("write project");
+
+    let snapshot = snapshot_project(&project_path).expect("snapshot");
+    let provider =
+        FilesystemProvider::open(root.path().join("provider")).expect("filesystem provider");
+    let provider_id = provider.provider_id();
+    let outcome = push_with_options(
+        &provider,
+        &provider_id,
+        &[],
+        &sidecar_path_for(&project_path),
+        snapshot.as_bytes(),
+        author(),
+        "External project with media",
+        "",
+        &PushOptions::for_snapshot(&snapshot),
+    )
+    .await
+    .expect("commit DAWproject");
+    let PushOutcome::Committed { commit_id, .. } = outcome else {
+        panic!("root project commit should not conflict");
+    };
+    let commit = provider.get_commit(&commit_id).await.expect("commit");
+    let stored = provider
+        .get_blob(&commit.tree.snapshot)
+        .await
+        .expect("snapshot blob");
+    assert!(
+        ProjectSnapshot::from_canonical_bytes(&stored)
+            .expect("stored snapshot")
+            .restore_bytes()
+            .is_err(),
+        "stored v2 JSON must not contain the resource payload"
+    );
+    let manifest: SampleManifest = serde_json::from_slice(
+        &provider
+            .get_blob(&commit.tree.samples)
+            .await
+            .expect("manifest blob"),
+    )
+    .expect("manifest");
+    let fetched = BTreeMap::from([(
+        manifest.entries[0].path.clone(),
+        provider
+            .get_blob(&manifest.entries[0].hash)
+            .await
+            .expect("resource blob"),
+    )]);
+    let stored = ProjectSnapshot::from_canonical_bytes(&stored).expect("stored snapshot");
+    let hydrated =
+        auru_pm::dawproject::hydrate_embedded_assets(&stored, &fetched).expect("hydrate");
+    let restored = hydrated.restore_bytes().expect("restore");
+    let mut archive = zip::ZipArchive::new(Cursor::new(restored)).expect("restored ZIP");
+    let mut resource = Vec::new();
+    archive
+        .by_name("audio/take.wav")
+        .expect("restored resource")
+        .read_to_end(&mut resource)
+        .expect("read resource");
+
+    assert_eq!(resource, b"RIFF-provider-asset");
 }

@@ -9,7 +9,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use auru_pm::{AURU_REGISTRY_URL, AuthMethod, OAuthProgress, RetentionRule};
+use auru_pm::{
+    AURU_REGISTRY_URL, AuthMethod, BundlePolicy, ConflictChoice, OAuthProgress, PathAlias,
+    RetentionRule,
+};
 use gpui::{
     Anchor, AnyElement, App, Bounds, Context, Div, ElementId, Entity, FocusHandle, FontWeight,
     Hsla, InteractiveElement, Interactivity, IntoElement, ParentElement, Render, RenderOnce,
@@ -62,10 +65,54 @@ enum Route {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OnboardingStep {
+    Profile,
+    Provider,
+    Music,
+}
+
+impl OnboardingStep {
+    const fn position(self) -> (usize, usize) {
+        (
+            match self {
+                Self::Profile => 1,
+                Self::Provider => 2,
+                Self::Music => 3,
+            },
+            3,
+        )
+    }
+
+    const fn next(self) -> Option<Self> {
+        match self {
+            Self::Profile => Some(Self::Provider),
+            Self::Provider => Some(Self::Music),
+            Self::Music => None,
+        }
+    }
+
+    const fn previous(self) -> Option<Self> {
+        match self {
+            Self::Profile => None,
+            Self::Provider => Some(Self::Profile),
+            Self::Music => Some(Self::Provider),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Overlay {
     None,
     ProviderPicker,
     Authenticate { provider_index: usize },
+    ConflictResolver,
+}
+
+struct PendingConflict {
+    project_id: String,
+    project_name: String,
+    backup: Box<backend::ConflictBackup>,
+    choices: Vec<ConflictChoice>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -157,11 +204,13 @@ struct ProjectManager {
     /// the list's position, so a fresh one each frame would snap it to the top.
     list_scroll: UniformListScrollHandle,
     route: Route,
+    onboarding_step: OnboardingStep,
     overlay: Overlay,
     display_name: String,
     display_name_input: Entity<InputState>,
     search_input: Entity<InputState>,
     credential_input: Entity<InputState>,
+    path_alias_input: Entity<InputState>,
     providers: Vec<ProviderListing>,
     catalog_state: CatalogState,
     auth_phase: AuthPhase,
@@ -187,6 +236,7 @@ struct ProjectManager {
     remote_refresh_pending: bool,
     /// Provider catalogue failures from the latest refresh.
     remote_discovery_errors: Vec<String>,
+    pending_conflict: Option<PendingConflict>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -203,14 +253,17 @@ impl ProjectManager {
 
         // The name someone chose last time, if they have been here before.
         let display_name_seed = state.display_name.clone();
-        let initial_route = if display_name_seed.trim().is_empty() {
+        let initial_route = if !state.onboarding_complete || display_name_seed.trim().is_empty() {
             Route::Onboarding
         } else {
             Route::Library
         };
 
-        let display_name_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Alice, Bob, or Charlie"));
+        let display_name_input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("e.g. Alice, Bob, or Charlie");
+            input.set_value(display_name_seed.as_str(), window, cx);
+            input
+        });
         // A separate input from onboarding's: Settings edits a name that
         // already exists, so it starts populated rather than empty.
         let display_name_setting = cx.new(|cx| {
@@ -222,12 +275,15 @@ impl ProjectManager {
             cx.new(|cx| InputState::new(window, cx).placeholder("⌕ search projects…"));
         let credential_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Personal access token"));
+        let path_alias_input = cx
+            .new(|cx| InputState::new(window, cx).placeholder("Recorded prefix, e.g. D:\\Samples"));
 
         let _subscriptions = [
             &display_name_input,
             &display_name_setting,
             &search_input,
             &credential_input,
+            &path_alias_input,
         ]
         .into_iter()
         .map(|input| {
@@ -338,11 +394,13 @@ impl ProjectManager {
             selected_project: 0,
             list_scroll: UniformListScrollHandle::default(),
             route: initial_route,
+            onboarding_step: OnboardingStep::Profile,
             overlay: Overlay::None,
             display_name: state.display_name.clone(),
             display_name_input,
             search_input,
             credential_input,
+            path_alias_input,
             providers,
             catalog_state,
             auth_phase: AuthPhase::Ready,
@@ -359,6 +417,7 @@ impl ProjectManager {
             remote_refreshing: false,
             remote_refresh_pending: false,
             remote_discovery_errors: Vec::new(),
+            pending_conflict: None,
             _subscriptions,
         }
     }
@@ -619,6 +678,125 @@ impl ProjectManager {
         }
 
         section.into_any_element()
+    }
+
+    fn render_path_aliases(&self, cx: &mut Context<Self>) -> AnyElement {
+        let aliases = self.state.path_aliases().to_vec();
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(section_label("[ PATHS FROM OTHER COMPUTERS ]"))
+            .children(aliases.into_iter().enumerate().map(|(index, alias)| {
+                let from = alias.from.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .border_1()
+                    .border_color(line())
+                    .p_3()
+                    .text_size(px(9.0))
+                    .child(div().min_w_0().flex_1().text_color(ink()).child(format!(
+                        "{}  →  {}",
+                        alias.from,
+                        alias.to.display()
+                    )))
+                    .child(
+                        div()
+                            .id(("remove-path-alias", index))
+                            .cursor_pointer()
+                            .text_color(faint())
+                            .hover(|this| this.text_color(red()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.state.remove_path_alias(&from);
+                                this.state.save();
+                                cx.notify();
+                            }))
+                            .child("REMOVE"),
+                    )
+                    .into_any_element()
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Input::new(&self.path_alias_input).flex_1())
+                    .child(
+                        div()
+                            .id("add-path-alias")
+                            .flex()
+                            .h(px(36.0))
+                            .items_center()
+                            .border_1()
+                            .border_color(line())
+                            .px_3()
+                            .cursor_pointer()
+                            .text_size(px(8.0))
+                            .text_color(faint())
+                            .hover(|this| this.border_color(green()).text_color(green()))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.add_path_alias(window, cx);
+                            }))
+                            .child("CHOOSE LOCAL FOLDER"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(8.0))
+                    .line_height(relative(1.5))
+                    .text_color(dim())
+                    .child(
+                        "Enter the path prefix stored by the other computer, then choose where \
+                         that folder lives here. The mapping is used for Ableton and FL samples.",
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn add_path_alias(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.path_alias_input.read(cx).value().trim().to_owned();
+        if from.is_empty() {
+            window.push_notification(
+                Notification::warning("Enter the path prefix written by the other computer.")
+                    .title("Recorded path needed"),
+                cx,
+            );
+            return;
+        }
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Map the recorded path to this folder".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            _ = this.update_in(cx, |this, window, cx| {
+                this.state.set_path_alias(&from, &path);
+                this.state.save();
+                this.path_alias_input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                });
+                window.push_notification(
+                    Notification::success(format!(
+                        "Projects referring to {from} will look in {}.",
+                        path.display()
+                    ))
+                    .title("Path mapping saved"),
+                    cx,
+                );
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Add a folder as a backup destination.
@@ -901,13 +1079,22 @@ impl ProjectManager {
                 }
             }
             ProjectAction::ReviewConflicts => {
-                window.push_notification(
-                    Notification::warning(
-                        "Both versions are preserved. The compare view is the next integration point.",
-                    )
-                    .title(format!("{project_name} needs a decision")),
-                    cx,
-                );
+                if self
+                    .pending_conflict
+                    .as_ref()
+                    .is_some_and(|pending| pending.project_id == project.id)
+                {
+                    self.overlay = Overlay::ConflictResolver;
+                    cx.notify();
+                } else {
+                    window.push_notification(
+                        Notification::warning(
+                            "Run the backup again to refresh the conflicting fields.",
+                        )
+                        .title(format!("{project_name} needs a decision")),
+                        cx,
+                    );
+                }
             }
             ProjectAction::None => {}
         }
@@ -945,6 +1132,7 @@ impl ProjectManager {
         let project_name = project.name.clone();
         let display_name = self.display_name.clone();
         let verify_uploads = self.verify_uploads;
+        let bundle_policy = self.backup_bundle_policy();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs() as i64)
@@ -1039,6 +1227,7 @@ impl ProjectManager {
                     display_name,
                     retention_rule,
                     verify_uploads,
+                    bundle_policy,
                 )
             });
             let result = backup.await;
@@ -1097,12 +1286,20 @@ impl ProjectManager {
                             cx,
                         );
                     }
-                    Ok(backend::BackupResult::NeedsResolution(conflicts)) => {
+                    Ok(backend::BackupResult::NeedsResolution(conflict)) => {
+                        let conflict_count = conflict.conflicts().len();
                         project.status = ProjectStatus::Conflicted;
                         project.sync_progress = 0.0;
+                        this.pending_conflict = Some(PendingConflict {
+                            project_id: project_id.clone(),
+                            project_name: project_name.clone(),
+                            choices: vec![ConflictChoice::Local; conflict_count],
+                            backup: conflict,
+                        });
+                        this.overlay = Overlay::ConflictResolver;
                         window.push_notification(
                             Notification::warning(format!(
-                                "{conflicts} conflicting field(s) need a choice before anything is committed."
+                                "{conflict_count} conflicting field(s) need a choice before anything is committed."
                             ))
                             .title(format!("{project_name} needs review")),
                             cx,
@@ -1145,6 +1342,22 @@ impl ProjectManager {
         self.state
             .save_checked()
             .map_err(|error| format!("Record the project revision before uploading: {error}"))
+    }
+
+    fn backup_bundle_policy(&self) -> BundlePolicy {
+        let mut policy = BundlePolicy::default();
+        for saved in self.state.path_aliases() {
+            let alias = PathAlias::new(saved.from.clone(), saved.to.clone());
+            match policy
+                .path_aliases
+                .iter()
+                .position(|known| known.from.eq_ignore_ascii_case(&alias.from))
+            {
+                Some(index) => policy.path_aliases[index] = alias,
+                None => policy.path_aliases.push(alias),
+            }
+        }
+        policy
     }
 
     /// Poll project modification times and enqueue revisions that have been
@@ -1287,26 +1500,54 @@ impl ProjectManager {
         cx.notify();
     }
 
-    fn complete_onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let display_name = self.display_name_input.read(cx).value().trim().to_owned();
-        if display_name.is_empty() {
-            window.push_notification(
-                Notification::warning("Add the name you want shown on project history.")
-                    .title("Display name needed"),
-                cx,
-            );
-            return;
+    fn advance_onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.onboarding_step {
+            OnboardingStep::Profile => {
+                let display_name = self.display_name_input.read(cx).value().trim().to_owned();
+                if display_name.is_empty() {
+                    window.push_notification(
+                        Notification::warning("Add the name you want shown on project history.")
+                            .title("Display name needed"),
+                        cx,
+                    );
+                    return;
+                }
+                self.display_name = display_name;
+                self.state.display_name = self.display_name.clone();
+                self.state.save();
+                self.onboarding_step = self
+                    .onboarding_step
+                    .next()
+                    .expect("profile is followed by provider setup");
+            }
+            OnboardingStep::Provider => {
+                self.onboarding_step = self
+                    .onboarding_step
+                    .next()
+                    .expect("provider setup is followed by project folders");
+            }
+            OnboardingStep::Music => {
+                self.state.onboarding_complete = true;
+                self.state.save();
+                self.route = Route::Library;
+                window.push_notification(
+                    Notification::success(
+                        "Your profile, backup destination, and project folders are ready.",
+                    )
+                    .title("Welcome to Auru PM"),
+                    cx,
+                );
+            }
         }
+        cx.notify();
+    }
 
-        self.display_name = display_name;
-        self.state.display_name = self.display_name.clone();
-        self.state.save();
-        self.route = Route::Library;
-        window.push_notification(
-            Notification::success("Your local profile is ready. No account was created.")
-                .title("Welcome to Auru PM"),
-            cx,
-        );
+    fn previous_onboarding_step(&mut self, cx: &mut Context<Self>) {
+        if let Some(previous) = self.onboarding_step.previous() {
+            self.onboarding_step = previous;
+        } else {
+            self.route = Route::Library;
+        }
         cx.notify();
     }
 
@@ -2581,9 +2822,142 @@ impl ProjectManager {
     }
 
     fn render_onboarding(&self, cx: &mut Context<Self>) -> AnyElement {
-        let can_continue = !self.display_name_input.read(cx).value().trim().is_empty();
+        let (position, total) = self.onboarding_step.position();
+        let can_continue = self.onboarding_step != OnboardingStep::Profile
+            || !self.display_name_input.read(cx).value().trim().is_empty();
+        let (title, detail, body) = match self.onboarding_step {
+            OnboardingStep::Profile => (
+                "Hello. What should we call you?",
+                "This name appears in project history. It stays with your local profile — no login or account is created.",
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .border_1()
+                    .border_color(line())
+                    .bg(panel())
+                    .p_5()
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(faint())
+                            .child("DISPLAY NAME"),
+                    )
+                    .child(Input::new(&self.display_name_input).w_full())
+                    .into_any_element(),
+            ),
+            OnboardingStep::Provider => {
+                let connected = self
+                    .providers
+                    .iter()
+                    .filter(|provider| provider.is_connected())
+                    .count();
+                (
+                    "Where should your backups live?",
+                    "Connect a hosted provider, a machine on your network, or an ordinary local folder. You can skip this and add one later.",
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .border_1()
+                        .border_color(if connected > 0 { green() } else { line() })
+                        .bg(panel())
+                        .p_5()
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(if connected > 0 { green() } else { dim() })
+                                .child(if connected == 0 {
+                                    "NO BACKUP DESTINATION CONNECTED".to_owned()
+                                } else {
+                                    format!(
+                                        "{connected} DESTINATION{} CONNECTED",
+                                        if connected == 1 { "" } else { "S" }
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("onboarding-choose-provider")
+                                .flex()
+                                .h(px(42.0))
+                                .items_center()
+                                .justify_center()
+                                .border_1()
+                                .border_color(green())
+                                .cursor_pointer()
+                                .text_size(px(9.0))
+                                .text_color(green())
+                                .hover(|this| this.bg(selection()))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.overlay = Overlay::ProviderPicker;
+                                    cx.notify();
+                                }))
+                                .child(if connected == 0 {
+                                    "CHOOSE A BACKUP DESTINATION"
+                                } else {
+                                    "ADD ANOTHER DESTINATION"
+                                }),
+                        )
+                        .into_any_element(),
+                )
+            }
+            OnboardingStep::Music => {
+                let watched = self.state.watched_folders.len();
+                (
+                    "Where do you keep your projects?",
+                    "Choose a folder and Auru will find supported projects inside it. Scanning only looks; nothing is uploaded.",
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .border_1()
+                        .border_color(if watched > 0 { green() } else { line() })
+                        .bg(panel())
+                        .p_5()
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(if watched > 0 { green() } else { dim() })
+                                .child(if watched == 0 {
+                                    "NO PROJECT FOLDERS WATCHED".to_owned()
+                                } else {
+                                    format!(
+                                        "{watched} FOLDER{} WATCHED",
+                                        if watched == 1 { "" } else { "S" }
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("onboarding-watch-folder")
+                                .flex()
+                                .h(px(42.0))
+                                .items_center()
+                                .justify_center()
+                                .border_1()
+                                .border_color(green())
+                                .cursor_pointer()
+                                .text_size(px(9.0))
+                                .text_color(green())
+                                .hover(|this| this.bg(selection()))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.watch_another_folder(window, cx);
+                                }))
+                                .child(if self.scanning {
+                                    "SCANNING…"
+                                } else if watched == 0 {
+                                    "CHOOSE YOUR PROJECTS FOLDER"
+                                } else {
+                                    "WATCH ANOTHER FOLDER"
+                                }),
+                        )
+                        .into_any_element(),
+                )
+            }
+        };
         let mut continue_button = div()
-            .id("finish-onboarding")
+            .id("continue-onboarding")
             .flex()
             .h(px(42.0))
             .min_w(px(180.0))
@@ -2598,14 +2972,18 @@ impl ProjectManager {
             .text_size(px(9.0))
             .font_weight(FontWeight::BOLD)
             .text_color(if can_continue { bg() } else { dim() })
-            .child("OPEN MY LIBRARY →");
+            .child(if self.onboarding_step == OnboardingStep::Music {
+                "OPEN MY LIBRARY →"
+            } else {
+                "CONTINUE →"
+            });
 
         if can_continue {
             continue_button = continue_button
                 .cursor_pointer()
                 .hover(|this| this.bg(green().opacity(0.82)))
                 .on_click(cx.listener(|this, _, window, cx| {
-                    this.complete_onboarding(window, cx);
+                    this.advance_onboarding(window, cx);
                 }));
         }
 
@@ -2624,75 +3002,57 @@ impl ProjectManager {
                     .text_size(px(9.0))
                     .text_color(faint())
                     .child("AURU PM · SETUP")
-                    .child("1 / 1"),
+                    .child(format!("{position} / {total}")),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .flex()
-                            .w(px(560.0))
-                            .flex_col()
-                            .gap_5()
-                            .child(
-                                div()
-                                    .font_family(DISPLAY_FONT)
-                                    .text_size(px(38.0))
-                                    .text_color(bright())
-                                    .child("Hello. What should we call you?"),
-                            )
-                            .child(
-                                div()
-                                    .max_w(px(500.0))
-                                    .text_size(px(10.0))
-                                    .line_height(relative(1.6))
-                                    .text_color(dim())
-                                    .child(
-                                        "This name appears in project history. It stays with your local profile — no login or account is created.",
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .border_1()
-                                    .border_color(line())
-                                    .bg(panel())
-                                    .p_5()
-                                    .child(
-                                        div()
-                                            .text_size(px(9.0))
-                                            .text_color(faint())
-                                            .child("DISPLAY NAME"),
-                                    )
-                                    .child(Input::new(&self.display_name_input).w_full()),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .id("skip-onboarding")
-                                            .cursor_pointer()
-                                            .text_size(px(9.0))
-                                            .text_color(faint())
-                                            .hover(|this| this.text_color(bright()))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.route = Route::Library;
-                                                cx.notify();
-                                            }))
-                                            .child("← BACK TO LIBRARY"),
-                                    )
-                                    .child(continue_button),
-                            ),
-                    ),
+                div().flex().flex_1().items_center().justify_center().child(
+                    div()
+                        .flex()
+                        .w(px(560.0))
+                        .flex_col()
+                        .gap_5()
+                        .child(
+                            div()
+                                .font_family(DISPLAY_FONT)
+                                .text_size(px(38.0))
+                                .text_color(bright())
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .max_w(px(500.0))
+                                .text_size(px(10.0))
+                                .line_height(relative(1.6))
+                                .text_color(dim())
+                                .child(detail),
+                        )
+                        .child(body)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .id("previous-onboarding")
+                                        .cursor_pointer()
+                                        .text_size(px(9.0))
+                                        .text_color(faint())
+                                        .hover(|this| this.text_color(bright()))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.previous_onboarding_step(cx);
+                                        }))
+                                        .child(
+                                            if self.onboarding_step == OnboardingStep::Profile {
+                                                "← BACK TO LIBRARY"
+                                            } else {
+                                                "← BACK"
+                                            },
+                                        ),
+                                )
+                                .child(continue_button),
+                        ),
+                ),
             )
             .into_any_element()
     }
@@ -2813,6 +3173,12 @@ impl ProjectManager {
                         let this = this.clone();
                         move |_, _window, cx: &mut App| {
                             this.update(cx, |this, cx| this.render_watched_folders(cx))
+                        }
+                    }))
+                    .item(SettingItem::render({
+                        let this = this.clone();
+                        move |_, _window, cx: &mut App| {
+                            this.update(cx, |this, cx| this.render_path_aliases(cx))
                         }
                     })),
             );
@@ -3085,6 +3451,319 @@ impl ProjectManager {
                     .child(provider.availability.label()),
             )
             .into_any_element()
+    }
+
+    fn render_conflict_resolver(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(pending) = self.pending_conflict.as_ref() else {
+            return overlay_backdrop(
+                div()
+                    .border_1()
+                    .border_color(line())
+                    .bg(panel())
+                    .p_6()
+                    .text_color(bright())
+                    .child("The conflict details are no longer available."),
+            );
+        };
+        let rows = pending
+            .backup
+            .conflicts()
+            .iter()
+            .enumerate()
+            .map(|(index, conflict)| {
+                (
+                    index,
+                    conflict.path.clone(),
+                    conflict_value_label(&conflict.local),
+                    conflict_value_label(&conflict.remote),
+                    pending.choices[index],
+                )
+            })
+            .collect::<Vec<_>>();
+        let project_name = pending.project_name.clone();
+
+        let panel =
+            div()
+                .flex()
+                .w(px(720.0))
+                .max_h(px(680.0))
+                .flex_col()
+                .border_1()
+                .border_color(line())
+                .bg(panel())
+                .shadow_lg()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .border_b_1()
+                        .border_color(line())
+                        .px_5()
+                        .py_4()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .font_family(DISPLAY_FONT)
+                                        .text_size(px(24.0))
+                                        .text_color(bright())
+                                        .child(format!("Resolve {project_name}")),
+                                )
+                                .child(div().text_size(px(8.0)).text_color(dim()).child(
+                                    "Choose which value to keep for every conflicting field.",
+                                )),
+                        )
+                        .child(
+                            div()
+                                .id("close-conflict-resolver")
+                                .cursor_pointer()
+                                .text_color(faint())
+                                .hover(|this| this.text_color(bright()))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.overlay = Overlay::None;
+                                    cx.notify();
+                                }))
+                                .child("×"),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_5()
+                        .overflow_y_scrollbar()
+                        .children(
+                            rows.into_iter()
+                                .map(|(index, path, local, remote, choice)| {
+                                    let choice_button = |label: &'static str,
+                                                 value: String,
+                                                 candidate: ConflictChoice,
+                                                 selected: bool,
+                                                 cx: &mut Context<Self>| {
+                                div()
+                                    .id((label, index))
+                                    .flex()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .flex_col()
+                                    .gap_2()
+                                    .border_1()
+                                    .border_color(if selected { green() } else { line() })
+                                    .bg(if selected { selection() } else { bg() })
+                                    .p_3()
+                                    .cursor_pointer()
+                                    .hover(|this| this.border_color(green()))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(pending) = this.pending_conflict.as_mut()
+                                            && let Some(choice) = pending.choices.get_mut(index)
+                                        {
+                                            *choice = candidate;
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_size(px(8.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(if selected { green() } else { faint() })
+                                            .child(label),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(9.0))
+                                            .line_height(relative(1.4))
+                                            .text_color(ink())
+                                            .child(value),
+                                    )
+                            };
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .child(
+                                            div().text_size(px(8.0)).text_color(blue()).child(path),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .gap_3()
+                                                .child(choice_button(
+                                                    "KEEP THIS COMPUTER",
+                                                    local,
+                                                    ConflictChoice::Local,
+                                                    choice == ConflictChoice::Local,
+                                                    cx,
+                                                ))
+                                                .child(choice_button(
+                                                    "KEEP PROVIDER",
+                                                    remote,
+                                                    ConflictChoice::Remote,
+                                                    choice == ConflictChoice::Remote,
+                                                    cx,
+                                                )),
+                                        )
+                                        .into_any_element()
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .gap_3()
+                        .border_t_1()
+                        .border_color(line())
+                        .p_5()
+                        .child(
+                            div()
+                                .id("cancel-conflict-resolution")
+                                .cursor_pointer()
+                                .px_4()
+                                .py_2()
+                                .text_size(px(8.0))
+                                .text_color(faint())
+                                .hover(|this| this.text_color(bright()))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.overlay = Overlay::None;
+                                    cx.notify();
+                                }))
+                                .child("NOT NOW"),
+                        )
+                        .child(
+                            div()
+                                .id("commit-conflict-resolution")
+                                .cursor_pointer()
+                                .border_1()
+                                .border_color(green())
+                                .bg(green())
+                                .px_5()
+                                .py_2()
+                                .text_size(px(8.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(bg())
+                                .hover(|this| this.bg(green().opacity(0.82)))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.resolve_pending_conflict(window, cx);
+                                }))
+                                .child("SAVE RESOLVED VERSION"),
+                        ),
+                );
+        overlay_backdrop(panel)
+    }
+
+    fn resolve_pending_conflict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_conflict.as_ref() else {
+            return;
+        };
+        let project_id = pending.project_id.clone();
+        let project_name = pending.project_name.clone();
+        let conflict = pending.backup.clone();
+        let choices = pending.choices.clone();
+        if let Some(project) = self
+            .projects
+            .iter_mut()
+            .find(|project| project.id == project_id)
+        {
+            project.status = ProjectStatus::Syncing;
+            project.sync_progress = 0.0;
+        }
+        self.overlay = Overlay::None;
+        cx.notify();
+
+        let resolution = cx
+            .background_executor()
+            .spawn(async move { backend::resolve_backup(&conflict, choices) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = resolution.await;
+            _ = this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(backend::BackupResult::Committed(receipt)) => {
+                        if let Some(project) = this
+                            .projects
+                            .iter_mut()
+                            .find(|project| project.id == project_id)
+                        {
+                            project.finish_transfer(receipt.history);
+                        }
+                        this.pending_conflict = None;
+                        window.push_notification(
+                            Notification::success(
+                                "Your choices were merged with the latest provider version.",
+                            )
+                            .title(format!("{project_name} backed up")),
+                            cx,
+                        );
+                    }
+                    Ok(backend::BackupResult::NeedsResolution(conflict)) => {
+                        let count = conflict.conflicts().len();
+                        if let Some(project) = this
+                            .projects
+                            .iter_mut()
+                            .find(|project| project.id == project_id)
+                        {
+                            project.status = ProjectStatus::Conflicted;
+                            project.sync_progress = 0.0;
+                        }
+                        this.pending_conflict = Some(PendingConflict {
+                            project_id,
+                            project_name: project_name.clone(),
+                            choices: vec![ConflictChoice::Local; count],
+                            backup: conflict,
+                        });
+                        this.overlay = Overlay::ConflictResolver;
+                        window.push_notification(
+                            Notification::warning(
+                                "The provider changed again. Review the refreshed fields.",
+                            )
+                            .title(format!("{project_name} changed while resolving")),
+                            cx,
+                        );
+                    }
+                    Ok(backend::BackupResult::NeedsReview(problems)) => {
+                        if let Some(project) = this
+                            .projects
+                            .iter_mut()
+                            .find(|project| project.id == project_id)
+                        {
+                            project.status = ProjectStatus::Conflicted;
+                            project.sync_progress = 0.0;
+                        }
+                        this.pending_conflict = None;
+                        window.push_notification(
+                            Notification::warning(format!(
+                                "Those choices produce {problems} project integrity problem(s). \
+                                 Your original version remains stashed safely."
+                            ))
+                            .title(format!("{project_name} still needs review")),
+                            cx,
+                        );
+                    }
+                    Err(message) => {
+                        if let Some(project) = this
+                            .projects
+                            .iter_mut()
+                            .find(|project| project.id == project_id)
+                        {
+                            project.status = ProjectStatus::Conflicted;
+                            project.sync_progress = 0.0;
+                        }
+                        window.push_notification(
+                            Notification::error(message)
+                                .title(format!("Couldn't resolve {project_name}")),
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3598,6 +4277,7 @@ impl Render for ProjectManager {
             Overlay::Authenticate { provider_index } => {
                 Some(self.render_authentication(provider_index, cx))
             }
+            Overlay::ConflictResolver => Some(self.render_conflict_resolver(cx)),
         };
 
         div()
@@ -4017,6 +4697,18 @@ mod cli_tests {
     }
 
     #[test]
+    fn onboarding_should_move_through_profile_provider_and_music_steps() {
+        let mut step = OnboardingStep::Profile;
+        assert_eq!(step.position(), (1, 3));
+        step = step.next().expect("provider step");
+        assert_eq!(step, OnboardingStep::Provider);
+        step = step.next().expect("music step");
+        assert_eq!(step, OnboardingStep::Music);
+        assert!(step.next().is_none());
+        assert_eq!(step.previous(), Some(OnboardingStep::Provider));
+    }
+
+    #[test]
     fn usage_should_document_every_flag_that_exists() {
         assert!(USAGE.contains("--providers-file"));
         assert!(USAGE.contains("--help"));
@@ -4034,6 +4726,27 @@ fn status_color(status: ProjectStatus) -> Hsla {
         ProjectStatus::OutOfSync(SyncDirection::LocalAhead) => amber(),
         ProjectStatus::OutOfSync(SyncDirection::UpstreamAhead) => blue(),
         ProjectStatus::Conflicted => red(),
+    }
+}
+
+fn conflict_value_label(value: &Option<serde_json::Value>) -> String {
+    let Some(value) = value else {
+        return "Not present".to_owned();
+    };
+    match value {
+        serde_json::Value::Null => "None".to_owned(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::String(value) => {
+            const MAX_CHARS: usize = 160;
+            let mut label = value.chars().take(MAX_CHARS).collect::<String>();
+            if value.chars().count() > MAX_CHARS {
+                label.push('…');
+            }
+            label
+        }
+        serde_json::Value::Array(values) => format!("{} item(s)", values.len()),
+        serde_json::Value::Object(fields) => format!("{} field(s)", fields.len()),
     }
 }
 

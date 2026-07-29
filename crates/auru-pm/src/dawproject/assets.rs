@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::project_format::{PortableSnapshot, XmlElement};
@@ -48,13 +47,6 @@ impl DawprojectAssetSummary {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct EmbeddedAsset {
-    pub(crate) path: String,
-    pub(crate) data: Vec<u8>,
-    pub(crate) kind: AssetKind,
-}
-
 pub(crate) fn collect(portable: &PortableSnapshot) -> Vec<DawprojectAssetRef> {
     let resources: BTreeMap<&str, Option<u64>> = portable
         .resources
@@ -62,7 +54,13 @@ pub(crate) fn collect(portable: &PortableSnapshot) -> Vec<DawprojectAssetRef> {
         .map(|resource| {
             (
                 resource.id.as_str(),
-                decoded_base64_size(&resource.data).map(|size| size as u64),
+                resource.size.or_else(|| {
+                    resource
+                        .data
+                        .as_deref()
+                        .and_then(decoded_base64_size)
+                        .map(|size| size as u64)
+                }),
             )
         })
         .collect();
@@ -73,9 +71,7 @@ pub(crate) fn collect_from_value(
     root: &XmlElement,
     snapshot: &serde_json::Value,
 ) -> Vec<DawprojectAssetRef> {
-    let resources = resource_values(snapshot)
-        .map(|(path, data)| (path, decoded_base64_size(data).map(|size| size as u64)))
-        .collect();
+    let resources = resource_sizes(snapshot).collect();
     collect_with_resources(root, &resources)
 }
 
@@ -107,27 +103,6 @@ fn collect_with_resources(
     found.into_values().collect()
 }
 
-pub(crate) fn embedded_from_value(
-    root: &XmlElement,
-    snapshot: &serde_json::Value,
-) -> Vec<EmbeddedAsset> {
-    let resources: BTreeMap<&str, &str> = resource_values(snapshot).collect();
-    collect_from_value(root, snapshot)
-        .into_iter()
-        .filter(|asset| asset.embedded)
-        .filter_map(|asset| {
-            let data = base64::engine::general_purpose::STANDARD
-                .decode(resources.get(asset.path.as_str())?)
-                .ok()?;
-            Some(EmbeddedAsset {
-                kind: classify(&asset.path),
-                path: asset.path,
-                data,
-            })
-        })
-        .collect()
-}
-
 pub(crate) fn resource_values(snapshot: &serde_json::Value) -> impl Iterator<Item = (&str, &str)> {
     snapshot
         .get("resources")
@@ -137,8 +112,33 @@ pub(crate) fn resource_values(snapshot: &serde_json::Value) -> impl Iterator<Ite
         .filter_map(|resource| {
             Some((
                 resource.get("id")?.as_str()?,
-                resource.get("data")?.as_str()?,
+                resource
+                    .get("hash")
+                    .or_else(|| resource.get("data"))?
+                    .as_str()?,
             ))
+        })
+}
+
+fn resource_sizes(snapshot: &serde_json::Value) -> impl Iterator<Item = (&str, Option<u64>)> {
+    snapshot
+        .get("resources")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|resource| {
+            let path = resource.get("id")?.as_str()?;
+            let size = resource
+                .get("size")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| {
+                    resource
+                        .get("data")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(decoded_base64_size)
+                        .map(|size| size as u64)
+                });
+            Some((path, size))
         })
 }
 
@@ -165,7 +165,7 @@ fn nonempty_attribute<'a>(element: &'a XmlElement, name: &str) -> Option<&'a str
     element.attribute(name).filter(|value| !value.is_empty())
 }
 
-fn classify(path: &str) -> AssetKind {
+pub(crate) fn classify(path: &str) -> AssetKind {
     let extension = Path::new(path)
         .extension()
         .and_then(|extension| extension.to_str())

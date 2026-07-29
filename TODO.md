@@ -64,6 +64,27 @@ described, it was read out of a real project rather than from documentation.
   entries, VST2/VST3/CLAP/AU plugin inventory, missing-plugin UI dispatch, and
   per-track structured version diffs. The existing oracle is exercised through
   commit metadata and the desktop detail model.
+- DAWproject snapshot schema v2 stores opaque archive resources as individual
+  CAS blobs identified by path, BLAKE3 hash, and size instead of duplicating
+  base64 payloads in canonical JSON. Locally loaded snapshots retain the bytes
+  for immediate round-trip; provider-fetched snapshots hydrate them from the
+  manifest. Version-one inline snapshots remain readable. Pre-merge stashes
+  protect and recover every detached resource, and upload verification
+  cross-checks the snapshot's resource descriptors against its manifest.
+- The desktop persists cross-machine path aliases and applies them to normal
+  backup planning. Conflicted backups now open a field-by-field local/remote
+  resolver and retry through the freshness-checking coordinator.
+- Onboarding now has profile, backup-destination, and watched-folder steps,
+  while legacy profiles skip onboarding.
+- Discovery reuses one directory read for Ableton detection and standalone
+  formats, prunes conventional sample-pack folders, and has deterministic
+  depth, project-count, and directory-count bounds.
+- CI now checks the standalone GPUI workspace as well as the headless
+  workspace. `corpus_roundtrip` provides one command for exercising an
+  uncommitted real-project corpus.
+- The reference server now persists state and blobs under `--data-dir` using
+  failure-atomic state replacement and applies a configurable per-client
+  request limit. Authentication remains intentionally deferred.
 
 ---
 
@@ -118,9 +139,9 @@ token will be checked by the first project request.
 ### 2.3 The reference server has no authentication
 
 `auru-pm-server` advertises `auth_methods: ["none"]`
-([main.rs:74](crates/auru-pm-server/src/main.rs:74)) and keeps state in memory.
-It is a conformance target, not a deployable service. Missing: persistence,
-any auth, and rate limiting.
+and is still a conformance target rather than a deployable service.
+Persistence and per-client rate limiting are implemented. Authentication is
+the remaining gap and is intentionally reserved for its own design session.
 
 ### 2.4 `auru-pm-client` — **resolved 2026-07-29**
 
@@ -133,6 +154,8 @@ The desktop app consumes this API for filesystem and HTTP recovery.
 `list_members` and `permissions` return `Error::Unsupported` on every provider,
 and `Capabilities::members` / `permissions` are always false. The trait hooks
 are deliberate placeholders for the teams plan; nothing consumes them yet.
+This is deferred with authentication because member identity and authorization
+semantics must be designed together.
 
 ---
 
@@ -199,17 +222,17 @@ reference format.
 
 ### 3.3 DAWproject
 
-**Implemented 2026-07-29; one storage follow-up remains.** The semantic reader
+**Implemented 2026-07-29.** The semantic reader
 follows the official DAWproject 1.0 schema and now supplies:
 
 - `ProjectInfo` metadata for title/credits, exporting application, tempo, time
   signature, tracks, clips, scenes, markers, arrangement extent, plugins, and
   media. The 1.0 schema has no project-wide key, so the UI leaves it blank.
-- One manifest/CAS object per referenced embedded media file. Restore fetches
-  those objects and hydrates the archive from them; external files and missing
-  archive entries remain explicitly distinguishable. The v1 canonical
-  snapshot also retains an inline fallback so the existing provider-free
-  `ProjectSnapshot::restore_bytes` API stays valid.
+- One manifest/CAS object per opaque archive resource, including embedded media
+  and plugin state. Restore fetches those objects and hydrates the archive;
+  external files and missing archive entries remain explicitly
+  distinguishable. Schema v2 keeps only resource path/hash/size in canonical
+  JSON, while schema v1 inline snapshots remain readable.
 - Stable plugin identities from the interchange format: VST2 decimal IDs,
   VST3 UUIDs, CLAP textual IDs, AU IDs, and DAW-scoped built-ins. The desktop
   now runs these through the normal missing-plugin resolver.
@@ -236,9 +259,8 @@ archives are not committed because they contain sample-pack audio, third-party
 preset state, and machine-local paths; the exporter behavior is captured by a
 small synthetic regression instead.
 
-- **Remaining:** making embedded media truly lazy, rather than storing the v1
-  inline fallback as well as its CAS object, requires a versioned snapshot
-  wrapper that can declare provider-hydrated archive resources.
+- **Resolved 2026-07-29:** schema v2 declares provider-hydrated archive
+  resources and removes the inline duplication.
 - **Resolved 2026-07-29:** discovery now offers `.dawproject` files (and native
   `.auru` files) alongside Ableton and FL projects.
 
@@ -280,13 +302,14 @@ small synthetic regression instead.
   commit, snapshot, manifest, metadata, every asset hash, and asset size. A
   failed verification produces a warning while retaining the successful
   backup and its history.
-- **Onboarding is one step, not the designed three.** The provider-connection
-  and folder-selection steps from `auru-pm-claude-design` are not built.
+- **Resolved 2026-07-29:** onboarding has profile, provider, and watched-folder
+  steps, each backed by the existing real connection and discovery flows.
 - **Resolved 2026-07-29:** the `project_listing` capability adds
   `GET /v1/projects` and project profiles. New-machine projects appear in the
   normal library, and Download restores and enrolls the selected project.
-- **`ProjectStatus::Conflicted` is now reachable** from a real coordinator
-  outcome, but the field-by-field resolver is still only a notification.
+- **Resolved 2026-07-29:** `ProjectStatus::Conflicted` opens a field-by-field
+  local/remote resolver. Confirming it retries through the coordinator, which
+  rechecks the provider head and current conflict set before committing.
   `SyncDirection::UpstreamAhead` is produced when refreshing a known project's
   history, and Download Latest restores that head to a new folder.
   `ProjectStatus::NotDownloaded` is produced by provider project discovery.
@@ -304,23 +327,26 @@ small synthetic regression instead.
 
 ## 5. Cross-cutting
 
-- **Compressed uploads are never negotiated in practice.** `Capabilities::compressed_uploads`
-  is implemented on both sides and defaults to false; no deployed provider sets it.
+- **Resolved 2026-07-29:** the reference server advertises compressed uploads
+  and decompresses request bodies before storing their plaintext CAS content.
 - **Resolved 2026-07-29:** `AURU_PATH_ALIASES` is the primary name and
   `AURU_ABLETON_PATH_ALIASES` remains a fallback.
-- **Path aliases have no UI.** Resolving a project saved on another machine
-  requires setting an environment variable, which no musician will do. This is
-  the difference between "your samples were found" and "10 files could not be
-  located" for any cross-machine restore.
-- **Scanning cost grew with FL support.** A single-pass walk of a real 655-project
-  drive takes ~450 ms, against ~50 ms when only Ableton folders were searched;
-  finding files means descending into sample-pack directories that a
-  folder-only scan could skip.
-- **No end-to-end test runs against real projects in CI.** The real `.als` and
+- **Resolved 2026-07-29:** path aliases are editable and persisted in Settings;
+  environment aliases remain supported for managed/headless deployments.
+- **Resolved 2026-07-29:** discovery reuses each directory listing for Ableton
+  and standalone detection, prunes conventional sample-pack folders, and
+  enforces a deterministic directory budget in addition to depth and project
+  limits.
+- **A real-project corpus still cannot run in public CI.** The real `.als` and
   `.flp` files live outside the repo and one is 18 MB, so the round-trip proofs
   are `cargo run --example` commands a person has to run.
 
-  This is the highest-value item on the list. Every serious bug found so far came
+  `corpus_roundtrip` now provides a single verifier for private/local corpora,
+  and was run against both supplied Bitwig exports. CI also checks the desktop
+  workspace and the committed synthetic interchange oracle. A sanitized,
+  redistributable Live/FL corpus is still required to close this item.
+
+  This remains high-value. Every serious bug found so far came
   from running a real file, and none would have been caught by a hand-written
   fixture, because each was a case nobody thought to write: Live 9 keeping file
   names in a sibling element, macOS `._` companions ending in `.als`, an FL
@@ -348,4 +374,5 @@ Real-project proofs, run by hand:
 ```bash
 cargo run --example flp_roundtrip -- "/path/to/Project.flp"
 cargo run --example dawproject_inspect -- "/path/to/Project.dawproject"
+cargo run --example corpus_roundtrip -- "/path/to/project-corpus"
 ```

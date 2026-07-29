@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use auru_pm::ableton::{self, BundlePolicy, PathAlias};
 use auru_pm::{
-    AuthorIdentity, FilesystemProvider, ProjectProvider, ProjectSnapshot, PushOutcome,
-    push_with_freshness_check, sidecar_path_for,
+    AuthorIdentity, FilesystemProvider, ProjectProvider, ProjectSnapshot, PushOptions, PushOutcome,
+    push_with_options, sidecar_path_for,
 };
 use tempfile::TempDir;
 
@@ -123,31 +123,9 @@ fn scenario() -> Scenario {
 /// Commit the project folder and return the commit.
 async fn commit(scenario: &Scenario) -> auru_pm::Commit {
     let snapshot = ProjectSnapshot::load(&scenario.live_set).expect("snapshot");
-    let plan = ableton::plan_bundle_assets(&snapshot, &scenario.project, &scenario.policy)
-        .expect("plan")
-        .expect("project folder detected");
-
-    // Store the planned assets, mirroring what the push path does with the
-    // default policy — this test drives a custom policy for the path alias.
-    let mut manifest = auru_pm::SampleManifest::new();
-    for asset in &plan.assets {
-        let bytes = std::fs::read(&asset.source).expect("read asset");
-        let hash = auru_pm::ContentHash::of(&bytes);
-        scenario
-            .provider
-            .put_blob(&hash, &bytes)
-            .await
-            .expect("put asset");
-        manifest.insert(auru_pm::SampleEntry {
-            path: asset.bundle_path.clone(),
-            hash,
-            size: bytes.len() as u64,
-            kind: asset.kind,
-            origin: asset.origin.clone(),
-        });
-    }
-
-    let PushOutcome::Committed { commit_id, .. } = push_with_freshness_check(
+    let mut options = PushOptions::default();
+    options.bundle_policy = scenario.policy.clone();
+    let PushOutcome::Committed { commit_id, .. } = push_with_options(
         &scenario.provider,
         &scenario.provider.provider_id(),
         &[],
@@ -156,28 +134,17 @@ async fn commit(scenario: &Scenario) -> auru_pm::Commit {
         author(),
         "Folder commit",
         "",
+        &options,
     )
     .await
     .expect("push") else {
         panic!("first commit cannot conflict");
     };
-
-    // Point the commit at the manifest built above.
-    let manifest_bytes = manifest.canonical_encoding().expect("encode manifest");
-    let manifest_hash = auru_pm::ContentHash::of(&manifest_bytes);
     scenario
-        .provider
-        .put_blob(&manifest_hash, &manifest_bytes)
-        .await
-        .expect("put manifest");
-
-    let mut commit = scenario
         .provider
         .get_commit(&commit_id)
         .await
-        .expect("get commit");
-    commit.tree.samples = manifest_hash;
-    commit
+        .expect("get commit")
 }
 
 #[tokio::test]

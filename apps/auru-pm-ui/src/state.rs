@@ -19,6 +19,10 @@ use serde::{Deserialize, Serialize};
 /// Bumped when the shape changes in a way older builds cannot read.
 pub const STATE_SCHEMA: u32 = 1;
 
+const fn existing_profile_completed_onboarding() -> bool {
+    true
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct FileRevision {
     unix_seconds: u64,
@@ -45,6 +49,12 @@ impl FileRevision {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PathAliasState {
+    pub from: String,
+    pub to: PathBuf,
+}
+
 /// Everything Auru carries from one launch to the next.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -60,6 +70,12 @@ pub struct AppState {
     pub schema: u32,
     /// Name shown against saved versions.
     pub display_name: String,
+    /// Whether the profile has completed the current setup flow.
+    ///
+    /// Missing means true for state written by older builds, which had already
+    /// treated choosing a display name as completed onboarding.
+    #[serde(default = "existing_profile_completed_onboarding")]
+    pub onboarding_complete: bool,
     /// `"night"` or `"day"`.
     pub appearance: String,
     pub automatic_backups: bool,
@@ -80,6 +96,9 @@ pub struct AppState {
     /// restart, even when the sidecar completion time is newer than that save.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     backup_attempts: BTreeMap<String, FileRevision>,
+    /// Recorded path prefixes from another machine mapped onto local folders.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    path_aliases: Vec<PathAliasState>,
     /// Folders scanned for projects.
     pub watched_folders: Vec<PathBuf>,
     /// Folders used as backup destinations — an external drive, or a NAS share.
@@ -107,6 +126,7 @@ impl Default for AppState {
             origin: None,
             schema: STATE_SCHEMA,
             display_name: String::new(),
+            onboarding_complete: false,
             appearance: "night".to_owned(),
             automatic_backups: true,
             verify_uploads: true,
@@ -114,6 +134,7 @@ impl Default for AppState {
             sort_order: "attention".to_owned(),
             first_seen: BTreeMap::new(),
             backup_attempts: BTreeMap::new(),
+            path_aliases: Vec::new(),
             watched_folders: Vec::new(),
             local_providers: Vec::new(),
             connected_providers: Vec::new(),
@@ -124,6 +145,40 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn path_aliases(&self) -> &[PathAliasState] {
+        &self.path_aliases
+    }
+
+    pub fn set_path_alias(&mut self, from: &str, to: &Path) {
+        let from = from.trim().trim_end_matches(['/', '\\']).to_owned();
+        if from.is_empty() {
+            return;
+        }
+        let replacement = PathAliasState {
+            from,
+            to: to.into(),
+        };
+        match self.path_aliases.iter().position(|alias| {
+            alias
+                .from
+                .trim_end_matches(['/', '\\'])
+                .eq_ignore_ascii_case(&replacement.from)
+        }) {
+            Some(index) => self.path_aliases[index] = replacement,
+            None => self.path_aliases.push(replacement),
+        }
+    }
+
+    pub fn remove_path_alias(&mut self, from: &str) {
+        let from = from.trim_end_matches(['/', '\\']);
+        self.path_aliases.retain(|alias| {
+            !alias
+                .from
+                .trim_end_matches(['/', '\\'])
+                .eq_ignore_ascii_case(from)
+        });
+    }
+
     pub fn record_backup_attempt(&mut self, project_id: &str, modified_at: Option<SystemTime>) {
         let Some(revision) = modified_at.and_then(FileRevision::from_system_time) else {
             return;
@@ -362,6 +417,42 @@ mod tests {
                 "project:/music/Song.dawproject".to_owned(),
                 attempted_revision
             )]
+        );
+    }
+
+    #[test]
+    fn path_aliases_should_persist_and_replace_the_same_recorded_prefix() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("state.json");
+        let mut state = AppState::load_from(&path);
+
+        state.set_path_alias(r"D:\Packs", Path::new("/mnt/old-packs"));
+        state.set_path_alias(r"d:\packs\\", Path::new("/mnt/current-packs"));
+        state.save();
+
+        let loaded = AppState::load_from(&path);
+        assert_eq!(
+            loaded.path_aliases(),
+            &[PathAliasState {
+                from: r"d:\packs".to_owned(),
+                to: PathBuf::from("/mnt/current-packs"),
+            }]
+        );
+    }
+
+    #[test]
+    fn onboarding_completion_should_distinguish_new_and_existing_profiles() {
+        assert!(!AppState::default().onboarding_complete);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let legacy = temp.path().join("legacy.json");
+        std::fs::write(&legacy, r#"{"schema":1,"display_name":"Existing user"}"#)
+            .expect("legacy state");
+
+        let loaded = AppState::load_from(&legacy);
+        assert!(
+            loaded.onboarding_complete,
+            "an existing profile must not be forced through new setup steps"
         );
     }
 

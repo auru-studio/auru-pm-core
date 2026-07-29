@@ -20,3 +20,32 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  desktop:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/auru-pm-ui
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GPUI system libraries
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          libasound2-dev
+          libfontconfig-dev
+          libglib2.0-dev
+          libssl-dev
+          libwayland-dev
+          libx11-xcb-dev
+          libxkbcommon-x11-dev
+          libzstd-dev
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/auru-pm-ui -> target
+      - run: cargo fmt -- --check
+      - run: cargo test --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings

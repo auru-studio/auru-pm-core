@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use serde_json::Value;
 
 use crate::ableton::BundlePolicy;
@@ -57,6 +58,27 @@ pub enum PushOutcome {
     },
 }
 
+/// Caller-controlled project bundling behavior for one push.
+#[derive(Clone, Debug, Default)]
+pub struct PushOptions {
+    pub bundle_policy: BundlePolicy,
+    pub conflict_resolutions: Option<Vec<ConflictResolution>>,
+    /// Opaque resources detached from a version-two project snapshot.
+    ///
+    /// Prefer [`Self::for_snapshot`] so hashes and bytes stay paired.
+    snapshot_resources: Arc<BTreeMap<String, Vec<u8>>>,
+}
+
+impl PushOptions {
+    /// Start push options with every detached resource held by `snapshot`.
+    pub fn for_snapshot(snapshot: &ProjectSnapshot) -> Self {
+        Self {
+            snapshot_resources: snapshot.detached_resources_handle(),
+            ..Self::default()
+        }
+    }
+}
+
 /// Re-read a committed backup through its provider and validate every object
 /// needed to restore it.
 pub async fn verify_commit_copy(provider: &dyn ProjectProvider, commit_id: CommitId) -> Result<()> {
@@ -79,13 +101,14 @@ pub async fn verify_commit_copy(provider: &dyn ProjectProvider, commit_id: Commi
         )));
     }
 
-    let snapshot = verify_blob(provider, commit.tree.snapshot, "snapshot").await?;
-    ProjectSnapshot::from_canonical_bytes(&snapshot)
+    let snapshot_bytes = verify_blob(provider, commit.tree.snapshot, "snapshot").await?;
+    let snapshot = ProjectSnapshot::from_canonical_bytes(&snapshot_bytes)
         .map_err(|error| Error::Other(format!("re-read snapshot is invalid: {error}")))?;
 
     let manifest_bytes = verify_blob(provider, commit.tree.samples, "asset manifest").await?;
     let manifest: SampleManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| Error::Other(format!("re-read asset manifest is invalid: {error}")))?;
+    verify_snapshot_manifest(&snapshot, &snapshot_bytes, &manifest)?;
 
     if let Some(metadata) = commit.metadata {
         verify_blob(provider, metadata, "project metadata").await?;
@@ -103,6 +126,39 @@ pub async fn verify_commit_copy(provider: &dyn ProjectProvider, commit_id: Commi
         }
     }
 
+    Ok(())
+}
+
+fn verify_snapshot_manifest(
+    snapshot: &ProjectSnapshot,
+    snapshot_bytes: &[u8],
+    manifest: &SampleManifest,
+) -> Result<()> {
+    if snapshot.format() != crate::project_format::ProjectFormat::Dawproject
+        || !crate::dawproject::requires_resource_hydration(snapshot)?
+    {
+        return Ok(());
+    }
+
+    let value: Value = serde_json::from_slice(snapshot_bytes)?;
+    for resource in crate::dawproject::snapshot_resources_from_value(&value)? {
+        let Some(entry) = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == resource.path)
+        else {
+            return Err(Error::Other(format!(
+                "re-read asset manifest is missing DAWproject resource '{}'",
+                resource.path
+            )));
+        };
+        if entry.hash != resource.hash || entry.size != resource.size {
+            return Err(Error::Other(format!(
+                "re-read asset manifest does not match DAWproject resource '{}'",
+                resource.path
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -146,9 +202,47 @@ async fn stash_snapshot(
     primary: &dyn ProjectProvider,
     sidecar_path: &Path,
     snapshot_bytes: &[u8],
+    snapshot_resources: &BTreeMap<String, Vec<u8>>,
     base: Option<CommitId>,
     reason: &str,
 ) -> Result<ContentHash, String> {
+    let snapshot = ProjectSnapshot::from_canonical_bytes(snapshot_bytes)
+        .map_err(|error| format!("validate local snapshot before stashing: {error}"))?;
+    let value: Value = serde_json::from_slice(snapshot.as_bytes())
+        .map_err(|error| format!("read local snapshot before stashing: {error}"))?;
+    let mut resources = BTreeMap::new();
+    if snapshot.format() == crate::project_format::ProjectFormat::Dawproject
+        && crate::dawproject::requires_resource_hydration(&snapshot)
+            .map_err(|error| format!("inspect local snapshot before stashing: {error}"))?
+    {
+        for resource in crate::dawproject::snapshot_resources_from_value(&value)
+            .map_err(|error| format!("read local DAWproject resources before stashing: {error}"))?
+        {
+            let bytes = snapshot_resources.get(&resource.path).ok_or_else(|| {
+                format!(
+                    "stash local DAWproject resource '{}': bytes are unavailable; build PushOptions with PushOptions::for_snapshot",
+                    resource.path
+                )
+            })?;
+            if ContentHash::of(bytes) != resource.hash || bytes.len() as u64 != resource.size {
+                return Err(format!(
+                    "stash local DAWproject resource '{}': bytes do not match the snapshot hash and size",
+                    resource.path
+                ));
+            }
+            primary
+                .put_blob(&resource.hash, bytes)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "stash local DAWproject resource '{}': {error}",
+                        resource.path
+                    )
+                })?;
+            resources.insert(resource.path, resource.hash);
+        }
+    }
+
     let hash = ContentHash::of(snapshot_bytes);
     primary
         .put_blob(&hash, snapshot_bytes)
@@ -157,6 +251,7 @@ async fn stash_snapshot(
     Sidecar::modify(sidecar_path, |sidecar| {
         sidecar.stash = Some(Stash {
             snapshot: hash,
+            resources,
             created_at: now_epoch_secs(),
             base,
             reason: reason.to_owned(),
@@ -169,7 +264,10 @@ async fn stash_snapshot(
 /// Fetch the snapshot held in the sidecar's stash, if there is one.
 ///
 /// Lets a caller offer "put my version back" after a merge the user does not
-/// want to keep. Returns `Ok(None)` when nothing is stashed.
+/// want to keep. A version-two DAWproject stash is returned as a self-contained
+/// version-one snapshot so the existing restore API can rebuild the complete
+/// archive without separate hydration. Returns `Ok(None)` when nothing is
+/// stashed.
 pub async fn stashed_snapshot(
     provider: &dyn ProjectProvider,
     sidecar_path: &Path,
@@ -178,11 +276,79 @@ pub async fn stashed_snapshot(
     let Some(stash) = sidecar.stash else {
         return Ok(None);
     };
-    provider
+    let snapshot_bytes = provider
         .get_blob(&stash.snapshot)
         .await
-        .map(Some)
-        .map_err(|e| format!("fetch stashed snapshot: {e}"))
+        .map_err(|e| format!("fetch stashed snapshot: {e}"))?;
+    if stash.resources.is_empty() {
+        return Ok(Some(snapshot_bytes));
+    }
+
+    let stored = ProjectSnapshot::from_canonical_bytes(&snapshot_bytes)
+        .map_err(|error| format!("validate stashed snapshot: {error}"))?;
+    if stored.format() != crate::project_format::ProjectFormat::Dawproject {
+        return Err("only a DAWproject stash may declare detached resources".to_owned());
+    }
+    let mut value: Value = serde_json::from_slice(&snapshot_bytes)
+        .map_err(|error| format!("parse stashed snapshot: {error}"))?;
+    let resources = value
+        .get_mut("resources")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "stashed DAWproject snapshot is missing its resources".to_owned())?;
+    for resource in resources {
+        let object = resource
+            .as_object_mut()
+            .ok_or_else(|| "stashed DAWproject resource is not an object".to_owned())?;
+        let path = object
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "stashed DAWproject resource is missing its path".to_owned())?
+            .to_owned();
+        let expected = stash
+            .resources
+            .get(&path)
+            .ok_or_else(|| format!("stashed DAWproject resource '{path}' has no protected blob"))?;
+        let recorded_hash: ContentHash = serde_json::from_value(
+            object
+                .get("hash")
+                .cloned()
+                .ok_or_else(|| format!("stashed DAWproject resource '{path}' has no hash"))?,
+        )
+        .map_err(|error| format!("read stashed DAWproject resource hash for '{path}': {error}"))?;
+        if recorded_hash != *expected {
+            return Err(format!(
+                "stashed DAWproject resource '{path}' does not match its protected hash"
+            ));
+        }
+        let recorded_size = object
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("stashed DAWproject resource '{path}' has no recorded size"))?;
+        let bytes = provider
+            .get_blob(expected)
+            .await
+            .map_err(|error| format!("fetch stashed DAWproject resource '{path}': {error}"))?;
+        if ContentHash::of(&bytes) != *expected || bytes.len() as u64 != recorded_size {
+            return Err(format!(
+                "stashed DAWproject resource '{path}' does not match its protected hash and size"
+            ));
+        }
+        object.insert(
+            "data".to_owned(),
+            Value::String(base64::engine::general_purpose::STANDARD.encode(bytes)),
+        );
+        object.remove("hash");
+        object.remove("size");
+    }
+    value["auru_pm_snapshot"] = Value::from(1);
+    let encoded =
+        serde_json::to_vec(&value).map_err(|error| format!("encode stashed snapshot: {error}"))?;
+    let recovered = ProjectSnapshot::from_canonical_bytes(&encoded)
+        .map_err(|error| format!("validate stashed snapshot: {error}"))?;
+    recovered
+        .restore_bytes()
+        .map_err(|error| format!("validate stashed DAWproject resources: {error}"))?;
+    Ok(Some(recovered.into_bytes()))
 }
 
 /// Forget the stashed pre-merge state.
@@ -203,6 +369,68 @@ pub fn discard_stash(sidecar_path: &Path) -> Result<(), String> {
 /// other format returns empty, so nothing else changes behaviour.
 fn integrity_problems(merged: &Value) -> Vec<IntegrityProblem> {
     crate::ableton::validate_snapshot_value(merged)
+}
+
+/// Put every DAWproject merge input into the v2 resource representation.
+///
+/// A merge can span commits written before and after resources were detached
+/// from canonical JSON. Hashing legacy inline bytes before `merge3` prevents a
+/// chosen v1 `data` field from landing beneath a v2 schema marker. Persisting
+/// those bytes first also guarantees that whichever descriptor wins can be
+/// resolved by `build_sample_manifest`.
+async fn normalize_dawproject_for_merge(
+    primary: &dyn ProjectProvider,
+    snapshot: &mut Value,
+) -> Result<(), String> {
+    if crate::dawproject::snapshot_parts_from_value(snapshot).is_none() {
+        return Ok(());
+    }
+
+    let parsed = crate::dawproject::snapshot_resources_from_value(snapshot)
+        .map_err(|error| format!("read DAWproject merge resources: {error}"))?;
+    let mut legacy_blobs = Vec::new();
+    if !parsed.is_empty() {
+        let resources = snapshot
+            .get_mut("resources")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| "DAWproject merge snapshot is missing its resources".to_owned())?;
+        if resources.len() != parsed.len() {
+            return Err("DAWproject merge resource count changed while normalizing".to_owned());
+        }
+        for (resource, parsed) in resources.iter_mut().zip(parsed) {
+            let object = resource
+                .as_object_mut()
+                .ok_or_else(|| "DAWproject merge resource is not an object".to_owned())?;
+            if object.get("id").and_then(Value::as_str) != Some(parsed.path.as_str()) {
+                return Err("DAWproject merge resource order changed while normalizing".to_owned());
+            }
+            let Some(bytes) = parsed.inline_data else {
+                continue;
+            };
+            let hash = ContentHash::of(&bytes);
+            object.insert(
+                "hash".to_owned(),
+                serde_json::to_value(hash)
+                    .map_err(|error| format!("encode DAWproject resource hash: {error}"))?,
+            );
+            object.insert("size".to_owned(), Value::from(bytes.len() as u64));
+            object.remove("data");
+            legacy_blobs.push((parsed.path, hash, bytes));
+        }
+    }
+    snapshot["auru_pm_snapshot"] = Value::from(2);
+    let normalized = serde_json::to_vec(snapshot)
+        .map_err(|error| format!("encode normalized DAWproject merge snapshot: {error}"))?;
+    ProjectSnapshot::from_canonical_bytes(&normalized)
+        .map_err(|error| format!("validate normalized DAWproject merge snapshot: {error}"))?;
+
+    for (path, hash, bytes) in legacy_blobs {
+        primary
+            .put_blob(&hash, &bytes)
+            .await
+            .map_err(|error| format!("store legacy DAWproject resource '{path}': {error}"))?;
+    }
+    Ok(())
 }
 
 fn now_epoch_secs() -> i64 {
@@ -243,6 +471,7 @@ async fn build_sample_manifest(
     snapshot: &Value,
     project_root: Option<&Path>,
     policy: &BundlePolicy,
+    detached_resources: &BTreeMap<String, Vec<u8>>,
 ) -> Result<(SampleManifest, Vec<(ContentHash, Vec<u8>)>), String> {
     let mut manifest = SampleManifest::new();
     let mut blobs: Vec<(ContentHash, Vec<u8>)> = Vec::new();
@@ -273,27 +502,57 @@ async fn build_sample_manifest(
         blobs.push((hash, bytes));
     }
 
-    // DAWproject carries media inside its ZIP rather than beside the project
-    // file, so there is no filesystem path for `plan_assets` to return. Store
-    // each referenced embedded file as its own object too so the manifest can
-    // inventory and address it independently. Provider restore hydrates from
-    // these objects; the canonical archive remains self-contained as a v1
-    // fallback for `ProjectSnapshot::restore_bytes`. Removing that duplicate
-    // copy is a future snapshot-schema change, not something to do silently.
-    for asset in crate::dawproject::embedded_assets_from_value(snapshot) {
-        let hash = ContentHash::of(&asset.data);
-        primary
-            .put_blob(&hash, &asset.data)
-            .await
-            .map_err(|e| format!("put embedded asset blob '{}': {e}", asset.path))?;
+    // DAWproject v2 keeps opaque archive entries out of canonical JSON.
+    // Locally-created resources arrive in `detached_resources`; resources
+    // selected from a remote merge are already in the provider CAS.
+    for resource in crate::dawproject::snapshot_resources_from_value(snapshot)
+        .map_err(|error| format!("read DAWproject resources: {error}"))?
+    {
+        let matching_candidate = detached_resources
+            .get(&resource.path)
+            .filter(|bytes| {
+                ContentHash::of(bytes) == resource.hash && bytes.len() as u64 == resource.size
+            })
+            .cloned()
+            .or_else(|| {
+                resource.inline_data.filter(|bytes| {
+                    ContentHash::of(bytes) == resource.hash && bytes.len() as u64 == resource.size
+                })
+            });
+        if let Some(bytes) = matching_candidate {
+            primary
+                .put_blob(&resource.hash, &bytes)
+                .await
+                .map_err(|e| format!("put embedded asset blob '{}': {e}", resource.path))?;
+            blobs.push((resource.hash, bytes));
+        } else {
+            let bytes = primary
+                .get_blob(&resource.hash)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "DAWproject resource '{}' is detached from its snapshot and could not be read from the provider ({error}); build PushOptions with PushOptions::for_snapshot for a newly loaded project",
+                        resource.path
+                    )
+                })?;
+            let actual_hash = ContentHash::of(&bytes);
+            if actual_hash != resource.hash || bytes.len() as u64 != resource.size {
+                return Err(format!(
+                    "provider copy of DAWproject resource '{}' does not match its snapshot hash and size",
+                    resource.path
+                ));
+            }
+            // Mirror fan-out needs every final resource, including one chosen
+            // from the remote side of a merge that this machine never loaded.
+            blobs.push((resource.hash, bytes));
+        }
         manifest.insert(SampleEntry {
-            path: asset.path,
-            hash,
-            size: asset.data.len() as u64,
-            kind: asset.kind,
+            path: resource.path,
+            hash: resource.hash,
+            size: resource.size,
+            kind: resource.kind,
             origin: None,
         });
-        blobs.push((hash, asset.data));
     }
 
     Ok((manifest, blobs))
@@ -485,9 +744,13 @@ async fn push_to_mirror(
 /// Returns `PushOutcome::NeedsResolution` when the merge cannot be
 /// completed automatically. Returns `Err(String)` only for hard failures
 /// (I/O, serialization, repeated HEAD races).
+///
+/// This legacy byte-only entry point is suitable for native Auru, Ableton,
+/// FL Studio, and self-contained DAWproject v1 snapshots. Newly loaded
+/// DAWproject v2 snapshots detach their archive resources; push those through
+/// [`push_with_options`] with [`PushOptions::for_snapshot`].
 // This is a stable public coordinator API whose parameters represent distinct
-// caller-owned resources; keep it source-compatible until a versioned options
-// type can be introduced.
+// caller-owned resources. New optional behavior belongs in `PushOptions`.
 #[expect(clippy::too_many_arguments)]
 pub async fn push_with_freshness_check(
     primary: &dyn ProjectProvider,
@@ -499,6 +762,34 @@ pub async fn push_with_freshness_check(
     message: &str,
     description: &str,
 ) -> Result<PushOutcome, String> {
+    let options = PushOptions::default();
+    push_with_options(
+        primary,
+        primary_id,
+        mirrors,
+        sidecar_path,
+        snapshot_bytes,
+        author,
+        message,
+        description,
+        &options,
+    )
+    .await
+}
+
+/// Push with caller-controlled project bundling behavior.
+#[expect(clippy::too_many_arguments)]
+pub async fn push_with_options(
+    primary: &dyn ProjectProvider,
+    primary_id: &str,
+    mirrors: &[(String, Arc<dyn ProjectProvider>)],
+    sidecar_path: &Path,
+    snapshot_bytes: &[u8],
+    author: AuthorIdentity,
+    message: &str,
+    description: &str,
+    options: &PushOptions,
+) -> Result<PushOutcome, String> {
     push_with_optional_resolutions(
         primary,
         primary_id,
@@ -508,7 +799,9 @@ pub async fn push_with_freshness_check(
         author,
         message,
         description,
-        None,
+        options.conflict_resolutions.as_deref(),
+        &options.bundle_policy,
+        &options.snapshot_resources,
     )
     .await
 }
@@ -519,6 +812,11 @@ pub async fn push_with_freshness_check(
 /// The provider head and conflict set are recomputed before applying choices,
 /// so a remote change between displaying and confirming the resolver cannot
 /// silently commit against stale data.
+///
+/// This legacy byte-only retry has the same DAWproject v2 limitation as
+/// [`push_with_freshness_check`]. Set `conflict_resolutions` on
+/// [`PushOptions`] created with [`PushOptions::for_snapshot`] and call
+/// [`push_with_options`] when the snapshot has detached resources.
 // This extends the stable coordinator API with explicit resolutions; see
 // `push_with_freshness_check` for why these inputs remain separate.
 #[expect(clippy::too_many_arguments)]
@@ -533,7 +831,11 @@ pub async fn push_with_conflict_resolutions(
     description: &str,
     resolutions: &[ConflictResolution],
 ) -> Result<PushOutcome, String> {
-    push_with_optional_resolutions(
+    let options = PushOptions {
+        conflict_resolutions: Some(resolutions.to_vec()),
+        ..PushOptions::default()
+    };
+    push_with_options(
         primary,
         primary_id,
         mirrors,
@@ -542,7 +844,7 @@ pub async fn push_with_conflict_resolutions(
         author,
         message,
         description,
-        Some(resolutions),
+        &options,
     )
     .await
 }
@@ -559,6 +861,8 @@ async fn push_with_optional_resolutions(
     message: &str,
     description: &str,
     resolutions: Option<&[ConflictResolution]>,
+    bundle_policy: &BundlePolicy,
+    snapshot_resources: &BTreeMap<String, Vec<u8>>,
 ) -> Result<PushOutcome, String> {
     let remote_head = primary
         .get_head()
@@ -591,6 +895,7 @@ async fn push_with_optional_resolutions(
                     primary,
                     sidecar_path,
                     snapshot_bytes,
+                    snapshot_resources,
                     local_head,
                     "before merging with the latest version",
                 )
@@ -617,12 +922,15 @@ async fn push_with_optional_resolutions(
                     .map_err(|e| format!("get remote snapshot: {e}"))?;
 
                 // Parse all three states.
-                let ancestor_json: Value = serde_json::from_slice(&ancestor_bytes)
+                let mut ancestor_json: Value = serde_json::from_slice(&ancestor_bytes)
                     .map_err(|e| format!("parse ancestor snapshot: {e}"))?;
-                let current_local: Value = serde_json::from_slice(snapshot_bytes)
+                let mut current_local: Value = serde_json::from_slice(snapshot_bytes)
                     .map_err(|e| format!("parse local snapshot: {e}"))?;
-                let remote_json: Value = serde_json::from_slice(&remote_bytes)
+                let mut remote_json: Value = serde_json::from_slice(&remote_bytes)
                     .map_err(|e| format!("parse remote snapshot: {e}"))?;
+                normalize_dawproject_for_merge(primary, &mut ancestor_json).await?;
+                normalize_dawproject_for_merge(primary, &mut current_local).await?;
+                normalize_dawproject_for_merge(primary, &mut remote_json).await?;
 
                 match merge3(&ancestor_json, &current_local, &remote_json) {
                     MergeOutcome::Conflict { base, conflicts } => {
@@ -682,11 +990,14 @@ async fn push_with_optional_resolutions(
     // in the CAS, and build the manifest that the commit will point at.
     let final_snapshot: Value = serde_json::from_slice(&final_snapshot_bytes)
         .map_err(|e| format!("parse final snapshot: {e}"))?;
+    ProjectSnapshot::from_canonical_bytes(&final_snapshot_bytes)
+        .map_err(|error| format!("validate final snapshot: {error}"))?;
     let (manifest, sample_blobs) = build_sample_manifest(
         primary,
         &final_snapshot,
         project_root_for(sidecar_path),
-        &BundlePolicy::default(),
+        bundle_policy,
+        snapshot_resources,
     )
     .await?;
 
@@ -939,6 +1250,33 @@ mod tests {
             .unwrap()
     }
 
+    fn dawproject_with_resource(bytes: &[u8]) -> ProjectSnapshot {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        archive.start_file("project.xml", options).unwrap();
+        archive
+            .write_all(br#"<Project version="1.0"><Structure/></Project>"#)
+            .unwrap();
+        archive.start_file("audio/take.wav", options).unwrap();
+        archive.write_all(bytes).unwrap();
+        let source = archive.finish().unwrap().into_inner();
+        ProjectSnapshot::from_source_bytes(ProjectFormat::Dawproject, &source).unwrap()
+    }
+
+    fn dawproject_v1_value(bytes: &[u8]) -> Value {
+        let snapshot = dawproject_with_resource(bytes);
+        let mut value: Value = serde_json::from_slice(snapshot.as_bytes()).unwrap();
+        value["auru_pm_snapshot"] = Value::from(1);
+        let resource = value["resources"][0].as_object_mut().unwrap();
+        resource.insert(
+            "data".into(),
+            Value::String(base64::engine::general_purpose::STANDARD.encode(bytes)),
+        );
+        resource.remove("hash");
+        resource.remove("size");
+        value
+    }
+
     #[test]
     fn explicit_verification_should_detect_a_missing_uploaded_snapshot() {
         let dir = TempDir::new().unwrap();
@@ -1014,6 +1352,7 @@ mod tests {
                 &snapshot,
                 None,
                 &BundlePolicy::default(),
+                &BTreeMap::new(),
             ))
             .unwrap();
 
@@ -1061,6 +1400,7 @@ mod tests {
                 &snapshot,
                 None,
                 &BundlePolicy::default(),
+                &BTreeMap::new(),
             ))
             .unwrap();
 
@@ -1105,6 +1445,7 @@ mod tests {
                 &value,
                 None,
                 &BundlePolicy::default(),
+                &snapshot.detached_resources_handle(),
             ))
             .expect("manifest");
 
@@ -1123,6 +1464,154 @@ mod tests {
                 .expect("stored asset"),
             b"embedded-audio"
         );
+    }
+
+    #[test]
+    fn remote_dawproject_resource_should_win_when_the_local_path_has_other_bytes() {
+        let dir = TempDir::new().unwrap();
+        let provider = FilesystemProvider::open(dir.path().join("cas")).unwrap();
+        let local = dawproject_with_resource(b"local version");
+        let remote = dawproject_with_resource(b"remote version");
+        let remote_value: Value = serde_json::from_slice(remote.as_bytes()).unwrap();
+        let remote_resource =
+            crate::dawproject::snapshot_resources_from_value(&remote_value).unwrap()[0].hash;
+        rt().block_on(provider.put_blob(&remote_resource, b"remote version"))
+            .unwrap();
+
+        let (manifest, blobs) = rt()
+            .block_on(build_sample_manifest(
+                &provider,
+                &remote_value,
+                None,
+                &BundlePolicy::default(),
+                &local.detached_resources_handle(),
+            ))
+            .expect("remote CAS bytes should satisfy the final descriptor");
+
+        assert_eq!(manifest.entries[0].hash, remote_resource);
+        assert_eq!(blobs, vec![(remote_resource, b"remote version".to_vec())]);
+    }
+
+    #[test]
+    fn v1_inline_resource_should_win_when_detached_bytes_at_its_path_do_not_match() {
+        let dir = TempDir::new().unwrap();
+        let provider = FilesystemProvider::open(dir.path().join("cas")).unwrap();
+        let local = dawproject_with_resource(b"local version");
+        let remote_value = dawproject_v1_value(b"remote inline version");
+
+        let (manifest, blobs) = rt()
+            .block_on(build_sample_manifest(
+                &provider,
+                &remote_value,
+                None,
+                &BundlePolicy::default(),
+                &local.detached_resources_handle(),
+            ))
+            .expect("v1 inline bytes should remain a complete fallback");
+
+        let expected_hash = ContentHash::of(b"remote inline version");
+        assert_eq!(manifest.entries[0].hash, expected_hash);
+        assert_eq!(
+            blobs,
+            vec![(expected_hash, b"remote inline version".to_vec())]
+        );
+    }
+
+    #[test]
+    fn mixed_v1_v2_resource_conflict_should_resolve_to_one_valid_v2_descriptor() {
+        let dir = TempDir::new().unwrap();
+        let provider = FilesystemProvider::open(dir.path().join("cas")).unwrap();
+        let mut ancestor = dawproject_v1_value(b"ancestor version");
+        let local_snapshot = dawproject_with_resource(b"local version");
+        let mut local: Value = serde_json::from_slice(local_snapshot.as_bytes()).unwrap();
+        let mut remote = dawproject_v1_value(b"remote version");
+
+        rt().block_on(async {
+            normalize_dawproject_for_merge(&provider, &mut ancestor)
+                .await
+                .unwrap();
+            normalize_dawproject_for_merge(&provider, &mut local)
+                .await
+                .unwrap();
+            normalize_dawproject_for_merge(&provider, &mut remote)
+                .await
+                .unwrap();
+        });
+        assert_eq!(ancestor["auru_pm_snapshot"], 2);
+        assert_eq!(local["auru_pm_snapshot"], 2);
+        assert_eq!(remote["auru_pm_snapshot"], 2);
+        assert!(remote["resources"][0].get("data").is_none());
+
+        let MergeOutcome::Conflict { base, conflicts } = merge3(&ancestor, &local, &remote) else {
+            panic!("both sides changed the same resource");
+        };
+        let choices = vec![crate::merge::ConflictChoice::Remote; conflicts.len()];
+        let resolved = resolve_conflicts(base, &conflicts, &choices).unwrap();
+        let bytes = serde_json::to_vec(&resolved).unwrap();
+        ProjectSnapshot::from_canonical_bytes(&bytes).expect("resolved v2 snapshot is valid");
+        let (manifest, blobs) = rt()
+            .block_on(build_sample_manifest(
+                &provider,
+                &resolved,
+                None,
+                &BundlePolicy::default(),
+                &local_snapshot.detached_resources_handle(),
+            ))
+            .expect("remote legacy bytes were retained in CAS");
+
+        let remote_hash = ContentHash::of(b"remote version");
+        assert_eq!(manifest.entries[0].hash, remote_hash);
+        assert_eq!(blobs, vec![(remote_hash, b"remote version".to_vec())]);
+    }
+
+    #[test]
+    fn verification_should_require_every_detached_dawproject_resource_in_the_manifest() {
+        let snapshot = dawproject_with_resource(b"provider asset");
+        let fetched = ProjectSnapshot::from_canonical_bytes(snapshot.as_bytes()).unwrap();
+        let error = verify_snapshot_manifest(&fetched, snapshot.as_bytes(), &SampleManifest::new())
+            .expect_err("detached resource must be represented by the manifest");
+
+        assert!(error.to_string().contains("audio/take.wav"), "{error}");
+    }
+
+    #[test]
+    fn dawproject_stash_should_restore_detached_resources_after_reopening_provider() {
+        let dir = TempDir::new().unwrap();
+        let provider_path = dir.path().join("cas");
+        let sidecar = dir.path().join("song.dawproject-pm.json");
+        let snapshot = dawproject_with_resource(b"stashed audio");
+        let provider = FilesystemProvider::open(&provider_path).unwrap();
+        rt().block_on(stash_snapshot(
+            &provider,
+            &sidecar,
+            snapshot.as_bytes(),
+            &snapshot.detached_resources_handle(),
+            None,
+            "test recovery",
+        ))
+        .expect("stash");
+        drop(provider);
+
+        let reopened = FilesystemProvider::open(provider_path).unwrap();
+        let recovered = rt()
+            .block_on(stashed_snapshot(&reopened, &sidecar))
+            .expect("read stash")
+            .expect("stash exists");
+        let recovered = ProjectSnapshot::from_canonical_bytes(&recovered).unwrap();
+        let restored = recovered.restore_bytes().expect("restore complete archive");
+        let mut archive = zip::ZipArchive::new(Cursor::new(restored)).unwrap();
+        let mut resource = Vec::new();
+        std::io::Read::read_to_end(
+            &mut archive.by_name("audio/take.wav").unwrap(),
+            &mut resource,
+        )
+        .unwrap();
+
+        assert_eq!(resource, b"stashed audio");
+        let restored = archive.into_inner().into_inner();
+        let renormalized = ProjectSnapshot::from_source_bytes(ProjectFormat::Dawproject, &restored)
+            .expect("re-normalize restored stash");
+        assert_eq!(renormalized.as_bytes(), snapshot.as_bytes());
     }
 
     #[test]
@@ -1208,8 +1697,12 @@ mod tests {
             conflict: conflicts[0].clone(),
             choice: crate::merge::ConflictChoice::Local,
         }];
+        let options = PushOptions {
+            conflict_resolutions: Some(resolutions),
+            ..PushOptions::default()
+        };
         let resolved = rt()
-            .block_on(push_with_conflict_resolutions(
+            .block_on(push_with_options(
                 &provider,
                 &provider_id,
                 &[],
@@ -1218,7 +1711,7 @@ mod tests {
                 author("Local"),
                 "Resolved edit",
                 "",
-                &resolutions,
+                &options,
             ))
             .unwrap();
         let PushOutcome::Committed {

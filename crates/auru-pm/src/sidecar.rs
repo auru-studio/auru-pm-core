@@ -13,6 +13,7 @@
 //! conflict at the application layer; for now we assume Auru desktop
 //! is the only writer per host.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -94,6 +95,13 @@ pub struct Sidecar {
 pub struct Stash {
     /// CAS hash of the local snapshot as it stood before merging.
     pub snapshot: ContentHash,
+    /// DAWproject archive resources detached from a version-two snapshot.
+    ///
+    /// Keeping these hashes beside the snapshot makes a stash independently
+    /// restorable after restart and lets retention protect every required
+    /// object until the stash is accepted or discarded.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resources: BTreeMap<String, ContentHash>,
     /// Unix epoch seconds the stash was taken.
     pub created_at: i64,
     /// Commit the local work was based on, for context when restoring.

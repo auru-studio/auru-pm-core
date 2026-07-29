@@ -1,5 +1,6 @@
 /target
+/auru-pm-server-data
 **/*.rs.bk
 .DS_Store
 
-apps/*//target
+apps/*/target
