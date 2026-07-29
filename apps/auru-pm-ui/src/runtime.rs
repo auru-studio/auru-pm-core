@@ -20,10 +20,8 @@ mod tests {
 
     #[test]
     fn a_network_future_should_not_need_an_ambient_tokio_runtime() {
-        let result = block_on(auru_pm::HttpProvider::probe_health(
-            "http://localhost:9",
-        ))
-        .expect("the bridge should create its own runtime");
+        let result = block_on(auru_pm::HttpProvider::probe_health("http://localhost:9"))
+            .expect("the bridge should create its own runtime");
 
         assert!(
             result.is_err(),

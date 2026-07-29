@@ -1,6 +1,7 @@
 mod automatic_backup;
 mod backend;
 mod catalog;
+mod inspection;
 mod menus;
 mod model;
 mod runtime;
@@ -188,6 +189,18 @@ enum AuthPhase {
     Failed(String),
 }
 
+impl AuthPhase {
+    const fn inspection_value(&self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Waiting => "waiting",
+            Self::DeviceCode { .. } => "device_code",
+            Self::Complete { .. } => "complete",
+            Self::Failed(_) => "failed",
+        }
+    }
+}
+
 /// How much version history to keep after each successful backup.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum VersionRetention {
@@ -279,6 +292,8 @@ struct ProjectManager {
     /// Provider catalogue failures from the latest refresh.
     remote_discovery_errors: Vec<String>,
     pending_conflict: Option<PendingConflict>,
+    /// Present only for an explicitly requested `--inspect` launch.
+    inspection: Option<inspection::InspectionPublisher>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -460,6 +475,7 @@ impl ProjectManager {
             remote_refresh_pending: false,
             remote_discovery_errors: Vec::new(),
             pending_conflict: None,
+            inspection: None,
             _subscriptions,
         }
     }
@@ -1636,10 +1652,8 @@ impl ProjectManager {
             self.credential_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
             self.auth_phase = AuthPhase::Ready;
-            self.overlay.show(
-                overlay_host,
-                Overlay::Authenticate { provider_index },
-            );
+            self.overlay
+                .show(overlay_host, Overlay::Authenticate { provider_index });
         } else {
             let provider_name = self
                 .mark_provider_connected(provider_index)
@@ -3354,9 +3368,7 @@ impl ProjectManager {
                 self.providers
                     .iter()
                     .enumerate()
-                    .map(|(index, provider)| {
-                        self.render_settings_provider(index, provider, cx)
-                    }),
+                    .map(|(index, provider)| self.render_settings_provider(index, provider, cx)),
             )
             .child(
                 div()
@@ -4410,7 +4422,586 @@ impl ProjectManager {
         }
     }
 
-    fn settings_window_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn inspection_focus(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let input = match id {
+            "search-projects" => Some(self.search_input.clone()),
+            "display-name-input" => Some(self.display_name_input.clone()),
+            "display-name-setting" => Some(self.display_name_setting.clone()),
+            "credential-input" => Some(self.credential_input.clone()),
+            "path-alias-input" => Some(self.path_alias_input.clone()),
+            inspection::ROOT_ID => {
+                self.focus_handle.focus(window, cx);
+                None
+            }
+            _ => return Err(format!("semantic node '{id}' cannot receive focus")),
+        };
+        if let Some(input) = input {
+            let target = window.window_handle();
+            // Focusing the input notifies its subscribers. Run it after this
+            // ProjectManager update completes so that notification cannot
+            // re-enter the entity while it is already borrowed.
+            cx.defer(move |cx| {
+                _ = target.update(cx, |_, window, cx| {
+                    input.update(cx, |input, cx| input.focus(window, cx));
+                });
+            });
+        }
+        if let Some(inspection) = self.inspection.as_mut() {
+            inspection.set_focused_id(id);
+        }
+        cx.notify();
+        Ok(())
+    }
+
+    fn inspection_click(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        match id {
+            "backup-all" => self.back_up_all(window, cx),
+            "shortcut-refresh" => self.reload_library(window, cx),
+            "open-settings" => self.open_settings(cx),
+            "onboarding-choose-provider" => {
+                self.overlay
+                    .show(OverlayHost::Main, Overlay::ProviderPicker);
+                cx.notify();
+            }
+            "onboarding-watch-folder" | "watch-another-folder" => {
+                if self.scanning {
+                    return Err("a project-folder scan is already running".to_owned());
+                }
+                self.watch_another_folder(window, cx);
+            }
+            "continue-onboarding" => self.advance_onboarding(window, cx),
+            "previous-onboarding" => self.previous_onboarding_step(cx),
+            "add-provider" => {
+                self.overlay
+                    .show(OverlayHost::Settings, Overlay::ProviderPicker);
+                cx.notify();
+            }
+            "automatic-backups" => {
+                self.automatic_backups = !self.automatic_backups;
+                self.state.automatic_backups = self.automatic_backups;
+                self.state.save();
+                cx.notify();
+            }
+            "verify-uploads" => {
+                self.verify_uploads = !self.verify_uploads;
+                self.state.verify_uploads = self.verify_uploads;
+                self.state.save();
+                cx.notify();
+            }
+            "add-path-alias" => self.add_path_alias(window, cx),
+            "save-display-name" => {
+                self.commit_display_name(cx);
+                window.push_notification(
+                    Notification::success(format!(
+                        "New versions will be saved as {}.",
+                        self.display_name
+                    ))
+                    .title("Name updated"),
+                    cx,
+                );
+            }
+            "refresh-provider-projects" => {
+                if self.remote_refreshing {
+                    return Err("provider projects are already refreshing".to_owned());
+                }
+                self.refresh_remote_projects(cx);
+            }
+            "close-provider-picker" => {
+                self.overlay.clear();
+                cx.notify();
+            }
+            "add-local-provider" => self.add_local_provider(window, cx),
+            "begin-provider-auth" => {
+                let Overlay::Authenticate { provider_index } = self.overlay.overlay else {
+                    return Err("provider authentication is not open".to_owned());
+                };
+                self.begin_provider_auth(provider_index, window, cx);
+            }
+            "open-provider-sign-in" => {
+                let AuthPhase::DeviceCode {
+                    verification_uri, ..
+                } = &self.auth_phase
+                else {
+                    return Err("the provider has not supplied a sign-in page".to_owned());
+                };
+                cx.open_url(verification_uri);
+            }
+            "finish-provider-auth" => {
+                let Overlay::Authenticate { provider_index } = self.overlay.overlay else {
+                    return Err("provider authentication is not open".to_owned());
+                };
+                self.finish_provider_auth(provider_index, window, cx);
+            }
+            "retry-provider-auth" => {
+                self.auth_phase = AuthPhase::Ready;
+                cx.notify();
+            }
+            "cancel-provider-auth" => self.cancel_provider_auth(cx),
+            _ => {
+                if id.starts_with("project-primary-action-") {
+                    let index = self
+                        .projects
+                        .iter()
+                        .position(|project| {
+                            inspection::stable_id("project-primary-action", &project.id) == id
+                        })
+                        .ok_or_else(|| format!("unknown semantic project action '{id}'"))?;
+                    if self.projects[index].status.action() == ProjectAction::None {
+                        return Err("that project action is currently unavailable".to_owned());
+                    }
+                    self.handle_project_action(index, window, cx);
+                } else if id.starts_with("project-") {
+                    let index = self
+                        .projects
+                        .iter()
+                        .position(|project| inspection::stable_id("project", &project.id) == id)
+                        .ok_or_else(|| format!("unknown semantic project '{id}'"))?;
+                    self.select_project(index, cx);
+                } else if let Some(provider_id) = id.strip_prefix("settings-provider-") {
+                    let index = self
+                        .providers
+                        .iter()
+                        .position(|provider| provider.entry.id == provider_id)
+                        .ok_or_else(|| format!("unknown provider '{provider_id}'"))?;
+                    if self.providers[index].is_connected() {
+                        return Err("that provider is already connected".to_owned());
+                    }
+                    self.select_provider(index, OverlayHost::Settings, window, cx);
+                } else if let Some(provider_id) = id.strip_prefix("catalog-provider-") {
+                    let index = self
+                        .providers
+                        .iter()
+                        .position(|provider| provider.entry.id == provider_id)
+                        .ok_or_else(|| format!("unknown provider '{provider_id}'"))?;
+                    if self.providers[index].is_connected() {
+                        return Err("that provider is already connected".to_owned());
+                    }
+                    self.select_provider(index, self.overlay.host, window, cx);
+                } else {
+                    return Err(format!("semantic node '{id}' is not clickable"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn inspection_nodes(&self, cx: &App) -> Vec<gpui_mcp::SemanticNode> {
+        let focused_id = self
+            .inspection
+            .as_ref()
+            .and_then(inspection::InspectionPublisher::focused_id);
+        let focused = |id: &str| focused_id == Some(id);
+        let button = |id: String, label: String, value: Option<String>, enabled: bool| {
+            inspection::node(
+                id,
+                "button",
+                label,
+                value,
+                false,
+                if enabled { &["click"] } else { &[] },
+            )
+        };
+        let mut nodes = Vec::new();
+
+        match self.route {
+            Route::Library => {
+                let attention = self
+                    .projects
+                    .iter()
+                    .filter(|project| project.status.needs_attention())
+                    .count();
+                nodes.push(inspection::node(
+                    "library",
+                    "region",
+                    "Project library",
+                    Some(format!(
+                        "{} projects; {attention} need attention",
+                        self.projects.len()
+                    )),
+                    false,
+                    &[],
+                ));
+                nodes.push(inspection::node(
+                    "search-projects",
+                    "textbox",
+                    "Search projects",
+                    Some(self.search_input.read(cx).value().to_string()),
+                    focused("search-projects"),
+                    &["focus", "type_text"],
+                ));
+                nodes.push(button(
+                    "backup-all".to_owned(),
+                    "Back up all changes".to_owned(),
+                    None,
+                    self.projects
+                        .iter()
+                        .any(|project| project.status.action() == ProjectAction::Push),
+                ));
+                nodes.push(button(
+                    "shortcut-refresh".to_owned(),
+                    "Refresh library".to_owned(),
+                    None,
+                    true,
+                ));
+                nodes.push(button(
+                    "open-settings".to_owned(),
+                    "Open settings".to_owned(),
+                    Some(
+                        if self.settings_window.is_some() {
+                            "open"
+                        } else {
+                            "closed"
+                        }
+                        .to_owned(),
+                    ),
+                    true,
+                ));
+
+                let search_query = self.search_input.read(cx).value().to_lowercase();
+                for (index, project) in self
+                    .projects
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, project)| project.matches_search(&search_query))
+                    // The visual list is virtualized too. A bounded semantic
+                    // page keeps a large real library from flooding every MCP
+                    // tree response; narrowing the search exposes later rows.
+                    .take(100)
+                {
+                    let selected = index == self.selected_project;
+                    nodes.push(button(
+                        inspection::stable_id("project", &project.id),
+                        project.name.clone(),
+                        Some(format!(
+                            "{}; {}",
+                            if selected { "selected" } else { "not_selected" },
+                            project.list_status()
+                        )),
+                        true,
+                    ));
+                    if selected {
+                        let action = project.status.action();
+                        nodes.push(button(
+                            inspection::stable_id("project-primary-action", &project.id),
+                            format!("{}: {}", project.name, action.label()),
+                            Some(project.list_status()),
+                            action != ProjectAction::None,
+                        ));
+                    }
+                }
+            }
+            Route::Onboarding => {
+                let (position, total) = self.onboarding_step.position();
+                nodes.push(inspection::node(
+                    "onboarding",
+                    "region",
+                    "Auru PM setup",
+                    Some(format!("{position}/{total}")),
+                    false,
+                    &[],
+                ));
+                match self.onboarding_step {
+                    OnboardingStep::Profile => nodes.push(inspection::node(
+                        "display-name-input",
+                        "textbox",
+                        "Display name",
+                        Some(self.display_name_input.read(cx).value().to_string()),
+                        focused("display-name-input"),
+                        &["focus", "type_text"],
+                    )),
+                    OnboardingStep::Provider => nodes.push(button(
+                        "onboarding-choose-provider".to_owned(),
+                        "Choose a backup destination".to_owned(),
+                        Some(format!(
+                            "{} connected",
+                            self.providers
+                                .iter()
+                                .filter(|provider| provider.is_connected())
+                                .count()
+                        )),
+                        true,
+                    )),
+                    OnboardingStep::Music => nodes.push(button(
+                        "onboarding-watch-folder".to_owned(),
+                        "Choose a project folder".to_owned(),
+                        Some(format!("{} watched", self.state.watched_folders.len())),
+                        !self.scanning,
+                    )),
+                }
+                let can_continue = self.onboarding_step != OnboardingStep::Profile
+                    || !self.display_name_input.read(cx).value().trim().is_empty();
+                nodes.push(button(
+                    "continue-onboarding".to_owned(),
+                    "Continue setup".to_owned(),
+                    None,
+                    can_continue,
+                ));
+                nodes.push(button(
+                    "previous-onboarding".to_owned(),
+                    "Previous setup step".to_owned(),
+                    None,
+                    true,
+                ));
+            }
+        }
+
+        if self.settings_window.is_some() {
+            nodes.push(inspection::node(
+                "settings",
+                "window",
+                "Auru PM settings",
+                Some("open".to_owned()),
+                false,
+                &[],
+            ));
+            nodes.push(button(
+                "add-provider".to_owned(),
+                "Add another provider".to_owned(),
+                None,
+                true,
+            ));
+            nodes.push(button(
+                "automatic-backups".to_owned(),
+                "Back up automatically after changes".to_owned(),
+                Some(self.automatic_backups.to_string()),
+                true,
+            ));
+            nodes.push(button(
+                "verify-uploads".to_owned(),
+                "Verify every copy after upload".to_owned(),
+                Some(self.verify_uploads.to_string()),
+                true,
+            ));
+            nodes.push(button(
+                "watch-another-folder".to_owned(),
+                "Watch another project folder".to_owned(),
+                Some(if self.scanning { "scanning" } else { "ready" }.to_owned()),
+                !self.scanning,
+            ));
+            nodes.push(inspection::node(
+                "path-alias-input",
+                "textbox",
+                "Recorded path prefix",
+                Some(self.path_alias_input.read(cx).value().to_string()),
+                focused("path-alias-input"),
+                &["focus", "type_text"],
+            ));
+            nodes.push(button(
+                "add-path-alias".to_owned(),
+                "Choose local folder for path prefix".to_owned(),
+                None,
+                true,
+            ));
+            nodes.push(inspection::node(
+                "display-name-setting",
+                "textbox",
+                "Display name",
+                Some(self.display_name_setting.read(cx).value().to_string()),
+                focused("display-name-setting"),
+                &["focus", "type_text"],
+            ));
+            nodes.push(button(
+                "save-display-name".to_owned(),
+                "Save display name".to_owned(),
+                None,
+                true,
+            ));
+            nodes.push(button(
+                "refresh-provider-projects".to_owned(),
+                "Refresh provider projects".to_owned(),
+                Some(
+                    if self.remote_refreshing {
+                        "refreshing"
+                    } else {
+                        "ready"
+                    }
+                    .to_owned(),
+                ),
+                !self.remote_refreshing,
+            ));
+            for provider in &self.providers {
+                nodes.push(button(
+                    format!("settings-provider-{}", provider.entry.id),
+                    provider.entry.name.clone(),
+                    Some(provider.availability.label().to_owned()),
+                    !provider.is_connected(),
+                ));
+            }
+        }
+
+        match self.overlay.overlay {
+            Overlay::None => {}
+            Overlay::ProviderPicker => {
+                nodes.push(inspection::node(
+                    "provider-picker",
+                    "dialog",
+                    "Add a provider",
+                    Some(
+                        match self.overlay.host {
+                            OverlayHost::Main => "main",
+                            OverlayHost::Settings => "settings",
+                        }
+                        .to_owned(),
+                    ),
+                    false,
+                    &[],
+                ));
+                for provider in &self.providers {
+                    nodes.push(button(
+                        format!("catalog-provider-{}", provider.entry.id),
+                        provider.entry.name.clone(),
+                        Some(provider.availability.label().to_owned()),
+                        !provider.is_connected(),
+                    ));
+                }
+                nodes.push(button(
+                    "add-local-provider".to_owned(),
+                    "Add a local folder or NAS".to_owned(),
+                    None,
+                    true,
+                ));
+                nodes.push(button(
+                    "close-provider-picker".to_owned(),
+                    "Close provider picker".to_owned(),
+                    None,
+                    true,
+                ));
+            }
+            Overlay::Authenticate { provider_index } => {
+                let provider_name = self
+                    .providers
+                    .get(provider_index)
+                    .map(|provider| provider.entry.name.clone())
+                    .unwrap_or_else(|| "Unavailable provider".to_owned());
+                nodes.push(inspection::node(
+                    "provider-auth",
+                    "dialog",
+                    format!("Connect {provider_name}"),
+                    Some(self.auth_phase.inspection_value().to_owned()),
+                    false,
+                    &[],
+                ));
+                if self
+                    .providers
+                    .get(provider_index)
+                    .is_some_and(|provider| provider.auth_hint().accepts_credential)
+                {
+                    nodes.push(inspection::node(
+                        "credential-input",
+                        "textbox",
+                        "Personal access token",
+                        Some(
+                            if self.credential_input.read(cx).value().is_empty() {
+                                "empty"
+                            } else {
+                                "provided"
+                            }
+                            .to_owned(),
+                        ),
+                        focused("credential-input"),
+                        &["focus", "type_text"],
+                    ));
+                }
+                match &self.auth_phase {
+                    AuthPhase::Ready => nodes.push(button(
+                        "begin-provider-auth".to_owned(),
+                        "Begin provider authentication".to_owned(),
+                        None,
+                        true,
+                    )),
+                    AuthPhase::Waiting => {}
+                    AuthPhase::DeviceCode {
+                        user_code,
+                        verification_uri,
+                    } => {
+                        nodes.push(inspection::node(
+                            "provider-device-code",
+                            "status",
+                            "Provider device code",
+                            Some(user_code.clone()),
+                            false,
+                            &[],
+                        ));
+                        nodes.push(button(
+                            "open-provider-sign-in".to_owned(),
+                            "Open provider sign-in page".to_owned(),
+                            Some(verification_uri.clone()),
+                            true,
+                        ));
+                    }
+                    AuthPhase::Complete { detail } => nodes.push(button(
+                        "finish-provider-auth".to_owned(),
+                        "Return to settings".to_owned(),
+                        Some(detail.clone()),
+                        true,
+                    )),
+                    AuthPhase::Failed(message) => nodes.push(button(
+                        "retry-provider-auth".to_owned(),
+                        "Retry provider authentication".to_owned(),
+                        Some(message.clone()),
+                        true,
+                    )),
+                }
+                nodes.push(button(
+                    "cancel-provider-auth".to_owned(),
+                    "Cancel provider authentication".to_owned(),
+                    None,
+                    true,
+                ));
+            }
+            Overlay::ConflictResolver => nodes.push(inspection::node(
+                "conflict-resolver",
+                "dialog",
+                "Resolve backup conflict",
+                self.pending_conflict
+                    .as_ref()
+                    .map(|pending| pending.project_name.clone()),
+                false,
+                &[],
+            )),
+        }
+
+        nodes
+    }
+
+    fn publish_inspection(&mut self, surface: &'static str, window: &Window, cx: &Context<Self>) {
+        let nodes = self.inspection_nodes(cx);
+        if let Some(inspection) = self.inspection.as_mut() {
+            inspection.publish(surface, window, nodes);
+        }
+    }
+
+    fn publish_current_inspection(&mut self, window: &Window, cx: &Context<Self>) {
+        let is_settings = self.settings_window.is_some_and(|settings| {
+            gpui::AnyWindowHandle::from(settings) == window.window_handle()
+        });
+        let surface = if is_settings {
+            "settings"
+        } else {
+            match self.route {
+                Route::Library => "library",
+                Route::Onboarding => "onboarding",
+            }
+        };
+        self.publish_inspection(surface, window, cx);
+    }
+
+    fn settings_window_content(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.publish_inspection("settings", window, cx);
         let content = self.settings_component(cx);
         let overlay = self.render_overlay(OverlayHost::Settings, cx);
 
@@ -4424,7 +5015,12 @@ impl ProjectManager {
 }
 
 impl Render for ProjectManager {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let surface = match self.route {
+            Route::Library => "library",
+            Route::Onboarding => "onboarding",
+        };
+        self.publish_inspection(surface, window, cx);
         let content = match self.route {
             Route::Library => self.render_library(cx),
             Route::Onboarding => self.render_onboarding(cx),
@@ -4717,6 +5313,15 @@ mod cli_tests {
             panic!("no arguments is the ordinary case");
         };
         assert!(options.providers_file.is_none());
+        assert!(!options.inspect);
+    }
+
+    #[test]
+    fn inspection_should_require_an_explicit_flag() {
+        let Startup::Run(options) = parse(&["--inspect"]) else {
+            panic!("the inspection flag should parse");
+        };
+        assert!(options.inspect);
     }
 
     #[test]
@@ -4904,6 +5509,7 @@ mod cli_tests {
     #[test]
     fn usage_should_document_every_flag_that_exists() {
         assert!(USAGE.contains("--providers-file"));
+        assert!(USAGE.contains("--inspect"));
         assert!(USAGE.contains("--help"));
     }
 }
@@ -5140,14 +5746,16 @@ impl SettingsWindow {
 }
 
 impl Render for SettingsWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let manager = self.manager.clone();
         div()
             .size_full()
             .font_family(MONO_FONT)
             .bg(bg())
             .text_color(ink())
-            .child(manager.update(cx, |manager, cx| manager.settings_window_content(cx)))
+            .child(manager.update(cx, |manager, cx| {
+                manager.settings_window_content(window, cx)
+            }))
     }
 }
 
@@ -5208,6 +5816,8 @@ fn open_settings_window(manager: Entity<ProjectManager>, cx: &mut App) {
 struct Options {
     /// A provider list to use instead of the hosted registry.
     providers_file: Option<PathBuf>,
+    /// Enable the authenticated loopback endpoint used by `gpui-mcp`.
+    inspect: bool,
 }
 
 impl Options {
@@ -5221,6 +5831,7 @@ impl Options {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--help" | "-h" => return Startup::ShowUsage,
+                "--inspect" => options.inspect = true,
                 "--providers-file" => {
                     let Some(value) = args.next() else {
                         return Startup::Invalid(
@@ -5256,7 +5867,105 @@ auru-pm-ui — Auru project management
     --providers-file <path>   Load the provider list from a JSON file instead
                               of the hosted registry. See
                               providers.example.json for the format.
+    --inspect                 Enable the authenticated gpui-mcp inspection
+                              endpoint on an ephemeral loopback port.
     -h, --help                Show this message.";
+
+fn enable_inspection(
+    manager: Entity<ProjectManager>,
+    main_window: gpui::AnyWindowHandle,
+    cx: &mut App,
+) {
+    let running = match inspection::start() {
+        Ok(running) => running,
+        Err(error) => {
+            eprintln!("[auru-pm] could not start gpui-mcp inspection: {error}");
+            return;
+        }
+    };
+    eprintln!(
+        "[auru-pm] gpui-mcp attach address={} token={}",
+        running.address, running.token
+    );
+
+    let actions = running.actions;
+    manager.update(cx, |manager, cx| {
+        manager.inspection = Some(running.publisher);
+        cx.notify();
+    });
+
+    cx.spawn(async move |cx| {
+        while let Ok(gpui_mcp::ActionRequest { action, response }) = actions.recv().await {
+            let target = cx.update(|cx| {
+                manager
+                    .read(cx)
+                    .inspection
+                    .as_ref()
+                    .and_then(inspection::InspectionPublisher::active_window)
+                    .unwrap_or(main_window)
+            });
+            let mut result = match target.update(cx, |_, window, cx| {
+                use gpui_mcp::{InspectionAction, InspectionActionResult};
+
+                match action {
+                    InspectionAction::Click { id } => manager.update(cx, |manager, cx| {
+                        manager
+                            .inspection_click(&id, window, cx)
+                            .map(|()| InspectionActionResult::Complete)
+                    }),
+                    InspectionAction::Focus { id } => manager.update(cx, |manager, cx| {
+                        manager
+                            .inspection_focus(&id, window, cx)
+                            .map(|()| InspectionActionResult::Complete)
+                    }),
+                    InspectionAction::Resize { width, height } => {
+                        window.resize(Size {
+                            width: px(width as f32),
+                            height: px(height as f32),
+                        });
+                        window.bounds_changed(cx);
+                        Ok(InspectionActionResult::Complete)
+                    }
+                    InspectionAction::Key { key, modifiers } => {
+                        inspection::press_key(key, modifiers, window, cx)
+                    }
+                    InspectionAction::TypeText { text } => {
+                        inspection::type_text(&text, window, cx)
+                    }
+                    InspectionAction::Scroll {
+                        position,
+                        delta_x,
+                        delta_y,
+                        modifiers,
+                    } => Ok(inspection::scroll(
+                        position, delta_x, delta_y, modifiers, window, cx,
+                    )),
+                    InspectionAction::Drag { from, to } => {
+                        Ok(inspection::drag(from, to, window, cx))
+                    }
+                    InspectionAction::Screenshot { .. } => Err(
+                        "this GPUI platform does not expose runtime window pixels; use semantic state for assertions"
+                            .to_owned(),
+                    ),
+                }
+            }) {
+                Ok(result) => result,
+                Err(error) => Err(format!("update inspected GPUI window: {error}")),
+            };
+            if result.is_ok()
+                && let Err(error) = target.update(cx, |_, window, cx| {
+                    manager.update(cx, |manager, cx| {
+                        manager.publish_current_inspection(window, cx);
+                    });
+                })
+            {
+                result = Err(format!("publish inspected GPUI state: {error}"));
+            }
+            _ = response.send(result);
+        }
+    })
+    .detach();
+}
 
 fn main() {
     let options = match Options::from_args(std::env::args().skip(1)) {
@@ -5284,6 +5993,7 @@ fn main() {
             })
             .detach();
 
+            let mut manager = None;
             let result = cx.open_window(
                 WindowOptions {
                     titlebar: Some(gpui::TitlebarOptions {
@@ -5310,6 +6020,7 @@ fn main() {
                     tint_component_theme(cx);
                     let view: Entity<ProjectManager> =
                         cx.new(|cx| ProjectManager::new(options.clone(), window, cx));
+                    manager = Some(view.clone());
                     view.update(cx, |manager, cx| {
                         manager.refresh_remote_projects(cx);
                         manager.start_automatic_backup_watcher(window, cx);
@@ -5317,9 +6028,18 @@ fn main() {
                     cx.new(|cx| Root::new(view, window, cx))
                 },
             );
-            if let Err(error) = result {
-                eprintln!("failed to open Auru PM window: {error}");
-                cx.quit();
+            match result {
+                Ok(handle) => {
+                    if options.inspect {
+                        let manager =
+                            manager.expect("the project manager is built with the main window");
+                        enable_inspection(manager, handle.into(), cx);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("failed to open Auru PM window: {error}");
+                    cx.quit();
+                }
             }
         });
 }

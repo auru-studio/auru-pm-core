@@ -13,9 +13,11 @@ publish = false
 resolver = "2"
 
 [dependencies]
+async-channel = "2"
 auru-pm = { path = "../../crates/auru-pm" }
 auru-pm-client = { path = "../../crates/auru-pm-client" }
 gpui = { git = "https://github.com/zed-industries/zed" }
+gpui-mcp = "0.1.0"
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = [

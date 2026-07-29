@@ -73,6 +73,26 @@ from an older unauthenticated server is not assigned implicitly: OAuth startup
 refuses until `legacy_owner_subject` explicitly names its owner. Access and
 refresh tokens are stored only in the desktop OS keychain.
 
+## GPUI inspection and automation
+
+The desktop app integrates the published `gpui-mcp` crate behind an explicit
+development/test flag. Start the app with inspection enabled:
+
+```sh
+cargo run --manifest-path apps/auru-pm-ui/Cargo.toml -- --inspect
+```
+
+The app prints an ephemeral loopback address and authentication token. Install
+the matching MCP server with `cargo install gpui-mcp`, configure the
+`gpui-mcp` command in your MCP client, then call its `attach` tool with those
+two values.
+
+The semantic tree exposes the real library, projects, onboarding, settings,
+provider picker, and authentication state. Click and focus actions are
+dispatched on GPUI's foreground executor; keyboard input, Unicode text,
+scrolling, dragging, and resizing use GPUI's normal event path. Inspection is
+off for every ordinary launch, and each inspected launch receives a new token.
+
 ## License
 
 Licensed under either Apache License 2.0 or the MIT license, at your option.
