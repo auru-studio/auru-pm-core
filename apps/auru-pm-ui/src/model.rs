@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use auru_pm::{
     CommitId, CommitSummary, DiscoveredProject, PluginAvailability, PluginSearchPaths,
-    ProjectFormat, ProjectInfo, ProjectSnapshot, ResolvedPlugin, Sidecar, ableton, discovery,
-    flstudio, plugin_registry, sidecar_path_for,
+    ProjectFormat, ProjectInfo, ProjectLocation, ProjectMetadata, ProjectSnapshot, ResolvedPlugin,
+    Sidecar, ableton, discovery, flstudio, plugin_registry, sidecar_path_for,
 };
 
 /// A folder Auru watches for projects.
@@ -28,7 +28,7 @@ impl WatchedFolder {
     pub fn scan(path: &Path) -> Self {
         let projects = discovery::scan_for_projects(path, &discovery::ScanOptions::default())
             .into_iter()
-            .map(|found| FoundProject::from_discovered(&found))
+            .map(|found| FoundProject::from_discovered(path, &found))
             .collect();
         Self {
             path: path.to_path_buf(),
@@ -61,25 +61,29 @@ impl WatchedFolder {
 pub struct FoundProject {
     pub name: String,
     pub root: PathBuf,
-    /// The `.als` file name, shown under the project name.
+    /// Portable path beneath the folder that was scanned.
+    pub location: Option<ProjectLocation>,
+    /// The DAW project file name, shown under the project name.
     pub file: String,
     /// Size of the project folder on disk.
     pub bytes: u64,
 }
 
 impl FoundProject {
-    fn from_discovered(found: &DiscoveredProject) -> Self {
+    fn from_discovered(library_root: &Path, found: &DiscoveredProject) -> Self {
         let project_file = found.project_file();
+        let root = if found.owns_its_directory() {
+            found.directory()
+        } else {
+            project_file
+        };
         Self {
             name: found.name(),
             // What adding this project means: a folder for Ableton, a single
             // file for FL. Keying on the folder for FL would make two projects
             // saved side by side look like the same one.
-            root: if found.owns_its_directory() {
-                found.directory().to_path_buf()
-            } else {
-                project_file.to_path_buf()
-            },
+            root: root.to_path_buf(),
+            location: portable_project_location(library_root, root),
             file: project_file
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -100,6 +104,29 @@ impl FoundProject {
     pub fn size_label(&self) -> String {
         format_bytes(self.bytes)
     }
+
+    pub fn library_path(&self) -> &str {
+        self.location
+            .as_ref()
+            .map(|location| location.relative_path.as_str())
+            .unwrap_or(&self.name)
+    }
+}
+
+/// Express one project beneath a watched root without leaking an absolute,
+/// machine-specific path into its provider profile.
+fn portable_project_location(library_root: &Path, project: &Path) -> Option<ProjectLocation> {
+    let relative = project.strip_prefix(library_root).ok()?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return None;
+        };
+        parts.push(component.to_str()?.to_owned());
+    }
+    (!parts.is_empty()).then(|| ProjectLocation {
+        relative_path: parts.join("/"),
+    })
 }
 
 /// Total size of a folder, best-effort.
@@ -166,9 +193,17 @@ fn local_file_state(project_file: &Path) -> LocalFileState {
     }
 }
 
-fn provider_links_for(project_path: &Path) -> (Option<RemoteProjectRef>, BTreeMap<String, String>) {
+#[derive(Default)]
+struct ProviderLinks {
+    remote: Option<RemoteProjectRef>,
+    handles: BTreeMap<String, String>,
+    metadata: ProjectMetadata,
+    location: Option<ProjectLocation>,
+}
+
+fn provider_links_for(project_path: &Path) -> ProviderLinks {
     let Ok(sidecar) = Sidecar::load(&sidecar_path_for(project_path)) else {
-        return (None, BTreeMap::new());
+        return ProviderLinks::default();
     };
     let remote = sidecar.primary.as_ref().and_then(|provider_id| {
         Some(RemoteProjectRef {
@@ -177,7 +212,12 @@ fn provider_links_for(project_path: &Path) -> (Option<RemoteProjectRef>, BTreeMa
             head: sidecar.local_head?,
         })
     });
-    (remote, sidecar.provider_handles)
+    ProviderLinks {
+        remote,
+        handles: sidecar.provider_handles,
+        metadata: sidecar.metadata,
+        location: sidecar.location,
+    }
 }
 
 /// How long ago a file was saved, in the words a person would use.
@@ -262,6 +302,7 @@ pub struct LoadedDetail {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImportKind {
     AbletonLiveSet,
+    BitwigProject,
     FlStudio,
     Dawproject,
     AuruProject,
@@ -269,8 +310,9 @@ pub enum ImportKind {
 
 impl ImportKind {
     /// Every kind that can be added, in menu order.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::AbletonLiveSet,
+        Self::BitwigProject,
         Self::FlStudio,
         Self::Dawproject,
         Self::AuruProject,
@@ -279,6 +321,7 @@ impl ImportKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::AbletonLiveSet => "Ableton Live project…",
+            Self::BitwigProject => "Bitwig Studio project…",
             Self::FlStudio => "FL Studio project…",
             Self::Dawproject => "DAWproject file…",
             Self::AuruProject => "Auru project…",
@@ -289,6 +332,7 @@ impl ImportKind {
     pub const fn prompt(self) -> &'static str {
         match self {
             Self::AbletonLiveSet => "Choose an Ableton project folder or .als",
+            Self::BitwigProject => "Choose a .bwproject",
             Self::FlStudio => "Choose an .flp",
             Self::Dawproject => "Choose a .dawproject file",
             Self::AuruProject => "Choose an .auru file",
@@ -307,6 +351,7 @@ impl ImportKind {
     pub const fn format(self) -> ProjectFormat {
         match self {
             Self::AbletonLiveSet => ProjectFormat::AbletonLiveSet,
+            Self::BitwigProject => ProjectFormat::BitwigProject,
             Self::FlStudio => ProjectFormat::FlStudio,
             Self::Dawproject => ProjectFormat::Dawproject,
             Self::AuruProject => ProjectFormat::Auru,
@@ -367,6 +412,7 @@ pub fn import_project(kind: ImportKind, path: &Path) -> Result<Project, String> 
         .as_ref()
         .map_or(project_file.as_path(), |bundle| bundle.root());
 
+    let links = provider_links_for(&project_file);
     Ok(Project {
         // Path-derived so re-adding the same project replaces rather than
         // duplicates it.
@@ -392,8 +438,10 @@ pub fn import_project(kind: ImportKind, path: &Path) -> Result<Project, String> 
         // Stamped by `load_library` once this project is part of the library.
         added_at: None,
         live_set: Some(project_file),
-        remote: None,
-        provider_handles: BTreeMap::new(),
+        remote: links.remote,
+        provider_handles: links.handles,
+        metadata: links.metadata,
+        location: links.location,
         detail,
         missing_plugins,
     })
@@ -412,7 +460,7 @@ fn missing_plugins_for(snapshot: &ProjectSnapshot) -> Vec<MissingPlugin> {
             .and_then(|bytes| flstudio::read_plugins(&bytes).ok()),
         ProjectFormat::Dawproject => auru_pm::dawproject::read_plugins(snapshot).ok(),
         ProjectFormat::AbletonLiveSet => ableton::read_plugins(snapshot).ok(),
-        ProjectFormat::Auru => None,
+        ProjectFormat::Auru | ProjectFormat::BitwigProject => None,
     };
 
     plugins
@@ -761,7 +809,7 @@ impl ProjectStatus {
     pub const fn label(self) -> &'static str {
         match self {
             Self::NeverBackedUp => "Never backed up",
-            Self::NotDownloaded => "Not downloaded",
+            Self::NotDownloaded => "Ready to restore",
             Self::Downloaded => "Downloaded",
             Self::Syncing => "Syncing",
             Self::OutOfSync(SyncDirection::LocalAhead) => "Out of sync · local ahead",
@@ -773,7 +821,7 @@ impl ProjectStatus {
     pub const fn action(self) -> ProjectAction {
         match self {
             Self::NeverBackedUp => ProjectAction::Push,
-            Self::NotDownloaded => ProjectAction::Download,
+            Self::NotDownloaded => ProjectAction::Restore,
             Self::Downloaded => ProjectAction::Open,
             Self::Syncing => ProjectAction::None,
             Self::OutOfSync(SyncDirection::LocalAhead) => ProjectAction::Push,
@@ -792,7 +840,7 @@ impl ProjectStatus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProjectAction {
-    Download,
+    Restore,
     Open,
     Push,
     Pull,
@@ -803,7 +851,7 @@ pub enum ProjectAction {
 impl ProjectAction {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Download => "↓  DOWNLOAD",
+            Self::Restore => "↓  RESTORE PROJECT",
             Self::Open => "OPEN PROJECT",
             Self::Push => "↑  BACK UP CHANGES",
             Self::Pull => "↓  DOWNLOAD LATEST",
@@ -813,7 +861,7 @@ impl ProjectAction {
     }
 
     pub const fn starts_transfer(self) -> bool {
-        matches!(self, Self::Download | Self::Push | Self::Pull)
+        matches!(self, Self::Restore | Self::Push | Self::Pull)
     }
 }
 
@@ -841,8 +889,66 @@ pub struct RemoteProjectSeed {
     pub name: String,
     pub file_name: String,
     pub format: ProjectFormat,
+    pub metadata: ProjectMetadata,
+    pub location: Option<ProjectLocation>,
     pub updated_at: i64,
     pub info: Option<ProjectInfo>,
+}
+
+/// BPM constraints used by the library filter bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BpmFilter {
+    Range { min: u16, max: u16 },
+    Exact(u16),
+}
+
+impl BpmFilter {
+    pub fn matches(self, tempo: Option<f64>) -> bool {
+        let Some(tempo) = tempo.filter(|tempo| tempo.is_finite()) else {
+            return false;
+        };
+        match self {
+            Self::Range { min, max } => tempo >= f64::from(min) && tempo <= f64::from(max),
+            Self::Exact(bpm) => tempo.round() == f64::from(bpm),
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            Self::Range { min, max } => format!("{min}–{max}"),
+            Self::Exact(bpm) => bpm.to_string(),
+        }
+    }
+}
+
+/// Unique metadata values available to the library filter comboboxes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LibraryFilterOptions {
+    pub genres: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+pub fn library_filter_options(projects: &[Project]) -> LibraryFilterOptions {
+    let mut genres = BTreeMap::new();
+    let mut tags = BTreeMap::new();
+    for project in projects {
+        for genre in project.metadata.genres() {
+            genres
+                .entry(genre.to_lowercase())
+                .or_insert_with(|| genre.to_owned());
+        }
+        for tag in &project.metadata.tags {
+            let tag = tag.trim();
+            if !tag.is_empty() {
+                tags.entry(tag.to_lowercase())
+                    .or_insert_with(|| tag.to_owned());
+            }
+        }
+    }
+    LibraryFilterOptions {
+        genres: genres.into_values().collect(),
+        tags: tags.into_values().collect(),
+    }
 }
 
 #[derive(Debug)]
@@ -885,6 +991,10 @@ pub struct Project {
     /// Every provider handle recorded for this project, cached from its
     /// sidecar so catalogue reconciliation never performs filesystem I/O.
     pub provider_handles: BTreeMap<String, String>,
+    /// User-authored labels synced through the provider project profile.
+    pub metadata: ProjectMetadata,
+    /// Portable project placement beneath its watched library root.
+    pub location: Option<ProjectLocation>,
     pub detail: Option<ProjectDetail>,
     /// Plugins this computer does not have. Empty is the good case.
     pub missing_plugins: Vec<MissingPlugin>,
@@ -904,7 +1014,7 @@ impl Project {
         let found = DiscoveredProject::detect(root).ok().flatten()?;
         let live_set = found.project_file().to_path_buf();
         let local = local_file_state(&live_set);
-        let (remote, provider_handles) = provider_links_for(&live_set);
+        let links = provider_links_for(&live_set);
 
         Some(Self {
             // Keyed on the project file, not the folder: a folder can hold
@@ -939,8 +1049,10 @@ impl Project {
             detail: None,
             missing_plugins: Vec::new(),
             live_set: Some(live_set),
-            remote,
-            provider_handles,
+            remote: links.remote,
+            provider_handles: links.handles,
+            metadata: links.metadata,
+            location: links.location,
         })
     }
 
@@ -1004,6 +1116,8 @@ impl Project {
                 head: seed.head,
             }),
             provider_handles,
+            metadata: seed.metadata,
+            location: seed.location,
             detail,
             missing_plugins: Vec::new(),
         }
@@ -1036,15 +1150,56 @@ impl Project {
 
     /// Whether this project matches what someone typed in the search box.
     ///
-    /// Matches the project's name and its file name, case-insensitively. An
-    /// empty query matches everything, so clearing the box restores the list.
+    /// Matches the project's name, file name, genre, and tags
+    /// case-insensitively. An empty query matches everything, so clearing the
+    /// box restores the list.
     pub fn matches_search(&self, query: &str) -> bool {
         let query = query.trim();
         if query.is_empty() {
             return true;
         }
         let query = query.to_lowercase();
-        self.name.to_lowercase().contains(&query) || self.file_name.to_lowercase().contains(&query)
+        self.name.to_lowercase().contains(&query)
+            || self.file_name.to_lowercase().contains(&query)
+            || self
+                .metadata
+                .genre
+                .as_ref()
+                .is_some_and(|genre| genre.to_lowercase().contains(&query))
+            || self
+                .metadata
+                .tags
+                .iter()
+                .any(|tag| tag.to_lowercase().contains(&query))
+    }
+
+    /// Match the search box and every active filter group.
+    ///
+    /// Multiple values within Genre or Tags are alternatives; the three
+    /// groups combine with AND, matching the behavior of music-library filter
+    /// bars where selecting another value broadens one facet.
+    pub fn matches_library_filters(
+        &self,
+        query: &str,
+        genres: &[String],
+        tags: &[String],
+        bpm: Option<BpmFilter>,
+    ) -> bool {
+        self.matches_search(query)
+            && (genres.is_empty()
+                || self.metadata.genres().any(|genre| {
+                    genres
+                        .iter()
+                        .any(|selected| genre.eq_ignore_ascii_case(selected))
+                }))
+            && (tags.is_empty()
+                || self.metadata.tags.iter().any(|tag| {
+                    tags.iter()
+                        .any(|selected| tag.eq_ignore_ascii_case(selected))
+                }))
+            && bpm.is_none_or(|filter| {
+                filter.matches(self.detail.as_ref().and_then(|detail| detail.tempo))
+            })
     }
 
     /// Fold in what [`Self::detail_for`] read.
@@ -1059,6 +1214,7 @@ impl Project {
         match self.format {
             ProjectFormat::Dawproject => "DAWPROJECT",
             ProjectFormat::AbletonLiveSet => "ABLETON LIVE SET",
+            ProjectFormat::BitwigProject => "BITWIG STUDIO PROJECT",
             ProjectFormat::FlStudio => "FL STUDIO PROJECT",
             ProjectFormat::Auru => "AURU PROJECT",
         }
@@ -1067,6 +1223,7 @@ impl Project {
     pub const fn open_label(&self) -> &'static str {
         match self.format {
             ProjectFormat::AbletonLiveSet => "OPEN IN ABLETON LIVE  ⌘↵",
+            ProjectFormat::BitwigProject => "OPEN IN BITWIG STUDIO  ⌘↵",
             ProjectFormat::FlStudio => "OPEN IN FL STUDIO  ⌘↵",
             ProjectFormat::Dawproject => "OPEN IN YOUR DAW  ⌘↵",
             ProjectFormat::Auru => "OPEN IN AURU STUDIO  ⌘↵",
@@ -1114,9 +1271,12 @@ impl Project {
             }
             ProjectStatus::NotDownloaded => {
                 if self.size.is_empty() {
-                    "Download it to work on this computer.".to_owned()
+                    "Restore it beneath a library root on this computer.".to_owned()
                 } else {
-                    format!("Download it to work here ({}).", self.size)
+                    format!(
+                        "Restore it beneath a library root on this computer ({}).",
+                        self.size
+                    )
                 }
             }
             ProjectStatus::Downloaded => "Every file was verified on Auru Cloud.".to_owned(),
@@ -1242,8 +1402,19 @@ impl Project {
 
     pub fn displayed_path(&self) -> String {
         match self.status {
-            ProjectStatus::NotDownloaded => "Not on this computer".to_owned(),
-            _ => self.local_path.clone(),
+            ProjectStatus::NotDownloaded => self.location.as_ref().map_or_else(
+                || "Not on this computer".to_owned(),
+                |location| format!("Restore location · {}", location.relative_path),
+            ),
+            _ => self.location.as_ref().map_or_else(
+                || self.local_path.clone(),
+                |location| {
+                    format!(
+                        "{} · Library path · {}",
+                        self.local_path, location.relative_path
+                    )
+                },
+            ),
         }
     }
 }
@@ -1391,6 +1562,18 @@ pub fn replace_provider_projects(
         })
         .collect();
     for seed in remote {
+        if let Some(project) = projects.iter_mut().find(|project| {
+            project
+                .provider_handles
+                .get(&seed.provider_id)
+                .is_some_and(|handle| handle == &seed.handle)
+        }) {
+            project.metadata = seed.metadata.clone();
+            if project.location.is_none() {
+                project.location = seed.location.clone();
+            }
+            continue;
+        }
         if !known_handles.insert((seed.provider_id.clone(), seed.handle.clone())) {
             continue;
         }
@@ -1399,26 +1582,39 @@ pub fn replace_provider_projects(
 }
 
 pub fn load_library(state: &mut crate::state::AppState) -> Vec<Project> {
-    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut roots: Vec<(PathBuf, Option<ProjectLocation>)> = Vec::new();
 
-    for folder in &state.watched_folders {
+    // Broad roots come first so overlapping entries preserve the whole logical
+    // hierarchy rather than whichever narrower folder happened to be saved
+    // first by an older version of the app.
+    let mut watched_folders = state.watched_folders.iter().collect::<Vec<_>>();
+    watched_folders.sort_by_key(|path| path.components().count());
+    for folder in watched_folders {
         for found in discovery::scan_for_projects(folder, &discovery::ScanOptions::default()) {
             // The path that identifies this project: its folder when it owns
             // one, otherwise the project file itself.
-            roots.push(if found.owns_its_directory() {
+            let root = if found.owns_its_directory() {
                 found.directory().to_path_buf()
             } else {
                 found.project_file().to_path_buf()
-            });
+            };
+            let location = portable_project_location(folder, &root);
+            roots.push((root, location));
         }
     }
-    roots.extend(state.projects.iter().cloned());
+    roots.extend(state.projects.iter().cloned().map(|root| (root, None)));
 
     let mut seen = std::collections::BTreeSet::new();
     let mut projects: Vec<Project> = roots
         .into_iter()
-        .filter(|root| seen.insert(root.clone()))
-        .filter_map(|root| Project::read_from_disk(&root))
+        .filter(|(root, _)| seen.insert(root.clone()))
+        .filter_map(|(root, location)| {
+            let mut project = Project::read_from_disk(&root)?;
+            if location.is_some() {
+                project.location = location;
+            }
+            Some(project)
+        })
         .collect();
 
     // "Recently added" has to mean added *to Auru*, which nothing on disk
@@ -1525,7 +1721,7 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_project_should_enter_the_library_as_downloadable() {
+    fn a_provider_project_should_enter_the_library_as_restorable() {
         let head = CommitId(auru_pm::ContentHash::of(b"remote head"));
         let project = Project::from_remote(RemoteProjectSeed {
             provider_id: "studio-nas".into(),
@@ -1535,12 +1731,16 @@ mod tests {
             name: "Night Drive".into(),
             file_name: "Night Drive.als".into(),
             format: ProjectFormat::AbletonLiveSet,
+            metadata: ProjectMetadata::default(),
+            location: Some(ProjectLocation {
+                relative_path: "Ableton/Projects/Night Drive Project".into(),
+            }),
             updated_at: 1_750_000_000,
             info: None,
         });
 
         assert_eq!(project.status, ProjectStatus::NotDownloaded);
-        assert_eq!(project.status.action(), ProjectAction::Download);
+        assert_eq!(project.status.action(), ProjectAction::Restore);
         assert!(project.live_set.is_none());
         assert_eq!(
             project
@@ -1565,6 +1765,8 @@ mod tests {
             name: name.into(),
             file_name: format!("{name}.als"),
             format: ProjectFormat::AbletonLiveSet,
+            metadata: ProjectMetadata::default(),
+            location: None,
             updated_at: 1_750_000_000,
             info: None,
         };
@@ -1583,6 +1785,35 @@ mod tests {
             projects[0].remote.as_ref().map(|remote| remote.head),
             Some(old_head)
         );
+    }
+
+    #[test]
+    fn a_provider_refresh_should_apply_metadata_to_a_linked_local_project() {
+        let metadata = ProjectMetadata {
+            genre: Some("Ambient".to_owned()),
+            tags: vec!["mastered".to_owned()],
+        };
+        let seed = RemoteProjectSeed {
+            provider_id: "studio-nas".into(),
+            provider_name: "Studio NAS".into(),
+            handle: "night-drive".into(),
+            head: CommitId(auru_pm::ContentHash::of(b"head")),
+            name: "Night Drive".into(),
+            file_name: "Night Drive.als".into(),
+            format: ProjectFormat::AbletonLiveSet,
+            metadata: metadata.clone(),
+            location: None,
+            updated_at: 1_750_000_000,
+            info: None,
+        };
+        let mut local = Project::from_remote(seed.clone());
+        local.live_set = Some(PathBuf::from("/music/Night Drive.als"));
+        local.metadata = ProjectMetadata::default();
+        let mut projects = vec![local];
+
+        replace_provider_projects(&mut projects, "studio-nas", vec![seed]);
+
+        assert_eq!(projects[0].metadata, metadata);
     }
 
     fn detail() -> ProjectDetail {
@@ -1864,6 +2095,64 @@ mod tests {
     }
 
     #[test]
+    fn watching_a_library_root_should_keep_each_nested_project_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_project_folder_at(
+            &temp
+                .path()
+                .join("Ableton")
+                .join("Projects")
+                .join("Night Drive Project"),
+        );
+        write_bitwig_project_at(
+            &temp
+                .path()
+                .join("Bitwig Projects")
+                .join("Broken Glass")
+                .join("Broken Glass.bwproject"),
+        );
+
+        let watched = WatchedFolder::scan(temp.path());
+        let paths = watched
+            .projects
+            .iter()
+            .map(FoundProject::library_path)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            [
+                "Ableton/Projects/Night Drive Project",
+                "Bitwig Projects/Broken Glass/Broken Glass.bwproject"
+            ]
+        );
+    }
+
+    #[test]
+    fn loading_a_watched_library_should_attach_the_restore_location() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_project_folder_at(
+            &temp
+                .path()
+                .join("Ableton")
+                .join("Projects")
+                .join("Night Drive Project"),
+        );
+        let mut state = crate::state::AppState::default();
+        state.watch(temp.path());
+
+        let projects = load_library(&mut state);
+
+        assert_eq!(
+            projects[0]
+                .location
+                .as_ref()
+                .map(|location| location.relative_path.as_str()),
+            Some("Ableton/Projects/Night Drive Project")
+        );
+    }
+
+    #[test]
     fn watching_a_folder_with_no_projects_should_find_nothing() {
         // Reported honestly rather than as an error: pointing at the wrong
         // folder is an easy mistake and not a failure.
@@ -2114,11 +2403,15 @@ mod tests {
     }
 
     #[test]
-    fn search_should_match_the_name_and_the_file() {
+    fn search_should_match_the_name_file_genre_and_tags() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("Song Project");
         write_project_folder_at(&root);
-        let project = Project::read_from_disk(&root).expect("a project");
+        let mut project = Project::read_from_disk(&root).expect("a project");
+        project.metadata = ProjectMetadata {
+            genre: Some("Drum & Bass".to_owned()),
+            tags: vec!["work in progress".to_owned(), "collab".to_owned()],
+        };
 
         assert!(project.matches_search(""), "an empty box shows everything");
         assert!(project.matches_search("   "), "and so does whitespace");
@@ -2128,7 +2421,63 @@ mod tests {
         );
         assert!(project.matches_search("NIGHT DRIVE"));
         assert!(project.matches_search(".als"), "and matches the file name");
+        assert!(project.matches_search("drum & bass"));
+        assert!(project.matches_search("COLLAB"));
         assert!(!project.matches_search("something else"));
+    }
+
+    #[test]
+    fn library_filters_should_or_values_inside_each_facet() {
+        let mut project = sortable("Night Drive", ProjectStatus::Downloaded);
+        project.metadata = ProjectMetadata {
+            genre: Some("Drum & Bass, Jungle".to_owned()),
+            tags: vec!["collab".to_owned()],
+        };
+        project.detail = Some(ProjectDetail {
+            tempo: Some(174.5),
+            ..ProjectDetail::default()
+        });
+
+        let matches = project.matches_library_filters(
+            "night",
+            &["Ambient".to_owned(), "jungle".to_owned()],
+            &["mastered".to_owned(), "COLLAB".to_owned()],
+            Some(BpmFilter::Range { min: 170, max: 180 }),
+        );
+
+        assert!(matches);
+    }
+
+    #[test]
+    fn exact_bpm_should_match_fractional_tempos_that_round_to_it() {
+        assert!(BpmFilter::Exact(175).matches(Some(174.5)));
+    }
+
+    #[test]
+    fn bpm_filter_should_not_guess_when_a_project_has_no_tempo() {
+        assert!(!BpmFilter::Range { min: 80, max: 160 }.matches(None));
+    }
+
+    #[test]
+    fn filter_options_should_be_sorted_and_deduplicated_case_insensitively() {
+        let mut first = sortable("One", ProjectStatus::Downloaded);
+        first.metadata = ProjectMetadata {
+            genre: Some("Drum & Bass, Jungle".to_owned()),
+            tags: vec!["Collab".to_owned(), "WIP".to_owned()],
+        };
+        let mut second = sortable("Two", ProjectStatus::Downloaded);
+        second.metadata = ProjectMetadata {
+            genre: Some("drum & bass".to_owned()),
+            tags: vec!["collab".to_owned(), "Club".to_owned()],
+        };
+
+        assert_eq!(
+            library_filter_options(&[first, second]),
+            LibraryFilterOptions {
+                genres: vec!["Drum & Bass".to_owned(), "Jungle".to_owned()],
+                tags: vec!["Club".to_owned(), "Collab".to_owned(), "WIP".to_owned()],
+            }
+        );
     }
 
     /// A project carrying only the fields sorting looks at.
@@ -2156,6 +2505,8 @@ mod tests {
             live_set: None,
             remote: None,
             provider_handles: BTreeMap::new(),
+            metadata: ProjectMetadata::default(),
+            location: None,
             detail: None,
             missing_plugins: Vec::new(),
         }
@@ -2298,6 +2649,7 @@ mod tests {
         // Only Ableton keeps its project in a folder; offering directories for
         // the others would invite picking something that cannot work.
         assert!(ImportKind::AbletonLiveSet.accepts_directories());
+        assert!(!ImportKind::BitwigProject.accepts_directories());
         assert!(!ImportKind::Dawproject.accepts_directories());
         assert!(!ImportKind::AuruProject.accepts_directories());
 
@@ -2330,6 +2682,13 @@ mod tests {
         std::fs::write(path, bytes).expect("write flp");
     }
 
+    fn write_bitwig_project_at(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create dirs");
+        }
+        std::fs::write(path, b"BtWg0003000200ba\0project").expect("write bwproject");
+    }
+
     #[test]
     fn an_fl_project_should_be_read_from_disk_like_any_other() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2342,6 +2701,17 @@ mod tests {
         assert_eq!(project.file_name, "Doom.flp");
         assert_eq!(project.format_label(), "FL STUDIO PROJECT");
         assert!(project.open_label().contains("FL STUDIO"));
+    }
+
+    #[test]
+    fn a_bitwig_project_should_be_read_from_disk_like_any_other() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("Song.bwproject");
+        write_bitwig_project_at(&path);
+
+        let project = Project::read_from_disk(&path).expect("a project");
+
+        assert_eq!(project.format, ProjectFormat::BitwigProject);
     }
 
     #[test]

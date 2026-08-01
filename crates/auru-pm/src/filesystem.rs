@@ -248,7 +248,14 @@ impl FilesystemProvider {
 
     fn write_project_profile(&self, profile: &ProjectProfile) -> Result<()> {
         let path = self.root.join(PROJECT_PROFILE_FILE);
-        let body = serde_json::to_vec_pretty(profile)?;
+        let mut profile = profile.clone();
+        if profile.location.is_none() {
+            profile.location = fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<ProjectProfile>(&bytes).ok())
+                .and_then(|existing| existing.location);
+        }
+        let body = serde_json::to_vec_pretty(&profile)?;
         // Unlike commits, this small cache is reconstructible from HEAD when
         // absent or malformed. A direct overwrite also keeps the required
         // idempotent upsert semantics on Windows, where rename does not
@@ -1036,6 +1043,10 @@ mod tests {
         let profile = ProjectProfile {
             display_name: "Night Drive".into(),
             format: crate::ProjectFormat::AbletonLiveSet,
+            metadata: crate::ProjectMetadata::default(),
+            location: Some(crate::ProjectLocation {
+                relative_path: "Ableton/Projects/Night Drive Project".into(),
+            }),
         };
 
         rt().block_on(async {
@@ -1044,6 +1055,7 @@ mod tests {
             provider
                 .put_project_profile(&ProjectProfile {
                     display_name: "Night Drive (Renamed)".into(),
+                    location: None,
                     ..profile.clone()
                 })
                 .await
@@ -1064,6 +1076,14 @@ mod tests {
                 .as_ref()
                 .map(|profile| profile.display_name.as_str()),
             Some("Night Drive (Renamed)")
+        );
+        assert_eq!(
+            projects[0]
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.location.as_ref())
+                .map(|location| location.relative_path.as_str()),
+            Some("Ableton/Projects/Night Drive Project")
         );
         assert_eq!(projects[0].updated_at, commit.timestamp);
     }

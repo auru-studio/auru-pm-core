@@ -18,8 +18,9 @@ use serde_json::{Value, json};
 
 use auru_pm::{
     AuthorIdentity, Commit, CommitId, ContentHash, HeadAdvance, HistoryRange, HttpAccount,
-    HttpProvider, ProjectFormat, ProjectProfile, ProjectProvider, RemoteState, RetentionRule,
-    SampleManifest, Sidecar, TreeRef, compute_commit_id, sidecar_path_for,
+    HttpProvider, ProjectFormat, ProjectLocation, ProjectMetadata, ProjectProfile, ProjectProvider,
+    RemoteState, RetentionRule, SampleManifest, Sidecar, TreeRef, compute_commit_id,
+    sidecar_path_for,
 };
 use tempfile::TempDir;
 
@@ -386,6 +387,13 @@ async fn m2_commit_roundtrip_over_http() {
     let profile = ProjectProfile {
         display_name: "Night Drive".into(),
         format: ProjectFormat::Auru,
+        metadata: ProjectMetadata {
+            genre: Some("Ambient".to_owned()),
+            tags: vec!["mastered".to_owned(), "instrumental".to_owned()],
+        },
+        location: Some(ProjectLocation {
+            relative_path: "Auru/Projects/Night Drive.auru".to_owned(),
+        }),
     };
     provider.put_project_profile(&profile).await.unwrap();
 

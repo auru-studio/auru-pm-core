@@ -7,6 +7,8 @@
 //! - DAWproject is a ZIP containing `project.xml`, optional `metadata.xml`, and
 //!   opaque media/plugin-state entries.
 //! - Ableton Live Sets (`.als`) are gzip-compressed XML.
+//! - Bitwig Studio projects (`.bwproject`) are opaque binary documents whose
+//!   bytes are preserved exactly.
 //!
 //! XML is represented as an ordered tree. Attributes are sorted, insignificant
 //! formatting whitespace is discarded, and element IDs are copied to a
@@ -37,6 +39,7 @@ const MIN_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const MAX_XML_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 100_000;
 const MAX_ARCHIVE_ENTRY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const BITWIG_MAGIC: &[u8; 4] = b"BtWg";
 
 /// Project-file formats that can be normalized for Auru project management.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -50,6 +53,8 @@ pub enum ProjectFormat {
     AbletonLiveSet,
     /// FL Studio `.flp` binary event stream.
     FlStudio,
+    /// Bitwig Studio `.bwproject` binary document.
+    BitwigProject,
 }
 
 impl ProjectFormat {
@@ -64,6 +69,8 @@ impl ProjectFormat {
             Some(Self::AbletonLiveSet)
         } else if extension.eq_ignore_ascii_case("flp") {
             Some(Self::FlStudio)
+        } else if extension.eq_ignore_ascii_case("bwproject") {
+            Some(Self::BitwigProject)
         } else {
             None
         }
@@ -76,6 +83,7 @@ impl ProjectFormat {
             Self::Dawproject => "dawproject",
             Self::AbletonLiveSet => "als",
             Self::FlStudio => "flp",
+            Self::BitwigProject => "bwproject",
         }
     }
 
@@ -92,6 +100,8 @@ impl ProjectFormat {
             Ok(Self::AbletonLiveSet)
         } else if crate::flstudio::is_flp(source) {
             Ok(Self::FlStudio)
+        } else if source.starts_with(BITWIG_MAGIC) {
+            Ok(Self::BitwigProject)
         } else if source.starts_with(b"PK\x03\x04")
             || source.starts_with(b"PK\x05\x06")
             || source.starts_with(b"PK\x07\x08")
@@ -101,7 +111,7 @@ impl ProjectFormat {
             Ok(Self::Auru)
         } else {
             Err(Error::ProjectFormat(format!(
-                "unsupported project file '{}'; expected .auru, .dawproject, .als, or .flp",
+                "unsupported project file '{}'; expected .auru, .dawproject, .als, .flp, or .bwproject",
                 path.display()
             )))
         }
@@ -115,6 +125,7 @@ impl fmt::Display for ProjectFormat {
             Self::Dawproject => "DAWproject",
             Self::AbletonLiveSet => "Ableton Live Set",
             Self::FlStudio => "FL Studio Project",
+            Self::BitwigProject => "Bitwig Studio Project",
         })
     }
 }
@@ -170,6 +181,7 @@ impl ProjectSnapshot {
             ProjectFormat::Dawproject => encode_dawproject(source)?,
             ProjectFormat::AbletonLiveSet => (encode_ableton(source)?, BTreeMap::new()),
             ProjectFormat::FlStudio => (encode_flstudio(source)?, BTreeMap::new()),
+            ProjectFormat::BitwigProject => (encode_bitwig(source)?, BTreeMap::new()),
         };
         Ok(Self {
             format,
@@ -188,7 +200,10 @@ impl ProjectSnapshot {
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self> {
         let value: Value = serde_json::from_slice(bytes)?;
         let format = portable_snapshot_format(&value)?.unwrap_or(ProjectFormat::Auru);
-        if format != ProjectFormat::Auru {
+        if format == ProjectFormat::BitwigProject {
+            let snapshot: OpaqueSnapshot = serde_json::from_value(value.clone())?;
+            snapshot.validate()?;
+        } else if format != ProjectFormat::Auru {
             let snapshot: PortableSnapshot = serde_json::from_value(value.clone())?;
             snapshot.validate()?;
         }
@@ -228,11 +243,14 @@ impl ProjectSnapshot {
 
     /// Deserialize the external-format wrapper backing this snapshot.
     ///
-    /// `Ok(None)` for native Auru, which stores its JSON unwrapped. Readers in
-    /// [`crate::ableton`] go through here rather than re-parsing the canonical
-    /// bytes themselves.
+    /// `Ok(None)` for native Auru and opaque Bitwig projects. Readers for the
+    /// XML-backed external formats go through here rather than re-parsing the
+    /// canonical bytes themselves.
     pub(crate) fn portable(&self) -> Result<Option<PortableSnapshot>> {
-        if self.format == ProjectFormat::Auru {
+        if matches!(
+            self.format,
+            ProjectFormat::Auru | ProjectFormat::BitwigProject
+        ) {
             return Ok(None);
         }
         let snapshot: PortableSnapshot = serde_json::from_slice(&self.canonical_bytes)?;
@@ -294,6 +312,10 @@ impl ProjectSnapshot {
                 snapshot.validate()?;
                 decode_flstudio(&snapshot)
             }
+            ProjectFormat::BitwigProject => {
+                let snapshot: OpaqueSnapshot = serde_json::from_slice(&self.canonical_bytes)?;
+                snapshot.decode()
+            }
         }
     }
 
@@ -347,6 +369,47 @@ pub(crate) struct PortableSnapshot {
     pub(crate) resources: Vec<ArchiveResource>,
 }
 
+/// Snapshot wrapper for formats Auru deliberately treats as opaque.
+///
+/// Bitwig's project document is proprietary binary data. Keeping it in a
+/// separate wrapper prevents XML-oriented readers from accidentally treating
+/// it as a portable tree while still making backup and restore byte-exact.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OpaqueSnapshot {
+    auru_pm_snapshot: u32,
+    format: ProjectFormat,
+    data: String,
+}
+
+impl OpaqueSnapshot {
+    fn validate(&self) -> Result<()> {
+        self.decode().map(|_| ())
+    }
+
+    fn decode(&self) -> Result<Vec<u8>> {
+        if !(MIN_SNAPSHOT_SCHEMA_VERSION..=SNAPSHOT_SCHEMA_VERSION).contains(&self.auru_pm_snapshot)
+        {
+            return Err(Error::ProjectFormat(format!(
+                "unsupported external snapshot schema {}; expected {} or {}",
+                self.auru_pm_snapshot, MIN_SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_SCHEMA_VERSION
+            )));
+        }
+        if self.format != ProjectFormat::BitwigProject {
+            return Err(Error::ProjectFormat(format!(
+                "opaque snapshot cannot declare {} format",
+                self.format
+            )));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&self.data)
+            .map_err(|error| {
+                Error::ProjectFormat(format!("invalid Bitwig snapshot data: {error}"))
+            })?;
+        validate_bitwig(&bytes)?;
+        Ok(bytes)
+    }
+}
+
 impl PortableSnapshot {
     pub(crate) fn validate(&self) -> Result<()> {
         if !(MIN_SNAPSHOT_SCHEMA_VERSION..=SNAPSHOT_SCHEMA_VERSION).contains(&self.auru_pm_snapshot)
@@ -356,9 +419,12 @@ impl PortableSnapshot {
                 self.auru_pm_snapshot, MIN_SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_SCHEMA_VERSION
             )));
         }
-        if self.format == ProjectFormat::Auru {
+        if !matches!(
+            self.format,
+            ProjectFormat::Dawproject | ProjectFormat::AbletonLiveSet | ProjectFormat::FlStudio
+        ) {
             return Err(Error::ProjectFormat(
-                "external snapshot wrapper cannot declare native Auru format".to_owned(),
+                "XML snapshot wrapper declares a non-XML project format".to_owned(),
             ));
         }
         self.project.validate()?;
@@ -814,6 +880,26 @@ fn decode_flstudio(snapshot: &PortableSnapshot) -> Result<Vec<u8>> {
     crate::flstudio::from_tree(&snapshot.project)
 }
 
+fn encode_bitwig(source: &[u8]) -> Result<Value> {
+    validate_bitwig(source)?;
+    serde_json::to_value(OpaqueSnapshot {
+        auru_pm_snapshot: MIN_SNAPSHOT_SCHEMA_VERSION,
+        format: ProjectFormat::BitwigProject,
+        data: base64::engine::general_purpose::STANDARD.encode(source),
+    })
+    .map_err(Error::from)
+}
+
+fn validate_bitwig(source: &[u8]) -> Result<()> {
+    if source.starts_with(BITWIG_MAGIC) {
+        Ok(())
+    } else {
+        Err(Error::ProjectFormat(
+            "invalid Bitwig project: missing BtWg header".to_owned(),
+        ))
+    }
+}
+
 fn encode_dawproject(source: &[u8]) -> Result<(Value, BTreeMap<String, Vec<u8>>)> {
     let reader = Cursor::new(source);
     let mut archive = zip::ZipArchive::new(reader)
@@ -1122,6 +1208,34 @@ mod tests {
             Some(ProjectFormat::AbletonLiveSet)
         );
         assert_eq!(ProjectFormat::from_path(Path::new("song.wav")), None);
+    }
+
+    #[test]
+    fn bitwig_path_detection_should_be_case_insensitive() {
+        assert_eq!(
+            ProjectFormat::from_path(Path::new("song.BWPROJECT")),
+            Some(ProjectFormat::BitwigProject)
+        );
+    }
+
+    #[test]
+    fn bitwig_snapshot_should_restore_exact_source_bytes() {
+        let source = b"BtWg0003000200ba\0\0\0\x04meta\0opaque project data";
+        let snapshot = ProjectSnapshot::from_source_bytes(ProjectFormat::BitwigProject, source)
+            .expect("valid Bitwig project");
+
+        assert_eq!(snapshot.restore_bytes().expect("Bitwig restore"), source);
+    }
+
+    #[test]
+    fn bitwig_snapshot_should_reject_a_missing_header() {
+        let error = ProjectSnapshot::from_source_bytes(
+            ProjectFormat::BitwigProject,
+            b"not a Bitwig project",
+        )
+        .expect_err("invalid Bitwig project must fail");
+
+        assert!(error.to_string().contains("missing BtWg header"));
     }
 
     #[test]

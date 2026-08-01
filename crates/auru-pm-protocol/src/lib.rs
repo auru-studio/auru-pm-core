@@ -150,14 +150,59 @@ pub struct RetentionReport {
     pub bytes_freed: u64,
 }
 
+/// User-authored metadata attached to a project rather than a specific version.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectMetadata {
+    /// Comma-separated musical categories, such as `Drum & Bass, Jungle`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genre: Option<String>,
+    /// Free-form labels used to organize and find projects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+impl ProjectMetadata {
+    /// Iterate the normalized, non-empty genres stored in the wire-compatible field.
+    pub fn genres(&self) -> impl Iterator<Item = &str> {
+        self.genre
+            .iter()
+            .flat_map(|genres| genres.split(','))
+            .map(str::trim)
+            .filter(|genre| !genre.is_empty())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.genre.is_none() && self.tags.is_empty()
+    }
+}
+
+/// Portable placement of a project beneath a user-selected library root.
+///
+/// `relative_path` always uses `/` separators and never contains the absolute
+/// path of the computer that created the backup. For a folder-owned project it
+/// names that folder; for a standalone project it names the project file.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectLocation {
+    pub relative_path: String,
+}
+
 /// Human-facing metadata registered for one provider-scoped project handle.
 ///
-/// The provider cannot infer either value from an opaque handle, and listing
+/// The provider cannot infer these values from an opaque handle, and listing
 /// projects should not require downloading every project's latest snapshot.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectProfile<F> {
     pub display_name: String,
     pub format: F,
+    /// Mutable project metadata. Omitted while empty so profiles written before
+    /// this field existed retain their compact wire shape.
+    #[serde(default, skip_serializing_if = "ProjectMetadata::is_empty")]
+    pub metadata: ProjectMetadata,
+    /// Where this project belongs beneath a library root. Profiles written by
+    /// older clients omit it and continue to restore directly into the folder
+    /// selected by the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<ProjectLocation>,
 }
 
 /// One project visible to the authenticated provider account.
@@ -211,6 +256,58 @@ mod tests {
         assert_eq!(response.projects.len(), 1);
         assert_eq!(response.projects[0].handle, "song");
         assert!(response.projects[0].profile.is_none());
+    }
+
+    #[test]
+    fn a_legacy_profile_should_decode_with_empty_metadata() {
+        let profile: ProjectProfile<String> =
+            serde_json::from_str(r#"{"display_name":"Song","format":"auru"}"#)
+                .expect("legacy project profile");
+
+        assert_eq!(profile.metadata, ProjectMetadata::default());
+        assert_eq!(profile.location, None);
+    }
+
+    #[test]
+    fn project_metadata_should_expose_each_comma_separated_genre() {
+        let metadata = ProjectMetadata {
+            genre: Some("Drum & Bass, Jungle,  Liquid  ".to_owned()),
+            tags: Vec::new(),
+        };
+
+        assert_eq!(
+            metadata.genres().collect::<Vec<_>>(),
+            ["Drum & Bass", "Jungle", "Liquid"]
+        );
+    }
+
+    #[test]
+    fn project_metadata_should_round_trip_inside_the_profile_metadata_field() {
+        let profile = ProjectProfile {
+            display_name: "Night Drive".to_owned(),
+            format: "ableton_live_set".to_owned(),
+            metadata: ProjectMetadata {
+                genre: Some("Drum & Bass".to_owned()),
+                tags: vec!["work in progress".to_owned(), "collab".to_owned()],
+            },
+            location: Some(ProjectLocation {
+                relative_path: "Ableton/Projects/Night Drive Project".to_owned(),
+            }),
+        };
+
+        let encoded = serde_json::to_value(&profile).expect("encode project profile");
+
+        assert_eq!(encoded["metadata"]["genre"], "Drum & Bass");
+        assert_eq!(encoded["metadata"]["tags"][1], "collab");
+        assert_eq!(
+            encoded["location"]["relative_path"],
+            "Ableton/Projects/Night Drive Project"
+        );
+        assert_eq!(
+            serde_json::from_value::<ProjectProfile<String>>(encoded)
+                .expect("decode project profile"),
+            profile
+        );
     }
 
     #[test]

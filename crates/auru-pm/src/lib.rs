@@ -64,8 +64,9 @@ pub use plugin_registry::{
 pub use project_format::{ProjectFormat, ProjectSnapshot, restore_project, snapshot_project};
 pub use project_info::{PROJECT_INFO_SCHEMA, ProjectInfo};
 pub use provider::{
-    AuthMethod, Capabilities, HeadAdvance, Member, PermSet, ProjectProfile, ProjectProvider,
-    ProviderProject, RetentionReport, RetentionRoots, RetentionRule, UserId,
+    AuthMethod, Capabilities, HeadAdvance, Member, PermSet, ProjectLocation, ProjectMetadata,
+    ProjectProfile, ProjectProvider, ProviderProject, RetentionReport, RetentionRoots,
+    RetentionRule, UserId,
 };
 pub use registry::{
     AURU_REGISTRY_URL, RegistryAvailability, RegistryDocument, RegistryEntry,

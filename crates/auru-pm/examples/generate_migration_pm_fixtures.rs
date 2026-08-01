@@ -18,6 +18,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let provider_id = "local-folder://fixture-provider".to_owned();
     let sidecar = Sidecar {
+        location: None,
+        metadata: auru_pm::ProjectMetadata::default(),
         primary: Some(provider_id.clone()),
         provider_handles: BTreeMap::new(),
         local_head: Some(commit.id),

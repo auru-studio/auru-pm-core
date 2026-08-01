@@ -68,6 +68,9 @@ under `provider_handles`. Keeping it out of the DAW file lets the same rule
 work for native and third-party project formats, while allowing the project
 and sidecar to move together without changing remote identity.
 
+`format` uses the wire values `auru`, `dawproject`, `ableton-live-set`,
+`fl-studio`, or `bitwig-project`.
+
 ## Hash format
 
 All hashes on the wire are the canonical `blake3:<64-hex>` string form
@@ -153,7 +156,14 @@ recovery entry point on a machine that has no project sidecars yet.
       "head": "blake3:...",
       "profile": {
         "display_name": "Night Drive",
-        "format": "ableton-live-set"
+        "format": "ableton-live-set",
+        "metadata": {
+          "genre": "Drum & Bass, Jungle",
+          "tags": ["work in progress", "collab"]
+        },
+        "location": {
+          "relative_path": "Ableton/Projects/Night Drive Project"
+        }
       },
       "updated_at": 1750000000
     }
@@ -171,8 +181,29 @@ Idempotently registers the human-facing metadata required by the account
 project list. It does not create a commit or move HEAD.
 
 ```json
-{ "display_name": "Night Drive", "format": "ableton-live-set" }
+{
+  "display_name": "Night Drive",
+  "format": "ableton-live-set",
+  "metadata": {
+    "genre": "Drum & Bass, Jungle",
+    "tags": ["work in progress", "collab"]
+  },
+  "location": {
+    "relative_path": "Ableton/Projects/Night Drive Project"
+  }
+}
 ```
+
+`metadata`, `metadata.genre`, and `metadata.tags` are optional. Omitting them
+clears the corresponding catalogue values; old profiles without `metadata`
+remain valid. Multiple genres are stored as a comma-separated `genre` string,
+so providers remain compatible with profiles containing one genre. `location`
+is also optional. Its `relative_path` uses `/`
+separators and records the project beneath a user-selected library root, never
+an absolute machine-specific path. Restore clients recreate its parent folders
+beneath the new root after rejecting traversal components. Providers preserve
+the last known `location` when an older client updates a profile without that
+field.
 
 ### `GET /v1/projects/{handle}/head`
 

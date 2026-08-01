@@ -13,9 +13,9 @@ use std::time::SystemTime;
 use auru_pm::{
     AuthorIdentity, BundlePolicy, CommitId, CommitSummary, ConflictChoice, ConflictResolution,
     ConflictedField, ContentHash, FilesystemProvider, HistoryRange, HttpAccount, ProjectFormat,
-    ProjectProfile, ProjectProvider, ProjectSnapshot, PushOptions, PushOutcome, RetentionReport,
-    RetentionRoots, RetentionRule, SampleManifest, Sidecar, fetch_project_info, flstudio,
-    push_with_options, sidecar_path_for, verify_commit_copy,
+    ProjectLocation, ProjectMetadata, ProjectProfile, ProjectProvider, ProjectSnapshot,
+    PushOptions, PushOutcome, RetentionReport, RetentionRoots, RetentionRule, SampleManifest,
+    Sidecar, fetch_project_info, flstudio, push_with_options, sidecar_path_for, verify_commit_copy,
 };
 use auru_pm_client::ProviderAccount;
 
@@ -45,6 +45,8 @@ pub struct BackupReceipt {
 pub struct PreparedBackup {
     project_path: PathBuf,
     snapshot: ProjectSnapshot,
+    metadata: ProjectMetadata,
+    location: Option<ProjectLocation>,
     source_revision: Option<SystemTime>,
 }
 
@@ -92,11 +94,18 @@ pub struct RemoteCatalogue {
 }
 
 /// Read one stable project revision without publishing it.
-pub fn prepare_backup(project_path: PathBuf) -> Result<PreparedBackup, String> {
+pub fn prepare_backup(
+    project_path: PathBuf,
+    location: Option<ProjectLocation>,
+) -> Result<PreparedBackup, String> {
     let (snapshot, source_revision) = load_stable_snapshot(&project_path)?;
+    let sidecar = Sidecar::load(&sidecar_path_for(&project_path))
+        .map_err(|error| format!("read project metadata: {error}"))?;
     Ok(PreparedBackup {
         project_path,
         snapshot,
+        metadata: sidecar.metadata,
+        location: location.or(sidecar.location),
         source_revision,
     })
 }
@@ -133,6 +142,8 @@ fn back_up_prepared_with_resolutions(
     let PreparedBackup {
         project_path,
         snapshot,
+        metadata,
+        location,
         source_revision,
     } = prepared;
     runtime()?.block_on(async move {
@@ -143,18 +154,26 @@ fn back_up_prepared_with_resolutions(
         } else {
             Vec::new()
         };
+        let sidecar_path = sidecar_path_for(&project_path);
+        if let Some(location) = &location {
+            Sidecar::modify(&sidecar_path, |sidecar| {
+                sidecar.location = Some(location.clone());
+            })
+            .map_err(|error| format!("save project library location: {error}"))?;
+        }
         if provider.capabilities().project_listing {
             provider
                 .put_project_profile(&ProjectProfile {
                     display_name: project_display_name(&project_path),
                     format: snapshot.format(),
+                    metadata: metadata.clone(),
+                    location: location.clone(),
                 })
                 .await
                 .map_err(|error| format!("register project with provider: {error}"))?;
         }
         let remote_id = listing.entry.id.clone();
 
-        let sidecar_path = sidecar_path_for(&project_path);
         let mut push_options = PushOptions::for_snapshot(&snapshot);
         push_options.bundle_policy = bundle_policy.clone();
         push_options.conflict_resolutions = conflict_resolutions;
@@ -241,6 +260,8 @@ fn back_up_prepared_with_resolutions(
                     prepared: PreparedBackup {
                         project_path,
                         snapshot,
+                        metadata,
+                        location,
                         source_revision,
                     },
                     display_name,
@@ -346,7 +367,7 @@ fn back_up(
     retention_rule: Option<RetentionRule>,
     verify_uploads: bool,
 ) -> Result<BackupResult, String> {
-    let prepared = prepare_backup(project_path)?;
+    let prepared = prepare_backup(project_path, None)?;
     back_up_prepared(
         listing,
         prepared,
@@ -458,6 +479,8 @@ pub fn remote_catalogue(listing: ProviderListing) -> Result<RemoteCatalogue, Str
                     ProjectProfile {
                         display_name: record.handle.clone(),
                         format: snapshot.format(),
+                        metadata: ProjectMetadata::default(),
+                        location: None,
                     }
                 }
             };
@@ -469,6 +492,8 @@ pub fn remote_catalogue(listing: ProviderListing) -> Result<RemoteCatalogue, Str
                 file_name: safe_project_file_name(&profile.display_name, profile.format),
                 name: profile.display_name,
                 format: profile.format,
+                metadata: profile.metadata,
+                location: profile.location,
                 updated_at: record.updated_at,
                 info,
             });
@@ -500,11 +525,12 @@ pub fn remote_history(
     })
 }
 
-/// Restore a commit into a new sibling folder under `destination`.
+/// Restore a commit into a new safety folder under `destination`.
 ///
-/// Never writes over the working project. A restore is something a person
-/// should be able to inspect and open before deciding whether it replaces
-/// current work.
+/// When the profile knows its watched-root-relative location, the organizing
+/// parent folders are recreated first. A restore never writes over the working
+/// project; it is something a person can inspect before deciding whether it
+/// replaces current work.
 pub fn restore(
     listing: ProviderListing,
     working_project: PathBuf,
@@ -513,12 +539,22 @@ pub fn restore(
 ) -> Result<RestoreResult, String> {
     runtime()?.block_on(async move {
         let provider = open_provider(&listing, &working_project).await?;
+        let location = Sidecar::load(&sidecar_path_for(&working_project))
+            .map_err(|error| format!("read project library location: {error}"))?
+            .location;
         let file_name = working_project
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("Restored Project")
             .to_owned();
-        restore_from_provider(provider.as_ref(), commit_id, &destination, &file_name).await
+        restore_from_provider(
+            provider.as_ref(),
+            commit_id,
+            &destination,
+            &file_name,
+            location.as_ref(),
+        )
+        .await
     })
 }
 
@@ -527,6 +563,8 @@ pub fn restore_remote(
     listing: ProviderListing,
     handle: String,
     file_name: String,
+    metadata: ProjectMetadata,
+    location: Option<ProjectLocation>,
     commit_id: CommitId,
     destination: PathBuf,
 ) -> Result<RestoreResult, String> {
@@ -536,11 +574,19 @@ pub fn restore_remote(
             .open_project(&handle)
             .await
             .map_err(|error| format!("open remote project: {error}"))?;
-        let result =
-            restore_from_provider(provider.as_ref(), commit_id, &destination, &file_name).await?;
+        let result = restore_from_provider(
+            provider.as_ref(),
+            commit_id,
+            &destination,
+            &file_name,
+            location.as_ref(),
+        )
+        .await?;
         let result = require_complete_recovery(result)?;
         let sidecar_path = sidecar_path_for(&result.project_file);
         Sidecar {
+            location,
+            metadata,
             primary: Some(listing.entry.id.clone()),
             provider_handles: BTreeMap::from([(listing.entry.id, handle)]),
             local_head: Some(commit_id),
@@ -549,6 +595,54 @@ pub fn restore_remote(
         .save(&sidecar_path)
         .map_err(|error| format!("enroll restored project: {error}"))?;
         Ok(result)
+    })
+}
+
+/// Persist user-authored project metadata locally and, when enrolled, update
+/// the provider catalogue profile as well.
+pub fn save_project_metadata(
+    provider_target: Option<(ProviderListing, String)>,
+    project_path: Option<PathBuf>,
+    profile: ProjectProfile,
+) -> Result<(), String> {
+    if let Some(project_path) = project_path {
+        let sidecar_path = sidecar_path_for(&project_path);
+        let backup_marker = std::fs::metadata(&sidecar_path)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        let metadata = profile.metadata.clone();
+        let location = profile.location.clone();
+        Sidecar::modify(&sidecar_path, |sidecar| {
+            sidecar.metadata = metadata;
+            sidecar.location = location;
+        })
+        .map_err(|error| format!("save local project metadata: {error}"))?;
+        if let Some(backup_marker) = backup_marker {
+            // Project status compares this timestamp with the DAW file's mtime.
+            // Metadata is not a backup and must not move that marker forward.
+            let sidecar_file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&sidecar_path)
+                .map_err(|error| format!("restore project backup marker: {error}"))?;
+            sidecar_file
+                .set_times(std::fs::FileTimes::new().set_modified(backup_marker))
+                .map_err(|error| format!("restore project backup marker: {error}"))?;
+        }
+    }
+
+    let Some((listing, handle)) = provider_target else {
+        return Ok(());
+    };
+    runtime()?.block_on(async move {
+        let provider = provider_account(&listing)
+            .await?
+            .open_project(&handle)
+            .await
+            .map_err(|error| format!("open project metadata on {}: {error}", listing.entry.name))?;
+        provider
+            .put_project_profile(&profile)
+            .await
+            .map_err(|error| format!("update project metadata on {}: {error}", listing.entry.name))
     })
 }
 
@@ -661,6 +755,7 @@ async fn restore_from_provider(
     commit_id: CommitId,
     destination: &Path,
     requested_file_name: &str,
+    location: Option<&ProjectLocation>,
 ) -> Result<RestoreResult, String> {
     let commit = provider
         .get_commit(&commit_id)
@@ -677,7 +772,7 @@ async fn restore_from_provider(
         .and_then(|stem| stem.to_str())
         .unwrap_or("Restored Project");
     let file_name = safe_project_file_name(requested_stem, snapshot.format());
-    let restore_root = unique_restore_root(destination, Path::new(&file_name), commit_id);
+    let restore_root = restore_root_for(destination, location, Path::new(&file_name), commit_id);
 
     match snapshot.format() {
         ProjectFormat::AbletonLiveSet => {
@@ -700,7 +795,28 @@ async fn restore_from_provider(
         ProjectFormat::Dawproject => {
             restore_dawproject(provider, &commit, &snapshot, &restore_root, &file_name).await
         }
+        ProjectFormat::BitwigProject => {
+            restore_opaque_project(&snapshot, &restore_root, &file_name)
+        }
     }
+}
+
+fn restore_opaque_project(
+    snapshot: &ProjectSnapshot,
+    restore_root: &Path,
+    file_name: &str,
+) -> Result<RestoreResult, String> {
+    std::fs::create_dir_all(restore_root)
+        .map_err(|error| format!("create restore folder: {error}"))?;
+    let project_file = restore_root.join(file_name);
+    snapshot
+        .restore_to_path(&project_file)
+        .map_err(|error| format!("restore project: {error}"))?;
+    Ok(RestoreResult {
+        project_file,
+        files_written: 0,
+        unavailable: 0,
+    })
 }
 
 async fn restore_dawproject(
@@ -956,6 +1072,50 @@ async fn restore_fl(
     })
 }
 
+fn restore_root_for(
+    destination: &Path,
+    location: Option<&ProjectLocation>,
+    fallback_project_path: &Path,
+    commit_id: CommitId,
+) -> PathBuf {
+    let Some(relative) = location.and_then(safe_restore_location) else {
+        return unique_restore_root(destination, fallback_project_path, commit_id);
+    };
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let project_path = relative
+        .file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fallback_project_path.to_path_buf());
+    unique_restore_root(&destination.join(parent), &project_path, commit_id)
+}
+
+/// Turn an untrusted provider profile location into a path that can only live
+/// beneath the restore root. Invalid paths deliberately fall back to the root
+/// rather than making a remote catalogue entry impossible to recover.
+fn safe_restore_location(location: &ProjectLocation) -> Option<PathBuf> {
+    const MAX_COMPONENTS: usize = 32;
+    let value = location.relative_path.trim();
+    if value.is_empty() || value.starts_with(['/', '\\']) {
+        return None;
+    }
+
+    let mut relative = PathBuf::new();
+    for (index, component) in value.split('/').enumerate() {
+        if index >= MAX_COMPONENTS || component.is_empty() || matches!(component, "." | "..") {
+            return None;
+        }
+        let mut component = safe_file_component(component, "", 160);
+        if component.is_empty() {
+            return None;
+        }
+        if is_windows_reserved_name(&component) {
+            component.insert(0, '_');
+        }
+        relative.push(component);
+    }
+    (!relative.as_os_str().is_empty()).then_some(relative)
+}
+
 fn unique_restore_root(destination: &Path, project_path: &Path, commit_id: CommitId) -> PathBuf {
     let stem = project_path
         .file_stem()
@@ -1044,6 +1204,22 @@ mod tests {
     }
 
     #[test]
+    fn an_opaque_bitwig_restore_should_write_the_exact_project_bytes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = b"BtWg0003000200ba\0opaque project data";
+        let snapshot = ProjectSnapshot::from_source_bytes(ProjectFormat::BitwigProject, source)
+            .expect("snapshot");
+
+        let restored = restore_opaque_project(&snapshot, temp.path(), "Song.bwproject")
+            .expect("restore Bitwig project");
+
+        assert_eq!(
+            std::fs::read(restored.project_file).expect("restored bytes"),
+            source
+        );
+    }
+
+    #[test]
     fn a_local_backup_should_create_history_and_record_its_provider() {
         let temp = tempfile::tempdir().expect("tempdir");
         let project = temp.path().join("Song.auru");
@@ -1086,6 +1262,134 @@ mod tests {
         assert_eq!(catalogue.projects[0].name, "Song");
         assert_eq!(catalogue.projects[0].format, ProjectFormat::Auru);
         assert_eq!(catalogue.projects[0].head, history[0].id);
+    }
+
+    #[test]
+    fn backup_and_recovery_should_preserve_the_nested_library_location() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp
+            .path()
+            .join("Music Production/Auru/Projects/Night Drive.auru");
+        std::fs::create_dir_all(project.parent().expect("project parent")).expect("mkdir");
+        std::fs::write(&project, br#"{"version":8,"channels":[]}"#).expect("project");
+        let listing = local_listing(&temp.path().join("Backups"));
+        let location = ProjectLocation {
+            relative_path: "Auru/Projects/Night Drive.auru".to_owned(),
+        };
+        let prepared = prepare_backup(project, Some(location.clone())).expect("prepare backup");
+        let BackupResult::Committed(BackupReceipt { history, .. }) = back_up_prepared(
+            listing.clone(),
+            prepared,
+            "Jake".to_owned(),
+            None,
+            false,
+            BundlePolicy::default(),
+        )
+        .expect("backup") else {
+            panic!("backup should commit");
+        };
+        let remote = remote_catalogue(listing.clone())
+            .expect("catalogue")
+            .projects
+            .remove(0);
+        let recovery_root = temp.path().join("Recovered Music Production");
+
+        let restored = restore_remote(
+            listing,
+            remote.handle,
+            remote.file_name,
+            remote.metadata,
+            remote.location,
+            history[0].id,
+            recovery_root.clone(),
+        )
+        .expect("restore");
+
+        assert!(
+            restored
+                .project_file
+                .starts_with(recovery_root.join("Auru/Projects")),
+            "restored to {}",
+            restored.project_file.display()
+        );
+        assert_eq!(
+            Sidecar::load(&sidecar_path_for(&restored.project_file))
+                .expect("restored sidecar")
+                .location,
+            Some(location)
+        );
+    }
+
+    #[test]
+    fn saving_metadata_should_update_the_local_sidecar_and_provider_profile() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("Song.auru");
+        std::fs::write(&project, br#"{"version":8,"channels":[]}"#).expect("project");
+        let listing = local_listing(&temp.path().join("Backups"));
+        let BackupResult::Committed(_) = back_up(
+            listing.clone(),
+            project.clone(),
+            "Jake".to_owned(),
+            None,
+            false,
+        )
+        .expect("initial backup") else {
+            panic!("first backup should commit");
+        };
+        let sidecar_path = sidecar_path_for(&project);
+        let sidecar = Sidecar::load(&sidecar_path).expect("enrolled sidecar");
+        let backup_marker = std::fs::metadata(&sidecar_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("backup marker");
+        let handle = sidecar
+            .provider_handles
+            .get(&listing.entry.id)
+            .expect("project handle")
+            .clone();
+        let metadata = ProjectMetadata {
+            genre: Some("Drum & Bass".to_owned()),
+            tags: vec!["work in progress".to_owned(), "collab".to_owned()],
+        };
+        let location = ProjectLocation {
+            relative_path: "Auru/Projects/Song.auru".to_owned(),
+        };
+
+        save_project_metadata(
+            Some((listing.clone(), handle)),
+            Some(project.clone()),
+            ProjectProfile {
+                display_name: "Song".to_owned(),
+                format: ProjectFormat::Auru,
+                metadata: metadata.clone(),
+                location: Some(location.clone()),
+            },
+        )
+        .expect("save project metadata");
+
+        let local = Sidecar::load(&sidecar_path).expect("updated sidecar");
+        let saved_marker = std::fs::metadata(&sidecar_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("preserved backup marker");
+        let remote = remote_catalogue(listing)
+            .expect("updated provider catalogue")
+            .projects
+            .remove(0);
+        assert_eq!(
+            (
+                local.metadata,
+                remote.metadata,
+                local.location,
+                remote.location,
+                saved_marker
+            ),
+            (
+                metadata.clone(),
+                metadata,
+                Some(location.clone()),
+                Some(location),
+                backup_marker
+            )
+        );
     }
 
     #[test]
@@ -1148,7 +1452,8 @@ mod tests {
             &project,
         )
         .expect("project");
-        let prepared = prepare_backup(project.clone()).expect("prepare stable project revision");
+        let prepared =
+            prepare_backup(project.clone(), None).expect("prepare stable project revision");
         let prepared_revision = prepared.source_revision();
         assert!(prepared_revision.is_some());
 
@@ -1298,6 +1603,8 @@ mod tests {
             listing.clone(),
             remote.handle.clone(),
             remote.file_name,
+            remote.metadata,
+            remote.location,
             history[0].id,
             temp.path().join("Recovered"),
         )
@@ -1417,6 +1724,8 @@ mod tests {
             listing,
             remote.handle,
             remote.file_name,
+            remote.metadata,
+            remote.location,
             history[0].id,
             temp.path().join("Recovered"),
         )
@@ -1630,6 +1939,50 @@ mod tests {
             .expect("restore folder name");
         assert!(folder.starts_with("My Song Restored "));
         assert!(folder.ends_with(" (2)"));
+    }
+
+    #[test]
+    fn a_restore_location_should_recreate_only_safe_relative_parents() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let commit = CommitId(auru_pm::ContentHash::of(b"nested restore"));
+        let location = ProjectLocation {
+            relative_path: "Ableton/Projects/Night Drive Project".to_owned(),
+        };
+
+        let root = restore_root_for(
+            temp.path(),
+            Some(&location),
+            Path::new("Night Drive.als"),
+            commit,
+        );
+
+        assert_eq!(
+            root.parent(),
+            Some(temp.path().join("Ableton/Projects").as_path())
+        );
+        assert!(
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("Night Drive Project Restored "))
+        );
+    }
+
+    #[test]
+    fn a_traversal_restore_location_should_fall_back_inside_the_selected_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let commit = CommitId(auru_pm::ContentHash::of(b"safe restore"));
+        let location = ProjectLocation {
+            relative_path: "../../outside".to_owned(),
+        };
+
+        let root = restore_root_for(
+            temp.path(),
+            Some(&location),
+            Path::new("Night Drive.als"),
+            commit,
+        );
+
+        assert_eq!(root.parent(), Some(temp.path()));
     }
 
     #[test]

@@ -10,6 +10,12 @@ use crate::project_format::ProjectFormat;
 /// it without downloading the latest snapshot.
 pub type ProjectProfile = auru_pm_protocol::ProjectProfile<ProjectFormat>;
 
+/// User-authored genre and tags attached to a project.
+pub type ProjectMetadata = auru_pm_protocol::ProjectMetadata;
+
+/// Portable placement beneath a watched library root.
+pub type ProjectLocation = auru_pm_protocol::ProjectLocation;
+
 /// One project returned by a provider account catalogue.
 pub type ProviderProject = auru_pm_protocol::ProviderProject<CommitId, ProjectFormat>;
 

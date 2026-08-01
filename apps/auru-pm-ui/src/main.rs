@@ -1,6 +1,8 @@
 mod automatic_backup;
 mod backend;
+mod badge_input;
 mod catalog;
+mod input_submit;
 mod inspection;
 mod menus;
 mod model;
@@ -13,42 +15,50 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use auru_pm::{
     AURU_REGISTRY_URL, AuthMethod, BundlePolicy, ConflictChoice, OAuthProgress, PathAlias,
-    RetentionRule,
+    ProjectMetadata, ProjectProfile, RetentionRule,
 };
 use gpui::{
     Anchor, AnyElement, App, Bounds, Context, Div, ElementId, Entity, FocusHandle, Focusable,
     FontWeight, Hsla, InteractiveElement, Interactivity, IntoElement, ParentElement, Render,
-    RenderOnce, SharedString, Size, Stateful, StyleRefinement, Styled, Subscription,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, prelude::*, px, relative,
-    rgb, uniform_list,
+    RenderOnce, Role, SharedString, Size, Stateful, StyleRefinement, Styled, Subscription,
+    TextAlign, UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, prelude::*, px,
+    relative, rgb, uniform_list,
 };
 use gpui_component::{
-    Root, Selectable, Sizable, Theme, ThemeMode, ThemeTokens, WindowExt,
-    input::{Input, InputEvent, InputState},
+    Icon, IconName, IndexPath, Root, Selectable, Sizable, Theme, ThemeMode, ThemeTokens, WindowExt,
+    button::{Button, ButtonVariants},
+    combobox::{Combobox, ComboboxState},
+    input::{Enter as InputEnter, Input, InputEvent, InputState, MaskPattern},
     menu::DropdownMenu,
     notification::Notification,
+    popover::Popover,
     scroll::ScrollableElement,
+    searchable_list::SearchableVec,
     setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
+    slider::{Slider, SliderEvent, SliderState},
     spinner::Spinner,
+    tag::Tag,
 };
 use gpui_platform::application;
 
 use crate::automatic_backup::{
     AutomaticBackupReason, AutomaticBackupScheduler, ProjectObservation,
 };
+use crate::badge_input::{badge_values, use_badge_input};
 use crate::catalog::{
     AuthHint, CatalogState, ProviderAvailability, ProviderListing, fetch_first_party_catalog,
     load_provider_file, local_provider,
 };
+use crate::input_submit::use_input_submit;
 use crate::menus::{
-    AddAbletonProject, AddAuruProject, AddDawproject, AddFlStudioProject, CloseWindow, Minimize,
-    OpenSettings, SortByAttentionRequired, SortByLastModifiedLocal, SortByLastModifiedRemote,
-    SortByName, SortByRecentlyAdded, Zoom,
+    AddAbletonProject, AddAuruProject, AddBitwigProject, AddDawproject, AddFlStudioProject,
+    CloseWindow, Minimize, OpenSettings, SortByAttentionRequired, SortByLastModifiedLocal,
+    SortByLastModifiedRemote, SortByName, SortByRecentlyAdded, Zoom,
 };
 use crate::model::{
-    ImportKind, PLUGIN_SETTINGS_REASSURANCE, Project, ProjectAction, ProjectStatus, SortOrder,
-    SyncDirection, WatchedFolder, format_bytes, import_project, load_library,
-    replace_provider_projects, sort_projects,
+    BpmFilter, ImportKind, LibraryFilterOptions, PLUGIN_SETTINGS_REASSURANCE, Project,
+    ProjectAction, ProjectStatus, SortOrder, SyncDirection, WatchedFolder, format_bytes,
+    import_project, library_filter_options, load_library, replace_provider_projects, sort_projects,
 };
 
 const OAUTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -56,6 +66,29 @@ const AUTOMATIC_BACKUP_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const DISPLAY_FONT: &str = "New York";
 const MONO_FONT: &str = "SF Mono";
 const SIDEBAR_WIDTH: f32 = 320.0;
+const MIN_FILTER_BPM: f32 = 1.0;
+const MAX_FILTER_BPM: f32 = 300.0;
+
+type FilterComboboxState = ComboboxState<SearchableVec<String>>;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum BpmFilterMode {
+    #[default]
+    Range,
+    Exact,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetadataBadgeField {
+    Genre,
+    Tag,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BpmRangeEndpoint {
+    Min,
+    Max,
+}
 const WAVEFORM_HEIGHTS: [f32; 30] = [
     10.0, 20.0, 14.0, 24.0, 18.0, 12.0, 22.0, 16.0, 25.0, 19.0, 12.0, 16.0, 23.0, 14.0, 18.0, 26.0,
     13.0, 20.0, 17.0, 24.0, 11.0, 15.0, 22.0, 18.0, 25.0, 14.0, 19.0, 12.0, 21.0, 16.0,
@@ -274,8 +307,28 @@ struct ProjectManager {
     display_name: String,
     display_name_input: Entity<InputState>,
     search_input: Entity<InputState>,
+    genre_filter: Entity<FilterComboboxState>,
+    genre_filter_trigger_focus: FocusHandle,
+    tag_filter: Entity<FilterComboboxState>,
+    tag_filter_trigger_focus: FocusHandle,
+    filter_options: LibraryFilterOptions,
+    bpm_range_slider: Entity<SliderState>,
+    bpm_range_min_input: Entity<InputState>,
+    bpm_range_max_input: Entity<InputState>,
+    bpm_exact_slider: Entity<SliderState>,
+    bpm_filter_mode: BpmFilterMode,
+    bpm_filter: Option<BpmFilter>,
+    bpm_popover_open: bool,
+    bpm_filter_loading: bool,
     credential_input: Entity<InputState>,
     path_alias_input: Entity<InputState>,
+    genre_input: Entity<InputState>,
+    genre_values: Vec<String>,
+    tags_input: Entity<InputState>,
+    tag_values: Vec<String>,
+    metadata_input_project_id: Option<String>,
+    metadata_input_baseline: ProjectMetadata,
+    metadata_saving: Option<String>,
     providers: Vec<ProviderListing>,
     catalog_state: CatalogState,
     auth_phase: AuthPhase,
@@ -340,12 +393,84 @@ impl ProjectManager {
         });
         let search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("⌕ search projects…"));
+        let filter_options = library_filter_options(&projects);
+        let genre_filter = cx.new(|cx| {
+            ComboboxState::new(
+                SearchableVec::new(filter_options.genres.clone()),
+                Vec::new(),
+                window,
+                cx,
+            )
+            .multiple(true)
+            .searchable(true)
+        });
+        let tag_filter = cx.new(|cx| {
+            ComboboxState::new(
+                SearchableVec::new(filter_options.tags.clone()),
+                Vec::new(),
+                window,
+                cx,
+            )
+            .multiple(true)
+            .searchable(true)
+        });
+        let genre_filter_trigger_focus = genre_filter.focus_handle(cx);
+        let tag_filter_trigger_focus = tag_filter.focus_handle(cx);
+        let bpm_range_slider = cx.new(|_| {
+            SliderState::new()
+                .min(MIN_FILTER_BPM)
+                .max(MAX_FILTER_BPM)
+                .step(1.0)
+                .default_value(MIN_FILTER_BPM..MAX_FILTER_BPM)
+        });
+        let bpm_range_min_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Min")
+                .mask_pattern(MaskPattern::Number {
+                    separator: None,
+                    fraction: Some(0),
+                })
+                .step(1.0)
+                .min(f64::from(MIN_FILTER_BPM))
+                .max(f64::from(MAX_FILTER_BPM))
+                .default_value(format!("{MIN_FILTER_BPM:.0}"))
+        });
+        let bpm_range_max_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Max")
+                .mask_pattern(MaskPattern::Number {
+                    separator: None,
+                    fraction: Some(0),
+                })
+                .step(1.0)
+                .min(f64::from(MIN_FILTER_BPM))
+                .max(f64::from(MAX_FILTER_BPM))
+                .default_value(format!("{MAX_FILTER_BPM:.0}"))
+        });
+        let bpm_range_min_focus = bpm_range_min_input.focus_handle(cx);
+        let bpm_range_max_focus = bpm_range_max_input.focus_handle(cx);
+        let bpm_exact_slider = cx.new(|_| {
+            SliderState::new()
+                .min(MIN_FILTER_BPM)
+                .max(MAX_FILTER_BPM)
+                .step(1.0)
+                .default_value(120.0)
+        });
         let credential_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Personal access token"));
         let path_alias_input = cx
             .new(|cx| InputState::new(window, cx).placeholder("Recorded prefix, e.g. D:\\Samples"));
+        let metadata_seed = projects
+            .first()
+            .map(|project| project.metadata.clone())
+            .unwrap_or_default();
+        let metadata_project_seed = projects.first().map(|project| project.id.clone());
+        let genre_input = cx.new(|cx| InputState::new(window, cx).placeholder("Add a genre…"));
+        let genre_values = metadata_seed.genres().map(str::to_owned).collect();
+        let tags_input = cx.new(|cx| InputState::new(window, cx).placeholder("Add a tag…"));
+        let tag_values = metadata_seed.tags.clone();
 
-        let _subscriptions = [
+        let mut _subscriptions: Vec<Subscription> = [
             &display_name_input,
             &display_name_setting,
             &search_input,
@@ -364,6 +489,93 @@ impl ProjectManager {
             })
         })
         .collect();
+
+        _subscriptions.extend([&genre_input, &tags_input].into_iter().map(|input| {
+            cx.subscribe_in(input, window, |_, _, event: &InputEvent, _, cx| {
+                if metadata_input_needs_parent_render(event) {
+                    cx.notify();
+                }
+            })
+        }));
+
+        _subscriptions.extend([
+            use_input_submit(
+                &display_name_input,
+                window,
+                cx,
+                |this: &mut Self, window, cx| {
+                    if this.route == Route::Onboarding
+                        && this.onboarding_step == OnboardingStep::Profile
+                    {
+                        this.advance_onboarding(window, cx);
+                    }
+                },
+            ),
+            use_input_submit(
+                &display_name_setting,
+                window,
+                cx,
+                |this: &mut Self, window, cx| this.save_display_name(window, cx),
+            ),
+            use_input_submit(
+                &credential_input,
+                window,
+                cx,
+                |this: &mut Self, window, cx| {
+                    let Overlay::Authenticate { provider_index } = this.overlay.overlay else {
+                        return;
+                    };
+                    if matches!(&this.auth_phase, AuthPhase::Ready) {
+                        this.begin_provider_auth(provider_index, window, cx);
+                    }
+                },
+            ),
+            use_input_submit(
+                &path_alias_input,
+                window,
+                cx,
+                |this: &mut Self, window, cx| this.add_path_alias(window, cx),
+            ),
+            use_badge_input(
+                &genre_input,
+                window,
+                cx,
+                |this: &mut Self, values, _, cx| {
+                    this.add_metadata_badges(MetadataBadgeField::Genre, values, cx);
+                },
+            ),
+            use_badge_input(&tags_input, window, cx, |this: &mut Self, values, _, cx| {
+                this.add_metadata_badges(MetadataBadgeField::Tag, values, cx);
+            }),
+        ]);
+        let slider_for_range_inputs = bpm_range_slider.clone();
+        let min_input_for_slider = bpm_range_min_input.clone();
+        let max_input_for_slider = bpm_range_max_input.clone();
+        _subscriptions.extend([
+            cx.observe(&genre_filter, |_, _, cx| cx.notify()),
+            cx.observe(&tag_filter, |_, _, cx| cx.notify()),
+            cx.subscribe_in(
+                &bpm_range_slider,
+                window,
+                move |_, _, _: &SliderEvent, window, cx| {
+                    let range = slider_for_range_inputs.read(cx).value();
+                    set_bpm_input_value(&min_input_for_slider, range.start(), window, cx);
+                    set_bpm_input_value(&max_input_for_slider, range.end(), window, cx);
+                    cx.notify();
+                },
+            ),
+            cx.subscribe_in(&bpm_exact_slider, window, |_, _, _: &SliderEvent, _, cx| {
+                cx.notify()
+            }),
+        ]);
+        _subscriptions.extend([
+            cx.on_blur(&bpm_range_min_focus, window, |this, window, cx| {
+                this.commit_bpm_range_endpoint(BpmRangeEndpoint::Min, window, cx);
+            }),
+            cx.on_blur(&bpm_range_max_focus, window, |this, window, cx| {
+                this.commit_bpm_range_endpoint(BpmRangeEndpoint::Max, window, cx);
+            }),
+        ]);
 
         // A providers file replaces the hosted registry outright: it was
         // passed deliberately, so silently going to the network instead would
@@ -469,8 +681,28 @@ impl ProjectManager {
             display_name: state.display_name.clone(),
             display_name_input,
             search_input,
+            genre_filter,
+            genre_filter_trigger_focus,
+            tag_filter,
+            tag_filter_trigger_focus,
+            filter_options,
+            bpm_range_slider,
+            bpm_range_min_input,
+            bpm_range_max_input,
+            bpm_exact_slider,
+            bpm_filter_mode: BpmFilterMode::default(),
+            bpm_filter: None,
+            bpm_popover_open: false,
+            bpm_filter_loading: false,
             credential_input,
             path_alias_input,
+            genre_input,
+            genre_values,
+            tags_input,
+            tag_values,
+            metadata_input_project_id: metadata_project_seed,
+            metadata_input_baseline: metadata_seed,
+            metadata_saving: None,
             providers,
             catalog_state,
             auth_phase: AuthPhase::Ready,
@@ -512,6 +744,15 @@ impl ProjectManager {
         cx: &mut Context<Self>,
     ) {
         self.add_project(ImportKind::AbletonLiveSet, window, cx);
+    }
+
+    fn add_bitwig_project(
+        &mut self,
+        _: &AddBitwigProject,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.add_project(ImportKind::BitwigProject, window, cx);
     }
 
     fn sort_by_last_modified_local(
@@ -632,8 +873,8 @@ impl ProjectManager {
                     .text_size(px(9.0))
                     .text_color(dim())
                     .child(
-                        "No folders watched yet. Point Auru at where you keep your projects \
-                         and it will find them.",
+                        "No library root watched yet. Choose the folder above your DAW folders; \
+                         Auru finds projects recursively and remembers their structure for restore.",
                     ),
             );
         }
@@ -691,7 +932,7 @@ impl ProjectManager {
                                 .whitespace_nowrap()
                                 .text_ellipsis()
                                 .text_color(ink())
-                                .child(project.name.clone()),
+                                .child(project.library_path().to_owned()),
                         )
                         .child(
                             div()
@@ -734,7 +975,7 @@ impl ProjectManager {
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.watch_another_folder(window, cx);
                 }))
-                .child("＋ WATCH ANOTHER FOLDER");
+                .child("＋ WATCH ANOTHER LIBRARY ROOT");
         }
         section = section.child(watch_button);
 
@@ -940,7 +1181,7 @@ impl ProjectManager {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Watch this folder".into()),
+            prompt: Some("Choose a music library root".into()),
         });
 
         cx.spawn_in(window, async move |this, cx| {
@@ -983,8 +1224,30 @@ impl ProjectManager {
         let where_ = folder.display_path();
         let size = format_bytes(folder.total_bytes());
 
+        let already_covered = self
+            .state
+            .watched_folders
+            .iter()
+            .any(|root| folder.path != *root && folder.path.starts_with(root));
+        if already_covered {
+            window.push_notification(
+                Notification::info(format!(
+                    "{where_} is already beneath one of your watched library roots."
+                ))
+                .title("Already watching these projects"),
+                cx,
+            );
+            return;
+        }
+
         self.state.watch(&folder.path);
         self.state.save();
+        self.watched_folders.retain(|existing| {
+            self.state
+                .watched_folders
+                .iter()
+                .any(|root| root == &existing.path)
+        });
         match self
             .watched_folders
             .iter()
@@ -999,7 +1262,7 @@ impl ProjectManager {
 
         let notification = if found == 0 {
             Notification::warning(format!(
-                "No Ableton projects in {where_}. Auru looks for folders Live has marked as projects."
+                "No supported projects were found beneath {where_}."
             ))
             .title("Nothing found there")
         } else {
@@ -1116,7 +1379,7 @@ impl ProjectManager {
             ProjectAction::Push => {
                 self.start_project_backup(index, BackupStart::Immediate, window, cx);
             }
-            ProjectAction::Download => {
+            ProjectAction::Restore => {
                 let Some(commit_id) = project.remote.as_ref().map(|remote| remote.head) else {
                     window.push_notification(
                         Notification::error("The provider did not identify a version to restore.")
@@ -1203,6 +1466,7 @@ impl ProjectManager {
         };
         let project_id = project.id.clone();
         let project_name = project.name.clone();
+        let project_location = project.location.clone();
         let display_name = self.display_name.clone();
         let verify_uploads = self.verify_uploads;
         let bundle_policy = self.backup_bundle_policy();
@@ -1224,7 +1488,7 @@ impl ProjectManager {
 
         let preparation = cx
             .background_executor()
-            .spawn(async move { backend::prepare_backup(project_path) });
+            .spawn(async move { backend::prepare_backup(project_path, project_location) });
         cx.spawn_in(window, async move |this, cx| {
             let prepared = match preparation.await {
                 Ok(prepared) => prepared,
@@ -1574,6 +1838,18 @@ impl ProjectManager {
         cx.notify();
     }
 
+    fn save_display_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_display_name(cx);
+        window.push_notification(
+            Notification::success(format!(
+                "New versions will be saved as {}.",
+                self.display_name
+            ))
+            .title("Name updated"),
+            cx,
+        );
+    }
+
     fn advance_onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.onboarding_step {
             OnboardingStep::Profile => {
@@ -1912,8 +2188,9 @@ impl ProjectManager {
     /// key and the plugin list need the Live Set opened, which is several
     /// megabytes of gunzip apiece. Doing that on selection means the list
     /// appears at once and the cost is paid only for what someone opens.
-    fn select_project(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn select_project(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.selected_project = index;
+        self.sync_metadata_inputs(window, cx);
         cx.notify();
         self.load_project_history(index, cx);
 
@@ -1940,6 +2217,174 @@ impl ProjectManager {
                     project.apply_detail(loaded);
                     cx.notify();
                 }
+            });
+        })
+        .detach();
+    }
+
+    fn metadata_from_inputs(&self, cx: &App) -> ProjectMetadata {
+        let mut genres = self.genre_values.clone();
+        extend_unique_metadata_values(
+            &mut genres,
+            badge_values(self.genre_input.read(cx).value().as_ref()),
+        );
+        let genre = (!genres.is_empty()).then(|| genres.join(", "));
+        let mut tags = self.tag_values.clone();
+        extend_unique_metadata_values(
+            &mut tags,
+            badge_values(self.tags_input.read(cx).value().as_ref()),
+        );
+        ProjectMetadata { genre, tags }
+    }
+
+    fn add_metadata_badges(
+        &mut self,
+        field: MetadataBadgeField,
+        values: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        match field {
+            MetadataBadgeField::Genre => {
+                extend_unique_metadata_values(&mut self.genre_values, values);
+            }
+            MetadataBadgeField::Tag => {
+                extend_unique_metadata_values(&mut self.tag_values, values);
+            }
+        }
+        cx.notify();
+    }
+
+    fn commit_pending_metadata_input(
+        &mut self,
+        field: MetadataBadgeField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = match field {
+            MetadataBadgeField::Genre => self.genre_input.clone(),
+            MetadataBadgeField::Tag => self.tags_input.clone(),
+        };
+        let values = badge_values(input.read(cx).value().as_ref());
+        if values.is_empty() {
+            return;
+        }
+        input.update(cx, |input, cx| input.set_value("", window, cx));
+        self.add_metadata_badges(field, values, cx);
+    }
+
+    fn remove_metadata_badge(
+        &mut self,
+        field: MetadataBadgeField,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let values = match field {
+            MetadataBadgeField::Genre => &mut self.genre_values,
+            MetadataBadgeField::Tag => &mut self.tag_values,
+        };
+        if index < values.len() {
+            values.remove(index);
+            cx.notify();
+        }
+    }
+
+    /// Keep the shared metadata inputs pointed at the selected project without
+    /// overwriting edits that are currently in progress.
+    fn sync_metadata_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.get(self.selected_project) else {
+            return;
+        };
+        let selected_changed =
+            self.metadata_input_project_id.as_deref() != Some(project.id.as_str());
+        let inputs_are_clean = self.metadata_from_inputs(cx) == self.metadata_input_baseline;
+        if !selected_changed
+            && (!inputs_are_clean || project.metadata == self.metadata_input_baseline)
+        {
+            return;
+        }
+
+        let project_id = project.id.clone();
+        let metadata = project.metadata.clone();
+        self.genre_values = metadata.genres().map(str::to_owned).collect();
+        self.tag_values = metadata.tags.clone();
+        self.genre_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.tags_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.metadata_input_project_id = Some(project_id);
+        self.metadata_input_baseline = metadata;
+    }
+
+    fn save_project_metadata(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_pending_metadata_input(MetadataBadgeField::Genre, window, cx);
+        self.commit_pending_metadata_input(MetadataBadgeField::Tag, window, cx);
+        let Some(project) = self.projects.get(index) else {
+            return;
+        };
+        let metadata = self.metadata_from_inputs(cx);
+        if metadata == project.metadata || self.metadata_saving.as_deref() == Some(&project.id) {
+            return;
+        }
+
+        let provider_target = project.remote.as_ref().and_then(|remote| {
+            self.providers
+                .iter()
+                .find(|provider| provider.entry.id == remote.provider_id)
+                .cloned()
+                .map(|provider| (provider, remote.handle.clone()))
+        });
+        if project.live_set.is_none() && provider_target.is_none() {
+            window.push_notification(
+                Notification::error("Reconnect this project's provider and try again.")
+                    .title("Can't save project metadata"),
+                cx,
+            );
+            return;
+        }
+
+        let project_id = project.id.clone();
+        let project_name = project.name.clone();
+        let profile = ProjectProfile {
+            display_name: project.name.clone(),
+            format: project.format,
+            metadata: metadata.clone(),
+            location: project.location.clone(),
+        };
+        let project_path = project.live_set.clone();
+        self.metadata_saving = Some(project_id.clone());
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let task = cx.background_executor().spawn(async move {
+                backend::save_project_metadata(provider_target, project_path, profile)
+            });
+            let result = task.await;
+            _ = this.update_in(cx, |this, window, cx| {
+                this.metadata_saving = None;
+                match result {
+                    Ok(()) => {
+                        if let Some(project) = this
+                            .projects
+                            .iter_mut()
+                            .find(|project| project.id == project_id)
+                        {
+                            project.metadata = metadata.clone();
+                        }
+                        this.metadata_input_baseline = metadata;
+                        window.push_notification(
+                            Notification::success("Genre and tags are up to date.")
+                                .title(format!("{project_name} metadata saved")),
+                            cx,
+                        );
+                    }
+                    Err(message) => window.push_notification(
+                        Notification::error(message).title("Couldn't save project metadata"),
+                        cx,
+                    ),
+                }
+                cx.notify();
             });
         })
         .detach();
@@ -2024,13 +2469,24 @@ impl ProjectManager {
         };
         let project_name = project.name.clone();
         let project_file_name = project.file_name.clone();
+        let project_metadata = project.metadata.clone();
+        let project_location = project.location.clone();
         let project_id = project.id.clone();
         let remote_only = project_path.is_none();
+        let restore_prompt = project_location.as_ref().map_or_else(
+            || "Restore into this folder".to_owned(),
+            |location| {
+                format!(
+                    "Choose a library root; {} will be recreated beneath it",
+                    location.relative_path
+                )
+            },
+        );
         let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Restore into this folder".into()),
+            prompt: Some(restore_prompt.into()),
         });
 
         cx.spawn_in(window, async move |this, cx| {
@@ -2040,6 +2496,8 @@ impl ProjectManager {
             let Some(destination) = paths.into_iter().next() else {
                 return;
             };
+            let restore_library_root = remote_only.then(|| destination.clone());
+            let library_root_to_scan = restore_library_root.clone();
             if remote_only {
                 _ = this.update_in(cx, |this, _, cx| {
                     if let Some(project) = this
@@ -2053,7 +2511,7 @@ impl ProjectManager {
                 });
             }
             let task = cx.background_executor().spawn(async move {
-                match (project_path, remote) {
+                let result = match (project_path, remote) {
                     (Some(project_path), _) => {
                         backend::restore(provider, project_path, commit_id, destination)
                     }
@@ -2061,17 +2519,50 @@ impl ProjectManager {
                         provider,
                         remote.handle,
                         project_file_name,
+                        project_metadata,
+                        project_location,
                         commit_id,
                         destination,
                     ),
                     (None, None) => Err("The project has no provider identity.".to_owned()),
-                }
+                };
+                let restored_library = result
+                    .as_ref()
+                    .ok()
+                    .and(library_root_to_scan.as_deref())
+                    .map(WatchedFolder::scan);
+                (result, restored_library)
             });
-            let result = task.await;
+            let (result, restored_library) = task.await;
             _ = this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(report) => {
                         if remote_only {
+                            if let Some(root) = restore_library_root.as_deref() {
+                                this.state.watch(root);
+                            }
+                            if let Some(folder) = restored_library {
+                                this.watched_folders.retain(|existing| {
+                                    this.state
+                                        .watched_folders
+                                        .iter()
+                                        .any(|root| root == &existing.path)
+                                });
+                                if let Some(index) = this
+                                    .watched_folders
+                                    .iter()
+                                    .position(|existing| existing.path == folder.path)
+                                {
+                                    this.watched_folders[index] = folder;
+                                } else if this
+                                    .state
+                                    .watched_folders
+                                    .iter()
+                                    .any(|root| root == &folder.path)
+                                {
+                                    this.watched_folders.push(folder);
+                                }
+                            }
                             this.state.add_project(&report.project_file);
                             this.state.save();
                             let restored = Project::read_from_disk(&report.project_file);
@@ -2234,8 +2725,544 @@ impl ProjectManager {
         cx.notify();
     }
 
-    fn render_library(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn sync_library_filter_options(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let options = library_filter_options(&self.projects);
+        if options == self.filter_options {
+            return;
+        }
+        replace_filter_combobox_items(&self.genre_filter, options.genres.clone(), window, cx);
+        replace_filter_combobox_items(&self.tag_filter, options.tags.clone(), window, cx);
+        self.filter_options = options;
+    }
+
+    fn sync_bpm_range_inputs_from_slider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let range = self.bpm_range_slider.read(cx).value();
+        set_bpm_input_value(&self.bpm_range_min_input, range.start(), window, cx);
+        set_bpm_input_value(&self.bpm_range_max_input, range.end(), window, cx);
+    }
+
+    fn commit_bpm_range_endpoint(
+        &mut self,
+        endpoint: BpmRangeEndpoint,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.bpm_range_slider.read(cx).value();
+        let typed = match endpoint {
+            BpmRangeEndpoint::Min => parse_bpm_input(self.bpm_range_min_input.read(cx).value()),
+            BpmRangeEndpoint::Max => parse_bpm_input(self.bpm_range_max_input.read(cx).value()),
+        };
+        let range = match endpoint {
+            BpmRangeEndpoint::Min => {
+                let min = typed.unwrap_or_else(|| current.start());
+                min.clamp(MIN_FILTER_BPM, current.end())..current.end()
+            }
+            BpmRangeEndpoint::Max => {
+                let max = typed.unwrap_or_else(|| current.end());
+                current.start()..max.clamp(current.start(), MAX_FILTER_BPM)
+            }
+        };
+        self.bpm_range_slider.update(cx, |slider, cx| {
+            slider.set_value(range, window, cx);
+        });
+        self.sync_bpm_range_inputs_from_slider(window, cx);
+        cx.notify();
+    }
+
+    fn commit_bpm_range_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.bpm_range_slider.read(cx).value();
+        let min = parse_bpm_input(self.bpm_range_min_input.read(cx).value())
+            .unwrap_or_else(|| current.start());
+        let max = parse_bpm_input(self.bpm_range_max_input.read(cx).value())
+            .unwrap_or_else(|| current.end());
+        let range = ordered_bpm_range(min, max);
+        self.bpm_range_slider.update(cx, |slider, cx| {
+            slider.set_value(range, window, cx);
+        });
+        self.sync_bpm_range_inputs_from_slider(window, cx);
+    }
+
+    fn apply_bpm_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bpm_filter_mode == BpmFilterMode::Range {
+            self.commit_bpm_range_inputs(window, cx);
+        }
+        self.bpm_filter = Some(match self.bpm_filter_mode {
+            BpmFilterMode::Range => {
+                let value = self.bpm_range_slider.read(cx).value();
+                BpmFilter::Range {
+                    min: value.start().round() as u16,
+                    max: value.end().round() as u16,
+                }
+            }
+            BpmFilterMode::Exact => {
+                BpmFilter::Exact(self.bpm_exact_slider.read(cx).value().start().round() as u16)
+            }
+        });
+        self.bpm_popover_open = false;
+        self.load_missing_bpm_details(cx);
+        cx.notify();
+    }
+
+    fn clear_bpm_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.bpm_filter = None;
+        self.bpm_popover_open = false;
+        self.bpm_range_slider.update(cx, |slider, cx| {
+            slider.set_value(MIN_FILTER_BPM..MAX_FILTER_BPM, window, cx);
+        });
+        self.sync_bpm_range_inputs_from_slider(window, cx);
+        self.bpm_exact_slider.update(cx, |slider, cx| {
+            slider.set_value(120.0, window, cx);
+        });
+        cx.notify();
+    }
+
+    fn clear_library_filters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.genre_filter
+            .update(cx, |filter, cx| filter.clear_selection(cx));
+        self.tag_filter
+            .update(cx, |filter, cx| filter.clear_selection(cx));
+        self.clear_bpm_filter(window, cx);
+    }
+
+    fn load_missing_bpm_details(&mut self, cx: &mut Context<Self>) {
+        if self.bpm_filter_loading {
+            return;
+        }
+        let pending = self
+            .projects
+            .iter()
+            .filter(|project| project.detail.is_none())
+            .filter_map(|project| Some((project.id.clone(), project.live_set.as_ref()?.clone())))
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return;
+        }
+
+        self.bpm_filter_loading = true;
+        let task = cx.background_executor().spawn(async move {
+            pending
+                .into_iter()
+                .map(|(id, path)| (id, Project::detail_for(&path)))
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let loaded = task.await;
+            _ = this.update(cx, |this, cx| {
+                for (id, detail) in loaded {
+                    if let Some(project) = this.projects.iter_mut().find(|project| project.id == id)
+                    {
+                        project.apply_detail(detail);
+                    }
+                }
+                this.bpm_filter_loading = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_library_filters(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let genre_active = !self.genre_filter.read(cx).selection().is_empty();
+        let tag_active = !self.tag_filter.read(cx).selection().is_empty();
+        let bpm_label = self.bpm_filter.map_or_else(
+            || {
+                if self.bpm_filter_loading {
+                    "BPM · …".to_owned()
+                } else {
+                    "BPM".to_owned()
+                }
+            },
+            |filter| {
+                format!(
+                    "BPM · {}{}",
+                    filter.label(),
+                    if self.bpm_filter_loading { "…" } else { "" }
+                )
+            },
+        );
+        let exact = self.bpm_exact_slider.read(cx).value().start();
+        let mode = self.bpm_filter_mode;
+
+        let genre = filter_combobox(
+            &self.genre_filter,
+            &self.genre_filter_trigger_focus,
+            "GENRE",
+            "Search genres…",
+            cx,
+        );
+        let tags = filter_combobox(
+            &self.tag_filter,
+            &self.tag_filter_trigger_focus,
+            "TAGS",
+            "Search tags…",
+            cx,
+        );
+
+        let bpm_panel = div()
+            .w(px(294.0))
+            .flex()
+            .flex_col()
+            .bg(bg())
+            .text_color(ink())
+            .child(
+                div()
+                    .flex()
+                    .h(px(36.0))
+                    .items_center()
+                    .justify_between()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(line())
+                    .px_4()
+                    .child(
+                        div()
+                            .text_size(px(8.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(green())
+                            .child("[ TEMPO FILTER ]"),
+                    )
+                    .child(
+                        div()
+                            .id("bpm-mode-range")
+                            .role(Role::Button)
+                            .aria_label("Range BPM mode")
+                            .flex()
+                            .h(px(24.0))
+                            .w(px(66.0))
+                            .cursor_pointer()
+                            .items_center()
+                            .justify_center()
+                            .border_1()
+                            .border_color(if mode == BpmFilterMode::Range {
+                                blue()
+                            } else {
+                                line()
+                            })
+                            .bg(if mode == BpmFilterMode::Range {
+                                blue().opacity(0.08)
+                            } else {
+                                panel()
+                            })
+                            .text_size(px(8.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(if mode == BpmFilterMode::Range {
+                                blue()
+                            } else {
+                                faint()
+                            })
+                            .hover(|this| this.bg(selection()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.bpm_filter_mode = BpmFilterMode::Range;
+                                cx.notify();
+                            }))
+                            .child("RANGE"),
+                    )
+                    .child(
+                        div()
+                            .id("bpm-mode-exact")
+                            .role(Role::Button)
+                            .aria_label("Exact BPM mode")
+                            .flex()
+                            .h(px(24.0))
+                            .w(px(66.0))
+                            .cursor_pointer()
+                            .items_center()
+                            .justify_center()
+                            .border_1()
+                            .border_color(if mode == BpmFilterMode::Exact {
+                                blue()
+                            } else {
+                                line()
+                            })
+                            .bg(if mode == BpmFilterMode::Exact {
+                                blue().opacity(0.08)
+                            } else {
+                                panel()
+                            })
+                            .text_size(px(8.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(if mode == BpmFilterMode::Exact {
+                                blue()
+                            } else {
+                                faint()
+                            })
+                            .hover(|this| this.bg(selection()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.bpm_filter_mode = BpmFilterMode::Exact;
+                                cx.notify();
+                            }))
+                            .child("EXACT"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .min_h(px(150.0))
+                    .flex_col()
+                    .justify_center()
+                    .gap_3()
+                    .mx_4()
+                    .my_4()
+                    .border_1()
+                    .border_color(line())
+                    .bg(panel())
+                    .p_3()
+                    .when(mode == BpmFilterMode::Range, |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(8.0))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(green())
+                                        .child("[ TEMPO WINDOW ]"),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(bpm_range_input(
+                                            "bpm-range-min-input",
+                                            &self.bpm_range_min_input,
+                                            BpmRangeEndpoint::Min,
+                                            cx,
+                                        ))
+                                        .child(
+                                            div()
+                                                .text_size(px(8.0))
+                                                .text_color(faint())
+                                                .child("TO"),
+                                        )
+                                        .child(bpm_range_input(
+                                            "bpm-range-max-input",
+                                            &self.bpm_range_max_input,
+                                            BpmRangeEndpoint::Max,
+                                            cx,
+                                        )),
+                                ),
+                        )
+                        .child(
+                            Slider::new(&self.bpm_range_slider)
+                                .w_full()
+                                .bg(blue())
+                                .text_color(bright()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .text_size(px(7.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(faint())
+                                .child("LOW · 01")
+                                .child("HIGH · 300"),
+                        )
+                    })
+                    .when(mode == BpmFilterMode::Exact, |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(8.0))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(green())
+                                        .child("[ TARGET TEMPO ]"),
+                                )
+                                .child(bpm_value_box(exact)),
+                        )
+                        .child(
+                            Slider::new(&self.bpm_exact_slider)
+                                .w_full()
+                                .bg(blue())
+                                .text_color(bright()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .text_size(px(7.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(faint())
+                                .child("LOW · 01")
+                                .child("HIGH · 300"),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .h(px(40.0))
+                    .border_t_1()
+                    .border_color(line())
+                    .child(
+                        div()
+                            .id("clear-bpm-filter")
+                            .role(Role::Button)
+                            .aria_label("Reset BPM filter")
+                            .flex()
+                            .flex_1()
+                            .cursor_pointer()
+                            .items_center()
+                            .justify_center()
+                            .border_r_1()
+                            .border_color(line())
+                            .bg(panel())
+                            .text_size(px(8.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(faint())
+                            .hover(|this| this.bg(selection()).text_color(bright()))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.clear_bpm_filter(window, cx);
+                            }))
+                            .child("RESET"),
+                    )
+                    .child(
+                        div()
+                            .id("apply-bpm-filter")
+                            .role(Role::Button)
+                            .aria_label("Apply BPM filter")
+                            .flex()
+                            .flex_1()
+                            .cursor_pointer()
+                            .items_center()
+                            .justify_center()
+                            .bg(green().opacity(0.06))
+                            .text_size(px(8.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(green())
+                            .hover(|this| this.bg(green().opacity(0.14)))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.apply_bpm_filter(window, cx);
+                            }))
+                            .child(if mode == BpmFilterMode::Range {
+                                "USE WINDOW  →"
+                            } else {
+                                "USE TARGET  →"
+                            }),
+                    ),
+            );
+
+        let bpm = Popover::new("bpm-filter-popover")
+            .anchor(Anchor::TopCenter)
+            .open(self.bpm_popover_open)
+            .on_open_change(cx.listener(|this, open: &bool, _, cx| {
+                this.bpm_popover_open = *open;
+                cx.notify();
+            }))
+            .appearance(false)
+            .border_1()
+            .border_color(line())
+            .rounded(px(2.0))
+            .shadow_lg()
+            .trigger(
+                Button::new("bpm-filter-trigger")
+                    .label(bpm_label)
+                    .icon(Icon::new(IconName::ChevronDown).xsmall())
+                    .outline()
+                    .small()
+                    .w_full()
+                    .when(self.bpm_filter.is_some(), |this| this.text_color(blue())),
+            )
+            .child(bpm_panel);
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(div().min_w_0().flex_1().child(genre))
+                    .child(div().min_w_0().flex_1().child(tags))
+                    .child(div().min_w_0().flex_1().child(bpm)),
+            )
+            .when(
+                genre_active || tag_active || self.bpm_filter.is_some(),
+                |this| this.child(self.render_filter_badges(cx)),
+            )
+            .into_any_element()
+    }
+
+    fn render_filter_badges(&self, cx: &mut Context<Self>) -> AnyElement {
+        let genres = self.genre_filter.read(cx).selection().to_vec();
+        let tags = self.tag_filter.read(cx).selection().to_vec();
+        let has_multiple = genres.len() + tags.len() + usize::from(self.bpm_filter.is_some()) > 1;
+
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .children(genres.into_iter().map(|(index, genre)| {
+                let state = self.genre_filter.clone();
+                filter_badge("genre", index, genre, state, blue(), cx)
+            }))
+            .children(tags.into_iter().map(|(index, tag)| {
+                let state = self.tag_filter.clone();
+                filter_badge("tag", index, tag, state, green(), cx)
+            }))
+            .when_some(self.bpm_filter, |this, bpm| {
+                this.child(
+                    div()
+                        .flex()
+                        .h(px(23.0))
+                        .items_center()
+                        .gap_1()
+                        .border_1()
+                        .border_color(amber())
+                        .px_2()
+                        .text_size(px(8.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(amber())
+                        .child(format!("BPM {}", bpm.label()))
+                        .child(
+                            Button::new("remove-bpm-filter")
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::new(IconName::Close).xsmall())
+                                .tab_stop(false)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.clear_bpm_filter(window, cx);
+                                })),
+                        ),
+                )
+            })
+            .when(has_multiple, |this| {
+                this.child(
+                    div()
+                        .id("clear-all-library-filters")
+                        .cursor_pointer()
+                        .px_1()
+                        .text_size(px(8.0))
+                        .text_color(faint())
+                        .hover(|this| this.text_color(bright()))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.clear_library_filters(window, cx);
+                        }))
+                        .child("CLEAR ALL ×"),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_library(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.sync_library_filter_options(window, cx);
         let search_query = self.search_input.read(cx).value().to_lowercase();
+        let genres = self.genre_filter.read(cx).selected_values();
+        let tags = self.tag_filter.read(cx).selected_values();
+        let applied_bpm_filter = if self.bpm_filter_loading {
+            None
+        } else {
+            self.bpm_filter
+        };
         let attention_count = self
             .projects
             .iter()
@@ -2279,7 +3306,11 @@ impl ProjectManager {
                     .border_b_1()
                     .border_color(line())
                     .p_4()
-                    .child(Input::new(&self.search_input).small().w_full()),
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(Input::new(&self.search_input).small().w_full())
+                    .child(self.render_library_filters(cx)),
             )
             .child(
                 div()
@@ -2328,12 +3359,13 @@ impl ProjectManager {
                     }))
                     .child("↑  BACK UP ALL CHANGES"),
             )
-            .child(
-                div()
-                    .min_h_0()
-                    .flex_1()
-                    .child(self.render_project_list(&search_query, cx)),
-            )
+            .child(div().min_h_0().flex_1().child(self.render_project_list(
+                &search_query,
+                &genres,
+                &tags,
+                applied_bpm_filter,
+                cx,
+            )))
             .child(
                 div()
                     .flex()
@@ -2392,14 +3424,21 @@ impl ProjectManager {
     ///
     /// Rows are a fixed height, which is what makes the uniform variant
     /// applicable — if they ever vary, this has to change with them.
-    fn render_project_list(&self, search_query: &str, cx: &mut Context<Self>) -> AnyElement {
+    fn render_project_list(
+        &self,
+        search_query: &str,
+        genres: &[String],
+        tags: &[String],
+        bpm: Option<BpmFilter>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         // Which projects the search leaves, as indices into `projects`. The
         // list works in slots; this maps a slot back to the real project.
         let visible: Vec<usize> = self
             .projects
             .iter()
             .enumerate()
-            .filter(|(_, project)| project.matches_search(search_query))
+            .filter(|(_, project)| project.matches_library_filters(search_query, genres, tags, bpm))
             .map(|(index, _)| index)
             .collect();
 
@@ -2414,6 +3453,8 @@ impl ProjectManager {
                 .text_color(faint())
                 .child(if self.projects.is_empty() {
                     "No projects yet — watch a folder, or add one."
+                } else if !genres.is_empty() || !tags.is_empty() || bpm.is_some() {
+                    "Nothing matches those filters."
                 } else {
                     "Nothing matches that search."
                 })
@@ -2472,8 +3513,8 @@ impl ProjectManager {
             .bg(if selected { selection() } else { bg() })
             .px_5()
             .hover(|this| this.bg(selection()))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.select_project(index, cx);
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_project(index, window, cx);
             }))
             .child(div().size(px(8.0)).rounded_full().bg(color))
             .child(
@@ -2646,6 +3687,101 @@ impl ProjectManager {
                     ),
             )
             .child(primary_action);
+
+        let metadata_dirty = self.metadata_from_inputs(cx) != project.metadata;
+        let metadata_is_saving = self.metadata_saving.as_deref() == Some(project.id.as_str());
+        let metadata_save_enabled = metadata_dirty && !metadata_is_saving;
+        let mut metadata_save = div()
+            .id("save-project-metadata")
+            .flex()
+            .h(px(32.0))
+            .min_w(px(108.0))
+            .items_center()
+            .justify_center()
+            .border_1()
+            .border_color(if metadata_save_enabled {
+                green()
+            } else {
+                line()
+            })
+            .px_3()
+            .text_size(px(9.0))
+            .font_weight(FontWeight::BOLD)
+            .text_color(if metadata_save_enabled {
+                green()
+            } else {
+                faint()
+            })
+            .child(if metadata_is_saving {
+                "SAVING…"
+            } else {
+                "SAVE METADATA"
+            });
+        if metadata_save_enabled {
+            metadata_save = metadata_save
+                .cursor_pointer()
+                .hover(|this| this.bg(green().opacity(0.1)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.save_project_metadata(index, window, cx);
+                }));
+        }
+        let metadata_editor = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(section_label("[ PROJECT METADATA ]"))
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap_3()
+                    .border_1()
+                    .border_color(line())
+                    .p_4()
+                    .child(
+                        div()
+                            .flex()
+                            .min_w_0()
+                            .flex_1()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(8.0))
+                                    .text_color(faint())
+                                    .child("GENRE · ENTER OR COMMA TO ADD"),
+                            )
+                            .child(metadata_badge_input(
+                                MetadataBadgeField::Genre,
+                                &self.genre_input,
+                                &self.genre_values,
+                                blue(),
+                                cx,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .min_w_0()
+                            .flex_1()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(8.0))
+                                    .text_color(faint())
+                                    .child("TAGS · ENTER OR COMMA TO ADD"),
+                            )
+                            .child(metadata_badge_input(
+                                MetadataBadgeField::Tag,
+                                &self.tags_input,
+                                &self.tag_values,
+                                green(),
+                                cx,
+                            )),
+                    )
+                    .child(metadata_save),
+            );
 
         let mut info_grid = div().flex().flex_col().border_1().border_color(line());
 
@@ -2878,6 +4014,7 @@ impl ProjectManager {
                         .gap_5()
                         .child(header)
                         .child(banner)
+                        .child(metadata_editor)
                         .child(info_grid)
                         .child(
                             div()
@@ -3045,7 +4182,7 @@ impl ProjectManager {
                 let watched = self.state.watched_folders.len();
                 (
                     "Where do you keep your projects?",
-                    "Choose a folder and Auru will find supported projects inside it. Scanning only looks; nothing is uploaded.",
+                    "Choose the root above your DAW folders. Auru finds supported projects recursively and preserves that structure for restore. Scanning only looks; nothing is uploaded.",
                     div()
                         .flex()
                         .flex_col()
@@ -3086,9 +4223,9 @@ impl ProjectManager {
                                 .child(if self.scanning {
                                     "SCANNING…"
                                 } else if watched == 0 {
-                                    "CHOOSE YOUR PROJECTS FOLDER"
+                                    "CHOOSE YOUR MUSIC LIBRARY ROOT"
                                 } else {
-                                    "WATCH ANOTHER FOLDER"
+                                    "WATCH ANOTHER LIBRARY ROOT"
                                 }),
                         )
                         .into_any_element(),
@@ -3464,15 +4601,7 @@ impl ProjectManager {
                                     .text_color(green())
                                     .hover(|this| this.border_color(green()))
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.commit_display_name(cx);
-                                        window.push_notification(
-                                            Notification::success(format!(
-                                                "New versions will be saved as {}.",
-                                                this.display_name
-                                            ))
-                                            .title("Name updated"),
-                                            cx,
-                                        );
+                                        this.save_display_name(window, cx);
                                     }))
                                     .child("SAVE NAME"),
                             ),
@@ -4447,6 +5576,10 @@ impl ProjectManager {
             "display-name-setting" => Some(self.display_name_setting.clone()),
             "credential-input" => Some(self.credential_input.clone()),
             "path-alias-input" => Some(self.path_alias_input.clone()),
+            "project-genre-input" => Some(self.genre_input.clone()),
+            "project-tags-input" => Some(self.tags_input.clone()),
+            "bpm-range-min-input" => Some(self.bpm_range_min_input.clone()),
+            "bpm-range-max-input" => Some(self.bpm_range_max_input.clone()),
             inspection::ROOT_ID => {
                 self.focus_handle.focus(window, cx);
                 None
@@ -4510,15 +5643,7 @@ impl ProjectManager {
             }
             "add-path-alias" => self.add_path_alias(window, cx),
             "save-display-name" => {
-                self.commit_display_name(cx);
-                window.push_notification(
-                    Notification::success(format!(
-                        "New versions will be saved as {}.",
-                        self.display_name
-                    ))
-                    .title("Name updated"),
-                    cx,
-                );
+                self.save_display_name(window, cx);
             }
             "refresh-provider-projects" => {
                 if self.remote_refreshing {
@@ -4531,6 +5656,9 @@ impl ProjectManager {
                 cx.notify();
             }
             "add-local-provider" => self.add_local_provider(window, cx),
+            "save-project-metadata" => {
+                self.save_project_metadata(self.selected_project, window, cx);
+            }
             "begin-provider-auth" => {
                 let Overlay::Authenticate { provider_index } = self.overlay.overlay else {
                     return Err("provider authentication is not open".to_owned());
@@ -4576,7 +5704,7 @@ impl ProjectManager {
                         .iter()
                         .position(|project| inspection::stable_id("project", &project.id) == id)
                         .ok_or_else(|| format!("unknown semantic project '{id}'"))?;
-                    self.select_project(index, cx);
+                    self.select_project(index, window, cx);
                 } else if let Some(provider_id) = id.strip_prefix("settings-provider-") {
                     let index = self
                         .providers
@@ -4652,6 +5780,24 @@ impl ProjectManager {
                         focused(&self.search_input),
                         &["focus", "type_text"],
                     ));
+                    if self.bpm_popover_open && self.bpm_filter_mode == BpmFilterMode::Range {
+                        nodes.push(inspection::node(
+                            "bpm-range-min-input",
+                            "spinbutton",
+                            "Minimum BPM",
+                            Some(self.bpm_range_min_input.read(cx).value().to_string()),
+                            focused(&self.bpm_range_min_input),
+                            &["focus", "type_text"],
+                        ));
+                        nodes.push(inspection::node(
+                            "bpm-range-max-input",
+                            "spinbutton",
+                            "Maximum BPM",
+                            Some(self.bpm_range_max_input.read(cx).value().to_string()),
+                            focused(&self.bpm_range_max_input),
+                            &["focus", "type_text"],
+                        ));
+                    }
                     nodes.push(button(
                         "backup-all".to_owned(),
                         "Back up all changes".to_owned(),
@@ -4681,11 +5827,20 @@ impl ProjectManager {
                     ));
 
                     let search_query = self.search_input.read(cx).value().to_lowercase();
+                    let genres = self.genre_filter.read(cx).selected_values();
+                    let tags = self.tag_filter.read(cx).selected_values();
+                    let bpm = if self.bpm_filter_loading {
+                        None
+                    } else {
+                        self.bpm_filter
+                    };
                     for (index, project) in self
                         .projects
                         .iter()
                         .enumerate()
-                        .filter(|(_, project)| project.matches_search(&search_query))
+                        .filter(|(_, project)| {
+                            project.matches_library_filters(&search_query, &genres, &tags, bpm)
+                        })
                         // The visual list is virtualized too. A bounded semantic
                         // page keeps a large real library from flooding every MCP
                         // tree response; narrowing the search exposes later rows.
@@ -4704,11 +5859,45 @@ impl ProjectManager {
                         ));
                         if selected {
                             let action = project.status.action();
+                            let draft_metadata = self.metadata_from_inputs(cx);
                             nodes.push(button(
                                 inspection::stable_id("project-primary-action", &project.id),
                                 format!("{}: {}", project.name, action.label()),
                                 Some(project.list_status()),
                                 action != ProjectAction::None,
+                            ));
+                            nodes.push(inspection::node(
+                                "project-genre-input",
+                                "textbox",
+                                "Project genre",
+                                Some(draft_metadata.genre.clone().unwrap_or_default()),
+                                focused(&self.genre_input),
+                                &["focus", "type_text"],
+                            ));
+                            nodes.push(inspection::node(
+                                "project-tags-input",
+                                "textbox",
+                                "Project tags",
+                                Some(draft_metadata.tags.join(", ")),
+                                focused(&self.tags_input),
+                                &["focus", "type_text"],
+                            ));
+                            nodes.push(button(
+                                "save-project-metadata".to_owned(),
+                                "Save project metadata".to_owned(),
+                                Some(
+                                    if self.metadata_saving.as_deref() == Some(project.id.as_str())
+                                    {
+                                        "saving"
+                                    } else if self.metadata_from_inputs(cx) != project.metadata {
+                                        "changed"
+                                    } else {
+                                        "saved"
+                                    }
+                                    .to_owned(),
+                                ),
+                                self.metadata_from_inputs(cx) != project.metadata
+                                    && self.metadata_saving.as_deref() != Some(project.id.as_str()),
                             ));
                         }
                     }
@@ -5039,11 +6228,317 @@ impl ProjectManager {
     }
 }
 
+fn metadata_badge_input(
+    field: MetadataBadgeField,
+    input: &Entity<InputState>,
+    values: &[String],
+    accent: Hsla,
+    cx: &mut Context<ProjectManager>,
+) -> AnyElement {
+    let (input_id, kind) = match field {
+        MetadataBadgeField::Genre => ("project-genre-input", "genre"),
+        MetadataBadgeField::Tag => ("project-tags-input", "tag"),
+    };
+    let focus_input = input.clone();
+
+    div()
+        .id(input_id)
+        .flex()
+        .min_h(px(34.0))
+        .w_full()
+        .cursor_text()
+        .flex_wrap()
+        .items_center()
+        .gap_1()
+        .border_1()
+        .border_color(line())
+        .rounded(px(4.0))
+        .bg(bg())
+        .px_2()
+        .py_1()
+        .on_click(move |_, window, cx| focus_input.focus_handle(cx).focus(window, cx))
+        .children(
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| metadata_value_badge(field, kind, index, value, accent, cx)),
+        )
+        .child(
+            div()
+                .min_w(px(112.0))
+                .flex_1()
+                .child(Input::new(input).small().appearance(false).w_full()),
+        )
+        .into_any_element()
+}
+
+fn metadata_value_badge(
+    field: MetadataBadgeField,
+    kind: &'static str,
+    index: usize,
+    value: &str,
+    accent: Hsla,
+    cx: &mut Context<ProjectManager>,
+) -> AnyElement {
+    let remove_id = SharedString::from(format!("remove-project-{kind}-{index}"));
+    Tag::custom(accent.opacity(0.08), accent, accent.opacity(0.65))
+        .small()
+        .rounded(px(4.0))
+        .max_w_full()
+        .gap_1()
+        .child(
+            div()
+                .max_w(px(180.0))
+                .overflow_x_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(value.to_owned()),
+        )
+        .child(
+            Button::new(remove_id)
+                .ghost()
+                .xsmall()
+                .tab_stop(false)
+                .icon(Icon::new(IconName::Close).xsmall())
+                .text_color(accent)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.remove_metadata_badge(field, index, cx);
+                })),
+        )
+        .into_any_element()
+}
+
+fn extend_unique_metadata_values(
+    values: &mut Vec<String>,
+    additions: impl IntoIterator<Item = String>,
+) {
+    for addition in additions {
+        let addition = addition.trim();
+        if addition.is_empty()
+            || values
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(addition))
+        {
+            continue;
+        }
+        values.push(addition.to_owned());
+    }
+}
+
+fn metadata_input_needs_parent_render(event: &InputEvent) -> bool {
+    matches!(event, InputEvent::Focus | InputEvent::Blur)
+}
+
+fn filter_combobox(
+    state: &Entity<FilterComboboxState>,
+    trigger_focus: &FocusHandle,
+    label: &'static str,
+    search_placeholder: &'static str,
+    cx: &mut Context<ProjectManager>,
+) -> AnyElement {
+    // gpui-component's Combobox wrapper and its open searchable list both
+    // track the list focus handle. Render the wrapper while closed for its
+    // keyboard/a11y semantics, then the same state entity while open so GPUI
+    // sees exactly one focus owner. Selection, search and popup behavior all
+    // remain the component's own implementation.
+    if state.focus_handle(cx) != *trigger_focus {
+        return state.clone().into_any_element();
+    }
+
+    Combobox::new(state)
+        .small()
+        .w_full()
+        .menu_width(px(236.0))
+        .menu_max_h(px(260.0))
+        .placeholder(label)
+        .search_placeholder(search_placeholder)
+        .render_trigger(move |ctx, _, _| {
+            compact_filter_trigger(label, ctx.selection.len(), ctx.open)
+        })
+        .into_any_element()
+}
+
+fn replace_filter_combobox_items(
+    state: &Entity<FilterComboboxState>,
+    items: Vec<String>,
+    window: &mut Window,
+    cx: &mut Context<ProjectManager>,
+) {
+    let selected = state.read(cx).selected_values();
+    let selected_indices = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            selected
+                .iter()
+                .any(|selected| item.eq_ignore_ascii_case(selected))
+        })
+        .map(|(index, _)| IndexPath::new(index))
+        .collect::<Vec<_>>();
+    state.update(cx, |state, cx| {
+        state.set_items(SearchableVec::new(items), window, cx);
+        state.set_selected_indices(selected_indices, window, cx);
+    });
+}
+
+fn compact_filter_trigger(label: &'static str, count: usize, open: bool) -> AnyElement {
+    let active = count > 0;
+    div()
+        .flex()
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .justify_between()
+        .gap_1()
+        .text_size(px(8.0))
+        .font_weight(FontWeight::BOLD)
+        .text_color(if active { blue() } else { dim() })
+        .child(
+            div()
+                .min_w_0()
+                .overflow_x_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(if active {
+                    format!("{label} · {count}")
+                } else {
+                    label.to_owned()
+                }),
+        )
+        .child(
+            Icon::new(if open {
+                IconName::ChevronUp
+            } else {
+                IconName::ChevronDown
+            })
+            .xsmall(),
+        )
+        .into_any_element()
+}
+
+fn bpm_value_box(value: f32) -> AnyElement {
+    div()
+        .flex()
+        .h(px(30.0))
+        .min_w(px(48.0))
+        .items_center()
+        .justify_center()
+        .border_1()
+        .border_color(line())
+        .rounded(px(4.0))
+        .bg(bg())
+        .px_2()
+        .text_size(px(10.0))
+        .font_weight(FontWeight::BOLD)
+        .text_color(bright())
+        .child(format!("{value:.0}"))
+        .into_any_element()
+}
+
+fn bpm_range_input(
+    id: &'static str,
+    input: &Entity<InputState>,
+    endpoint: BpmRangeEndpoint,
+    cx: &mut Context<ProjectManager>,
+) -> AnyElement {
+    div()
+        .id(id)
+        .w(px(62.0))
+        .on_action(cx.listener(move |this, _: &InputEnter, window, cx| {
+            this.commit_bpm_range_endpoint(endpoint, window, cx);
+        }))
+        .child(
+            Input::new(input)
+                .small()
+                .w_full()
+                .text_align(TextAlign::Center),
+        )
+        .into_any_element()
+}
+
+fn parse_bpm_input(value: impl AsRef<str>) -> Option<f32> {
+    value
+        .as_ref()
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .map(|value| value.round().clamp(MIN_FILTER_BPM, MAX_FILTER_BPM))
+}
+
+fn ordered_bpm_range(min: f32, max: f32) -> std::ops::Range<f32> {
+    let min = min.round().clamp(MIN_FILTER_BPM, MAX_FILTER_BPM);
+    let max = max.round().clamp(MIN_FILTER_BPM, MAX_FILTER_BPM);
+    min.min(max)..min.max(max)
+}
+
+fn set_bpm_input_value(
+    input: &Entity<InputState>,
+    value: f32,
+    window: &mut Window,
+    cx: &mut Context<ProjectManager>,
+) {
+    let value = format!("{value:.0}");
+    if input.read(cx).value().as_ref() == value {
+        return;
+    }
+    input.update(cx, |input, cx| input.set_value(value, window, cx));
+}
+
+fn filter_badge(
+    kind: &'static str,
+    index: IndexPath,
+    label: String,
+    state: Entity<FilterComboboxState>,
+    color: Hsla,
+    cx: &mut Context<ProjectManager>,
+) -> AnyElement {
+    let button_id = SharedString::from(format!(
+        "remove-{kind}-filter-{}-{}",
+        index.section, index.row
+    ));
+    div()
+        .flex()
+        .h(px(23.0))
+        .max_w_full()
+        .items_center()
+        .gap_1()
+        .border_1()
+        .border_color(color)
+        .px_2()
+        .text_size(px(8.0))
+        .font_weight(FontWeight::BOLD)
+        .text_color(color)
+        .child(
+            div()
+                .min_w_0()
+                .overflow_x_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(label),
+        )
+        .child(
+            Button::new(button_id)
+                .ghost()
+                .xsmall()
+                .icon(Icon::new(IconName::Close).xsmall())
+                .tab_stop(false)
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    state.update(cx, |state, cx| {
+                        state.remove_selected_index(index, cx);
+                    });
+                    cx.notify();
+                })),
+        )
+        .into_any_element()
+}
+
 impl Render for ProjectManager {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_metadata_inputs(window, cx);
         self.publish_inspection(self.route.inspection_surface(), window, cx);
         let content = match self.route {
-            Route::Library => self.render_library(cx),
+            Route::Library => self.render_library(window, cx),
             Route::Onboarding => self.render_onboarding(cx),
         };
 
@@ -5056,6 +6551,7 @@ impl Render for ProjectManager {
             .on_action(cx.listener(Self::zoom_window))
             .on_action(cx.listener(Self::open_settings_action))
             .on_action(cx.listener(Self::add_ableton_project))
+            .on_action(cx.listener(Self::add_bitwig_project))
             .on_action(cx.listener(Self::add_flstudio_project))
             .on_action(cx.listener(Self::add_dawproject))
             .on_action(cx.listener(Self::add_auru_project))
@@ -5227,6 +6723,7 @@ impl RenderOnce for BarLink {
 fn import_action(kind: ImportKind) -> Box<dyn gpui::Action> {
     match kind {
         ImportKind::AbletonLiveSet => Box::new(AddAbletonProject),
+        ImportKind::BitwigProject => Box::new(AddBitwigProject),
         ImportKind::FlStudio => Box::new(AddFlStudioProject),
         ImportKind::Dawproject => Box::new(AddDawproject),
         ImportKind::AuruProject => Box::new(AddAuruProject),
@@ -5269,6 +6766,41 @@ mod cli_tests {
 
     fn parse(args: &[&str]) -> Startup {
         Options::from_args(args.iter().map(|arg| (*arg).to_owned()))
+    }
+
+    #[test]
+    fn metadata_badges_should_accumulate_and_ignore_case_insensitive_duplicates() {
+        let mut values = vec!["Collab".to_owned()];
+        extend_unique_metadata_values(
+            &mut values,
+            [
+                "collab".to_owned(),
+                "Mastered".to_owned(),
+                "Club".to_owned(),
+            ],
+        );
+
+        assert_eq!(values, ["Collab", "Mastered", "Club"]);
+    }
+
+    #[test]
+    fn metadata_input_changes_should_not_rerender_the_project_manager() {
+        assert!(!metadata_input_needs_parent_render(&InputEvent::Change));
+    }
+
+    #[test]
+    fn bpm_input_should_clamp_values_to_the_supported_range() {
+        assert_eq!(parse_bpm_input("999"), Some(MAX_FILTER_BPM));
+    }
+
+    #[test]
+    fn bpm_input_should_reject_non_numeric_values() {
+        assert_eq!(parse_bpm_input("fast"), None);
+    }
+
+    #[test]
+    fn bpm_range_should_order_reversed_typed_values() {
+        assert_eq!(ordered_bpm_range(200.0, 100.0), 100.0..200.0);
     }
 
     #[test]

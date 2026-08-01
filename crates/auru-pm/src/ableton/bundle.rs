@@ -382,9 +382,9 @@ pub struct BundleFile {
 pub struct ScanOptions {
     /// Directory levels below the chosen folder to search.
     ///
-    /// Projects normally sit one level down. The default allows for a couple
-    /// of organising folders — `Ableton Projects/2026/Client Work/…` — without
-    /// turning a mistaken pick of `/` into an exhaustive disk walk.
+    /// Projects normally sit a few levels down. The default allows a library
+    /// root above DAW, client, year, and album folders without turning a
+    /// mistaken pick of `/` into an exhaustive disk walk.
     pub max_depth: usize,
     /// Stop after this many projects, so a pathological tree still returns.
     pub max_projects: usize,
@@ -400,7 +400,7 @@ pub struct ScanOptions {
 impl Default for ScanOptions {
     fn default() -> Self {
         Self {
-            max_depth: 4,
+            max_depth: 8,
             max_projects: 5_000,
             max_directories: 25_000,
             excluded_directory_names: vec![

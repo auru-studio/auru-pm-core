@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::commit::CommitId;
 use crate::error::{Error, Result};
 use crate::hash::ContentHash;
+use crate::provider::{ProjectLocation, ProjectMetadata};
 
 /// Conventional filename suffix appended to the `.auru` path.
 pub const SIDECAR_SUFFIX: &str = ".auru-pm.json";
@@ -45,6 +46,17 @@ pub fn sidecar_path_for(project_path: &Path) -> PathBuf {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Sidecar {
+    /// Portable placement beneath the watched library root. This is mirrored
+    /// into the provider profile so recovery can rebuild the same organizing
+    /// folders without recording an absolute path from this computer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<ProjectLocation>,
+
+    /// Mutable project labels available before a provider has been selected and
+    /// mirrored into the provider profile once the project is backed up.
+    #[serde(default, skip_serializing_if = "ProjectMetadata::is_empty")]
+    pub metadata: ProjectMetadata,
+
     /// Provider id of the designated primary, eg `"auru-hosted"` or
     /// `"local-folder://..."`. `None` when no provider is enrolled yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,6 +214,13 @@ mod tests {
         let remote = CommitId(ContentHash::of(b"remote"));
 
         let mut sidecar = Sidecar {
+            location: Some(ProjectLocation {
+                relative_path: "Ableton/Projects/Night Drive Project".into(),
+            }),
+            metadata: ProjectMetadata {
+                genre: Some("Ambient".into()),
+                tags: vec!["finished".into(), "live set".into()],
+            },
             primary: Some("local-folder://foo".into()),
             provider_handles: std::collections::BTreeMap::from([(
                 "local-folder://foo".into(),
@@ -225,6 +244,14 @@ mod tests {
         assert_eq!(
             loaded.provider_handles.get("local-folder://foo"),
             Some(&"opaque-project-handle".to_owned())
+        );
+        assert_eq!(loaded.metadata.genre.as_deref(), Some("Ambient"));
+        assert_eq!(
+            loaded
+                .location
+                .as_ref()
+                .map(|location| location.relative_path.as_str()),
+            Some("Ableton/Projects/Night Drive Project")
         );
     }
 

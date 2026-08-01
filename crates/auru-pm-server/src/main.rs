@@ -479,7 +479,7 @@ async fn put_project_profile(
     State(db): State<SharedDb>,
     Extension(identity): Extension<auth::TokenIdentity>,
     Path(handle): Path<String>,
-    Json(profile): Json<ProjectProfile<String>>,
+    Json(mut profile): Json<ProjectProfile<String>>,
 ) -> Response {
     let owner = Principal::from(&identity);
     let key = project_key(&owner, &handle);
@@ -490,6 +490,12 @@ async fn put_project_profile(
             handle: Some(handle),
             ..StoredProject::default()
         });
+        if profile.location.is_none() {
+            profile.location = project
+                .profile
+                .as_ref()
+                .and_then(|existing| existing.location.clone());
+        }
         project.profile = Some(profile);
     }) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1242,6 +1248,76 @@ strategy = "jwt"
             json!({"present": [false]}),
             "physical CAS deduplication must not grant another identity access"
         );
+    }
+
+    #[tokio::test]
+    async fn project_profiles_should_persist_metadata_and_library_location() {
+        let db: SharedDb = Arc::new(Mutex::new(Db::default()));
+        let auth = auth::AuthState::oauth("studio-pm", Arc::new(AcceptTestToken));
+        let app = app_with_auth(db.clone(), 600, auth);
+        let profile = json!({
+            "display_name": "Night Drive",
+            "format": "auru",
+            "metadata": {
+                "genre": "Drum & Bass",
+                "tags": ["work in progress", "collab"]
+            },
+            "location": {
+                "relative_path": "Auru/Projects/Night Drive.auru"
+            }
+        });
+
+        let response = send_json(
+            &app,
+            axum::http::Method::PUT,
+            "/v1/projects/night-drive",
+            "valid-test-token",
+            profile.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let update_without_location = json!({
+            "display_name": "Night Drive (Renamed)",
+            "format": "auru",
+            "metadata": {
+                "genre": "Drum & Bass",
+                "tags": ["work in progress", "collab"]
+            }
+        });
+        let response = send_json(
+            &app,
+            axum::http::Method::PUT,
+            "/v1/projects/night-drive",
+            "valid-test-token",
+            update_without_location,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let expected = json!({
+            "display_name": "Night Drive (Renamed)",
+            "format": "auru",
+            "metadata": {
+                "genre": "Drum & Bass",
+                "tags": ["work in progress", "collab"]
+            },
+            "location": {
+                "relative_path": "Auru/Projects/Night Drive.auru"
+            }
+        });
+
+        let stored = db
+            .lock()
+            .unwrap()
+            .projects
+            .values()
+            .next()
+            .and_then(|project| project.profile.as_ref())
+            .map(serde_json::to_value)
+            .transpose()
+            .expect("stored profile encoding");
+        assert_eq!(stored, Some(expected));
     }
 
     async fn upload_project_blob(

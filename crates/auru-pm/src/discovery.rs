@@ -5,10 +5,10 @@
 //!
 //! - An **Ableton** project is a folder. Whatever is inside belongs to it, so
 //!   the scan treats it as a leaf and never descends further.
-//! - **FL Studio**, **DAWproject**, and native **Auru** projects are standalone
-//!   files. The directory containing one is not the project — an `.flp`
-//!   examined during design sat in a downloads dump beside a thousand
-//!   unrelated images.
+//! - **Bitwig Studio**, **FL Studio**, **DAWproject**, and native **Auru**
+//!   projects are standalone files. The directory containing one is not the
+//!   project — an `.flp` examined during design sat in a downloads dump beside
+//!   a thousand unrelated images.
 //!
 //! Callers should not have to know which they are holding, so this module is
 //! the one place that does. Everything above it works in terms of
@@ -210,13 +210,14 @@ fn is_scannable(path: &Path, options: &ScanOptions) -> bool {
     if name.starts_with('.') {
         return false;
     }
-    // `Backup` holds a DAW's own autosaves. They are versions of a project
-    // already listed, and offering them as projects in their own right would
-    // bury the real one among its own history.
+    // `Backup` and Bitwig's `auto-backups` hold a DAW's own autosaves. They are
+    // versions of a project already listed, and offering them as projects in
+    // their own right would bury the real one among its own history.
     // An Ableton project folder is not excluded here: `scan_into` recognises
     // it on the way down and stops there, which costs one check per directory
     // instead of two.
     !name.eq_ignore_ascii_case("Backup")
+        && !name.eq_ignore_ascii_case("auto-backups")
         && !options
             .excluded_directory_names
             .iter()
@@ -264,6 +265,13 @@ mod tests {
             fs::create_dir_all(parent).expect("mkdir");
         }
         fs::write(path, bytes).expect("write");
+    }
+
+    fn write_bitwig_project(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("mkdir");
+        }
+        fs::write(path, b"BtWg0003000200ba\0project").expect("write");
     }
 
     /// A minimal Ableton project folder.
@@ -379,6 +387,40 @@ mod tests {
         let found = scan_for_projects(temp.path(), &ScanOptions::default());
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name(), "Song");
+    }
+
+    #[test]
+    fn a_scan_should_find_bitwig_projects_nested_beneath_a_library_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_file = temp
+            .path()
+            .join("Bitwig Projects")
+            .join("Album")
+            .join("Song")
+            .join("Song.bwproject");
+        write_bitwig_project(&project_file);
+
+        let found = scan_for_projects(temp.path(), &ScanOptions::default());
+
+        assert_eq!(found[0].project_file(), project_file);
+    }
+
+    #[test]
+    fn bitwig_auto_backups_should_not_be_offered_as_projects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_bitwig_project(&temp.path().join("Song").join("Song.bwproject"));
+        write_bitwig_project(
+            &temp
+                .path()
+                .join("Song")
+                .join("auto-backups")
+                .join("Song")
+                .join("Song [2026-08-01 120000].bwproject"),
+        );
+
+        let found = scan_for_projects(temp.path(), &ScanOptions::default());
+
+        assert_eq!(found.len(), 1);
     }
 
     #[test]

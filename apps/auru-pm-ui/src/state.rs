@@ -283,11 +283,22 @@ impl AppState {
         }
     }
 
-    /// Add a watched folder, ignoring one already being watched.
+    /// Add a watched folder, collapsing overlapping roots.
+    ///
+    /// A parent already discovers every project beneath a child. Keeping both
+    /// would scan twice and make the child's shorter relative paths compete
+    /// with the hierarchy rooted at the parent.
     pub fn watch(&mut self, path: &Path) {
-        if !self.watched_folders.iter().any(|known| known == path) {
-            self.watched_folders.push(path.to_path_buf());
+        if self
+            .watched_folders
+            .iter()
+            .any(|known| path.starts_with(known))
+        {
+            return;
         }
+        self.watched_folders
+            .retain(|known| !known.starts_with(path));
+        self.watched_folders.push(path.to_path_buf());
     }
 
     /// Add an individually-added project.
@@ -545,6 +556,27 @@ mod tests {
         state.watch(Path::new("/music"));
         state.watch(Path::new("/music"));
         assert_eq!(state.watched_folders.len(), 1);
+    }
+
+    #[test]
+    fn watching_a_parent_should_replace_redundant_nested_roots() {
+        let mut state = AppState::default();
+        state.watch(Path::new("/music/Ableton/Projects"));
+        state.watch(Path::new("/music/Bitwig Projects"));
+
+        state.watch(Path::new("/music"));
+
+        assert_eq!(state.watched_folders, [PathBuf::from("/music")]);
+    }
+
+    #[test]
+    fn watching_a_child_of_an_existing_root_should_be_ignored() {
+        let mut state = AppState::default();
+        state.watch(Path::new("/music"));
+
+        state.watch(Path::new("/music/Ableton/Projects"));
+
+        assert_eq!(state.watched_folders, [PathBuf::from("/music")]);
     }
 
     #[test]
