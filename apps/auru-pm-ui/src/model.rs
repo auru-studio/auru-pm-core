@@ -1267,7 +1267,7 @@ impl Project {
     pub fn status_explanation(&self) -> String {
         match self.status {
             ProjectStatus::NeverBackedUp => {
-                "If this computer is lost or stolen, so is this work.".to_owned()
+                "If you lose this project now, it will be lost forever.".to_owned()
             }
             ProjectStatus::NotDownloaded => {
                 if self.size.is_empty() {
@@ -2203,7 +2203,7 @@ mod tests {
         assert_eq!(project.status.action(), ProjectAction::Push);
         assert_eq!(project.list_status(), "only on this computer");
         assert!(
-            project.status_explanation().contains("lost or stolen"),
+            project.status_explanation().contains("lost forever"),
             "it should say plainly what is at stake"
         );
     }
