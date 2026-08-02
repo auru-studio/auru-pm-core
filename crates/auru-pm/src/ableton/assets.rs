@@ -78,8 +78,24 @@ pub(crate) fn plan(bundle: &AbletonBundle, root: &XmlElement, policy: &BundlePol
     let mut assets: BTreeMap<String, PlannedAsset> = BTreeMap::new();
     let mut unresolved = Vec::new();
 
-    // Everything already in the folder.
-    for file in bundle.enumerate(policy).unwrap_or_default() {
+    // Everything already in the folder. If the folder cannot be enumerated,
+    // retain that as a completeness problem instead of silently producing an
+    // empty-but-apparently-valid manifest.
+    let folder_files = match bundle.enumerate(policy) {
+        Ok(files) => files,
+        Err(error) => {
+            unresolved.push(UnresolvedAsset {
+                reference: format!("{} ({error})", bundle.root().display()),
+                class: RefClass::InFolder,
+            });
+            Vec::new()
+        }
+    };
+    let enumerated_sources = folder_files
+        .iter()
+        .map(|file| file.absolute.clone())
+        .collect::<BTreeSet<_>>();
+    for file in folder_files {
         assets.insert(
             file.relative.clone(),
             PlannedAsset {
@@ -120,6 +136,15 @@ pub(crate) fn plan(bundle: &AbletonBundle, root: &XmlElement, policy: &BundlePol
         // A reference that escapes the folder textually but lands back inside
         // it needs no gathering.
         if bundle.contains(&source) {
+            if !enumerated_sources.contains(&source) {
+                // Symlinks and files above the configured size ceiling are not
+                // enumerated. A reference to one must make the backup
+                // incomplete rather than looking safely captured in-place.
+                unresolved.push(UnresolvedAsset {
+                    reference: asset.dedup_key().to_owned(),
+                    class: RefClass::InFolder,
+                });
+            }
             continue;
         }
         let Some(file_name) = asset.file_name() else {

@@ -6,6 +6,8 @@
 //! testable seam that does not need a window.
 
 use std::collections::BTreeMap;
+use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -77,6 +79,7 @@ impl PreparedBackup {
 pub enum BackupVerification {
     Skipped,
     Verified,
+    Incomplete(Vec<String>),
     Failed(String),
 }
 
@@ -85,6 +88,22 @@ pub struct RestoreResult {
     pub project_file: PathBuf,
     pub files_written: usize,
     pub unavailable: usize,
+    pub verified_files: usize,
+    /// A previous destination retained because cleanup could not remove it.
+    /// The restore itself is valid; this path remains as an extra safety copy.
+    pub previous_copy: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RestoreCollisionChoice {
+    /// Fail if another process creates the destination after preflight.
+    AbortIfExists,
+    /// Keep the existing project and choose a numbered restore folder.
+    Duplicate,
+    /// Replace matching restored files while preserving unrelated files.
+    Overwrite,
+    /// Replace the whole existing restore folder after verification.
+    DeleteAndReplace,
 }
 
 #[derive(Clone, Debug)]
@@ -191,8 +210,14 @@ fn back_up_prepared_with_resolutions(
         .await?;
 
         Ok(match outcome {
-            PushOutcome::Committed { commit_id, .. } => {
-                let mut verification = if verify_uploads {
+            PushOutcome::Committed {
+                commit_id,
+                unavailable_assets,
+                ..
+            } => {
+                let mut verification = if !unavailable_assets.is_empty() {
+                    BackupVerification::Incomplete(unavailable_assets)
+                } else if verify_uploads {
                     match verify_commit_copy(provider.as_ref(), commit_id).await {
                         Ok(()) => BackupVerification::Verified,
                         Err(error) => BackupVerification::Failed(error.to_string()),
@@ -202,6 +227,13 @@ fn back_up_prepared_with_resolutions(
                 };
                 let (retention, retention_warning) = match retention_rule {
                     None => (None, None),
+                    Some(_) if verification != BackupVerification::Verified => (
+                        None,
+                        Some(
+                            "old versions were kept because this backup was not completely verified"
+                                .to_owned(),
+                        ),
+                    ),
                     Some(_) if !provider.capabilities().history_retention => (
                         None,
                         Some(format!(
@@ -246,6 +278,12 @@ fn back_up_prepared_with_resolutions(
                     &mut verification,
                 )
                 .await?;
+                if verification == BackupVerification::Verified {
+                    Sidecar::modify(&sidecar_path, |sidecar| {
+                        sidecar.verified_head = Some(commit_id);
+                    })
+                    .map_err(|error| format!("record verified backup: {error}"))?;
+                }
                 BackupResult::Committed(BackupReceipt {
                     history,
                     retention,
@@ -412,6 +450,7 @@ async fn load_history_after_backup(
             detail.push_str(&format!("; re-read backup history: {error}"));
             Ok(previous_history)
         }
+        (Err(_), BackupVerification::Incomplete(_)) => Ok(previous_history),
         (Err(error), verification @ BackupVerification::Verified) => {
             *verification = BackupVerification::Failed(format!("re-read backup history: {error}"));
             Ok(previous_history)
@@ -531,11 +570,28 @@ pub fn remote_history(
 /// parent folders are recreated first. A restore never writes over the working
 /// project; it is something a person can inspect before deciding whether it
 /// replaces current work.
+#[cfg(test)]
 pub fn restore(
     listing: ProviderListing,
     working_project: PathBuf,
     commit_id: CommitId,
     destination: PathBuf,
+) -> Result<RestoreResult, String> {
+    restore_with_collision(
+        listing,
+        working_project,
+        commit_id,
+        destination,
+        RestoreCollisionChoice::Duplicate,
+    )
+}
+
+pub fn restore_with_collision(
+    listing: ProviderListing,
+    working_project: PathBuf,
+    commit_id: CommitId,
+    destination: PathBuf,
+    collision: RestoreCollisionChoice,
 ) -> Result<RestoreResult, String> {
     runtime()?.block_on(async move {
         let provider = open_provider(&listing, &working_project).await?;
@@ -553,12 +609,14 @@ pub fn restore(
             &destination,
             &file_name,
             location.as_ref(),
+            collision,
         )
         .await
     })
 }
 
 /// Recover a provider-only project and enroll the restored copy locally.
+#[cfg(test)]
 pub fn restore_remote(
     listing: ProviderListing,
     handle: String,
@@ -567,6 +625,29 @@ pub fn restore_remote(
     location: Option<ProjectLocation>,
     commit_id: CommitId,
     destination: PathBuf,
+) -> Result<RestoreResult, String> {
+    restore_remote_with_collision(
+        listing,
+        handle,
+        file_name,
+        metadata,
+        location,
+        commit_id,
+        destination,
+        RestoreCollisionChoice::Duplicate,
+    )
+}
+
+#[expect(clippy::too_many_arguments)]
+pub fn restore_remote_with_collision(
+    listing: ProviderListing,
+    handle: String,
+    file_name: String,
+    metadata: ProjectMetadata,
+    location: Option<ProjectLocation>,
+    commit_id: CommitId,
+    destination: PathBuf,
+    collision: RestoreCollisionChoice,
 ) -> Result<RestoreResult, String> {
     runtime()?.block_on(async move {
         let provider = provider_account(&listing)
@@ -580,6 +661,7 @@ pub fn restore_remote(
             &destination,
             &file_name,
             location.as_ref(),
+            collision,
         )
         .await?;
         let result = require_complete_recovery(result)?;
@@ -590,6 +672,7 @@ pub fn restore_remote(
             primary: Some(listing.entry.id.clone()),
             provider_handles: BTreeMap::from([(listing.entry.id, handle)]),
             local_head: Some(commit_id),
+            verified_head: Some(commit_id),
             ..Sidecar::default()
         }
         .save(&sidecar_path)
@@ -647,8 +730,14 @@ pub fn save_project_metadata(
 }
 
 fn require_complete_recovery(result: RestoreResult) -> Result<RestoreResult, String> {
-    if result.unavailable == 0 {
+    if result.unavailable == 0 && result.verified_files > 0 {
         return Ok(result);
+    }
+    if result.verified_files == 0 {
+        return Err(format!(
+            "Restored a copy to {}, but no output files could be hash-verified. The copy was not enrolled as synchronized.",
+            result.project_file.display()
+        ));
     }
     Err(format!(
         "Restored a partial copy to {}, but {} referenced file(s) could not be restored. \
@@ -756,6 +845,7 @@ async fn restore_from_provider(
     destination: &Path,
     requested_file_name: &str,
     location: Option<&ProjectLocation>,
+    collision: RestoreCollisionChoice,
 ) -> Result<RestoreResult, String> {
     let commit = provider
         .get_commit(&commit_id)
@@ -772,32 +862,96 @@ async fn restore_from_provider(
         .and_then(|stem| stem.to_str())
         .unwrap_or("Restored Project");
     let file_name = safe_project_file_name(requested_stem, snapshot.format());
-    let restore_root = restore_root_for(destination, location, Path::new(&file_name), commit_id);
+    let requested_root = restore_root_for(destination, location, Path::new(&file_name), commit_id);
+    let final_root = resolve_restore_collision(&requested_root, collision)?;
+    let staging_root = create_staging_root(&final_root)?;
 
+    let restored =
+        restore_into_staging(provider, &commit, &snapshot, &staging_root, &file_name).await;
+    let mut restored = match restored {
+        Ok(restored) => restored,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging_root);
+            return Err(error);
+        }
+    };
+    let project_relative = match restored.project_file.strip_prefix(&staging_root) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => {
+            let _ = fs::remove_dir_all(&staging_root);
+            return Err("restored project escaped its staging folder".to_owned());
+        }
+    };
+    let expected_files = match hash_restore_tree(&staging_root) {
+        Ok(expected) => expected,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging_root);
+            return Err(error);
+        }
+    };
+    if restored.unavailable > 0
+        && matches!(
+            collision,
+            RestoreCollisionChoice::Overwrite | RestoreCollisionChoice::DeleteAndReplace
+        )
+    {
+        let _ = fs::remove_dir_all(&staging_root);
+        return Err(format!(
+            "The staged restore is missing {} referenced file(s), so the existing copy was left untouched.",
+            restored.unavailable
+        ));
+    }
+
+    let previous_copy =
+        match publish_verified_restore(&staging_root, &final_root, &expected_files, collision) {
+            Ok(previous) => previous,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staging_root);
+                return Err(error);
+            }
+        };
+    restored.project_file = final_root.join(project_relative);
+    restored.verified_files = expected_files.len();
+    restored.previous_copy = previous_copy;
+    Ok(restored)
+}
+
+async fn restore_into_staging(
+    provider: &dyn ProjectProvider,
+    commit: &auru_pm::Commit,
+    snapshot: &ProjectSnapshot,
+    restore_root: &Path,
+    file_name: &str,
+) -> Result<RestoreResult, String> {
     match snapshot.format() {
         ProjectFormat::AbletonLiveSet => {
             let report =
-                auru_pm::ableton::restore_bundle(provider, &commit, &restore_root, &file_name)
+                auru_pm::ableton::restore_bundle(provider, commit, restore_root, file_name)
                     .await
                     .map_err(|error| format!("restore Ableton project: {error}"))?;
             Ok(RestoreResult {
                 project_file: report.live_set,
                 files_written: report.files_written,
-                unavailable: report.unavailable.len(),
+                unavailable: report
+                    .unavailable
+                    .into_iter()
+                    .chain(report.rewrite.unresolved)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                verified_files: 0,
+                previous_copy: None,
             })
         }
         ProjectFormat::FlStudio => {
-            restore_fl(provider, &commit, &snapshot, &restore_root, &file_name).await
+            restore_fl(provider, commit, snapshot, restore_root, file_name).await
         }
         ProjectFormat::Auru => {
-            restore_auru(provider, &commit, &snapshot, &restore_root, &file_name).await
+            restore_auru(provider, commit, snapshot, restore_root, file_name).await
         }
         ProjectFormat::Dawproject => {
-            restore_dawproject(provider, &commit, &snapshot, &restore_root, &file_name).await
+            restore_dawproject(provider, commit, snapshot, restore_root, file_name).await
         }
-        ProjectFormat::BitwigProject => {
-            restore_opaque_project(&snapshot, &restore_root, &file_name)
-        }
+        ProjectFormat::BitwigProject => restore_opaque_project(snapshot, restore_root, file_name),
     }
 }
 
@@ -816,6 +970,8 @@ fn restore_opaque_project(
         project_file,
         files_written: 0,
         unavailable: 0,
+        verified_files: 0,
+        previous_copy: None,
     })
 }
 
@@ -865,6 +1021,8 @@ async fn restore_dawproject(
         } else {
             0
         },
+        verified_files: 0,
+        previous_copy: None,
     })
 }
 
@@ -904,7 +1062,7 @@ async fn restore_auru(
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("create sample folder: {error}"))?;
         }
-        std::fs::write(&target, bytes)
+        write_verified_new(&target, &bytes)
             .map_err(|error| format!("restore sample {}: {error}", entry.path))?;
         restored_paths.insert(entry.path.clone(), relative);
     }
@@ -923,6 +1081,8 @@ async fn restore_auru(
         project_file,
         files_written: restored_paths.len(),
         unavailable: referenced.len().saturating_sub(restored_paths.len()),
+        verified_files: 0,
+        previous_copy: None,
     })
 }
 
@@ -1063,12 +1223,14 @@ async fn restore_fl(
     let unavailable = repoint.still_missing.len();
 
     let project_file = restore_root.join(file_name);
-    std::fs::write(&project_file, stream.encode())
+    write_verified_new(&project_file, &stream.encode())
         .map_err(|error| format!("write restored FL project: {error}"))?;
     Ok(RestoreResult {
         project_file,
         files_written,
         unavailable,
+        verified_files: 0,
+        previous_copy: None,
     })
 }
 
@@ -1079,14 +1241,32 @@ fn restore_root_for(
     commit_id: CommitId,
 ) -> PathBuf {
     let Some(relative) = location.and_then(safe_restore_location) else {
-        return unique_restore_root(destination, fallback_project_path, commit_id);
+        return restore_root_candidate(destination, fallback_project_path, commit_id);
     };
     let parent = relative.parent().unwrap_or_else(|| Path::new(""));
     let project_path = relative
         .file_name()
         .map(PathBuf::from)
         .unwrap_or_else(|| fallback_project_path.to_path_buf());
-    unique_restore_root(&destination.join(parent), &project_path, commit_id)
+    restore_root_candidate(&destination.join(parent), &project_path, commit_id)
+}
+
+/// The first restore path presented to the user before any collision policy is
+/// applied. Safe to call on provider metadata because every component is
+/// sanitised by the same path builder used by the restore itself.
+pub fn restore_target(
+    destination: &Path,
+    requested_file_name: &str,
+    format: ProjectFormat,
+    location: Option<&ProjectLocation>,
+    commit_id: CommitId,
+) -> PathBuf {
+    let requested_stem = Path::new(requested_file_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("Restored Project");
+    let file_name = safe_project_file_name(requested_stem, format);
+    restore_root_for(destination, location, Path::new(&file_name), commit_id)
 }
 
 /// Turn an untrusted provider profile location into a path that can only live
@@ -1116,7 +1296,7 @@ fn safe_restore_location(location: &ProjectLocation) -> Option<PathBuf> {
     (!relative.as_os_str().is_empty()).then_some(relative)
 }
 
-fn unique_restore_root(destination: &Path, project_path: &Path, commit_id: CommitId) -> PathBuf {
+fn restore_root_candidate(destination: &Path, project_path: &Path, commit_id: CommitId) -> PathBuf {
     let stem = project_path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -1124,15 +1304,291 @@ fn unique_restore_root(destination: &Path, project_path: &Path, commit_id: Commi
     let commit = commit_id.0.to_string();
     let commit = commit.strip_prefix("blake3:").unwrap_or(&commit);
     let name = format!("{stem} Restored {}", &commit[..8]);
-    let first = destination.join(&name);
+    destination.join(name)
+}
+
+#[cfg(test)]
+fn unique_restore_root(destination: &Path, project_path: &Path, commit_id: CommitId) -> PathBuf {
+    let first = restore_root_candidate(destination, project_path, commit_id);
+    unique_duplicate_root(&first)
+}
+
+fn unique_duplicate_root(first: &Path) -> PathBuf {
     if !first.exists() {
-        return first;
+        return first.to_path_buf();
     }
+    let destination = first.parent().unwrap_or_else(|| Path::new(""));
+    let name = first
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Project Restored");
 
     (2..)
         .map(|copy| destination.join(format!("{name} ({copy})")))
         .find(|candidate| !candidate.exists())
         .expect("the restore copy number cannot be exhausted")
+}
+
+fn resolve_restore_collision(
+    requested: &Path,
+    collision: RestoreCollisionChoice,
+) -> Result<PathBuf, String> {
+    if !requested.exists() {
+        return Ok(requested.to_path_buf());
+    }
+    match collision {
+        RestoreCollisionChoice::AbortIfExists => Err(format!(
+            "{} now exists. Choose whether to delete, overwrite, duplicate, or ignore it.",
+            requested.display()
+        )),
+        RestoreCollisionChoice::Duplicate => Ok(unique_duplicate_root(requested)),
+        RestoreCollisionChoice::Overwrite | RestoreCollisionChoice::DeleteAndReplace => {
+            Ok(requested.to_path_buf())
+        }
+    }
+}
+
+fn create_staging_root(final_root: &Path) -> Result<PathBuf, String> {
+    let parent = final_root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| format!("create restore parent: {error}"))?;
+    let name = final_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Project Restored");
+    for copy in 1_u32.. {
+        let candidate = parent.join(format!(
+            ".{name}.auru-restoring-{}-{copy}",
+            std::process::id()
+        ));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create restore staging folder: {error}")),
+        }
+    }
+    unreachable!("the staging copy number cannot be exhausted")
+}
+
+fn hash_restore_tree(root: &Path) -> Result<Vec<(PathBuf, ContentHash)>, String> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        hashes: &mut Vec<(PathBuf, ContentHash)>,
+    ) -> Result<(), String> {
+        let mut entries = fs::read_dir(directory)
+            .map_err(|error| format!("read staged restore: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read staged restore entry: {error}"))?;
+        entries.sort_by_key(std::fs::DirEntry::path);
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("inspect staged restore: {error}"))?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "refusing a symlink in staged restore: {}",
+                    path.display()
+                ));
+            }
+            if metadata.is_dir() {
+                visit(root, &path, hashes)?;
+            } else if metadata.is_file() {
+                let relative = path
+                    .strip_prefix(root)
+                    .map(Path::to_path_buf)
+                    .map_err(|_| "staged restore escaped its root".to_owned())?;
+                let hash = ContentHash::of_file(&path)
+                    .map_err(|error| format!("BLAKE3 hash {}: {error}", path.display()))?;
+                hashes.push((relative, hash));
+            }
+        }
+        Ok(())
+    }
+
+    let mut hashes = Vec::new();
+    visit(root, root, &mut hashes)?;
+    Ok(hashes)
+}
+
+fn verify_restore_tree(
+    root: &Path,
+    expected_files: &[(PathBuf, ContentHash)],
+) -> Result<(), String> {
+    for (relative, expected) in expected_files {
+        let path = root.join(relative);
+        let actual = ContentHash::of_file(&path)
+            .map_err(|error| format!("verify restored file {}: {error}", path.display()))?;
+        if actual != *expected {
+            return Err(format!(
+                "restored file {} failed BLAKE3 verification: expected {expected}, read {actual}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn publish_verified_restore(
+    staging: &Path,
+    final_root: &Path,
+    expected_files: &[(PathBuf, ContentHash)],
+    collision: RestoreCollisionChoice,
+) -> Result<Option<PathBuf>, String> {
+    if !final_root.exists() {
+        fs::rename(staging, final_root)
+            .map_err(|error| format!("publish verified restore: {error}"))?;
+        if let Err(error) = verify_restore_tree(final_root, expected_files) {
+            let _ = fs::rename(final_root, staging);
+            return Err(error);
+        }
+        return Ok(None);
+    }
+
+    if matches!(
+        collision,
+        RestoreCollisionChoice::AbortIfExists | RestoreCollisionChoice::Duplicate
+    ) {
+        return Err(format!(
+            "{} appeared while the restore was being verified; nothing was overwritten",
+            final_root.display()
+        ));
+    }
+
+    let quarantine = unique_quarantine_path(final_root);
+    fs::rename(final_root, &quarantine)
+        .map_err(|error| format!("protect existing project before replacement: {error}"))?;
+    if let Err(error) = fs::rename(staging, final_root) {
+        let _ = fs::rename(&quarantine, final_root);
+        return Err(format!("install verified restore: {error}"));
+    }
+
+    let installed = if collision == RestoreCollisionChoice::Overwrite {
+        copy_missing_entries(&quarantine, final_root)
+            .and_then(|()| verify_restore_tree(final_root, expected_files))
+    } else {
+        verify_restore_tree(final_root, expected_files)
+    };
+    if let Err(error) = installed {
+        let rollback = rollback_replacement(final_root, staging, &quarantine);
+        return Err(match rollback {
+            Ok(()) => format!("{error}; the existing project was restored unchanged"),
+            Err(rollback) => format!(
+                "{error}; automatic rollback also failed: {rollback}. The previous copy remains at {}",
+                quarantine.display()
+            ),
+        });
+    }
+
+    match remove_path(&quarantine) {
+        Ok(()) => Ok(None),
+        Err(_) => Ok(Some(quarantine)),
+    }
+}
+
+fn unique_quarantine_path(final_root: &Path) -> PathBuf {
+    let parent = final_root.parent().unwrap_or_else(|| Path::new(""));
+    let name = final_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Project Restored");
+    (1_u32..)
+        .map(|copy| {
+            parent.join(format!(
+                ".{name}.auru-previous-{}-{copy}",
+                std::process::id()
+            ))
+        })
+        .find(|candidate| !candidate.exists())
+        .expect("the quarantine copy number cannot be exhausted")
+}
+
+fn copy_missing_entries(source: &Path, destination: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(source).map_err(|error| format!("read existing project: {error}"))? {
+        let entry = entry.map_err(|error| format!("read existing project entry: {error}"))?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path)
+            .map_err(|error| format!("inspect existing project entry: {error}"))?;
+        if destination_path.exists() {
+            if metadata.is_dir() && destination_path.is_dir() {
+                copy_missing_entries(&source_path, &destination_path)?;
+            }
+            continue;
+        }
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "cannot safely merge symlink {}; choose Keep both or Delete and replace instead",
+                source_path.display()
+            ));
+        }
+        if metadata.is_dir() {
+            fs::create_dir(&destination_path)
+                .map_err(|error| format!("preserve existing folder: {error}"))?;
+            copy_missing_entries(&source_path, &destination_path)?;
+        } else if metadata.is_file() {
+            fs::copy(&source_path, &destination_path)
+                .map_err(|error| format!("preserve existing file: {error}"))?;
+            let expected = ContentHash::of_file(&source_path)
+                .map_err(|error| format!("hash existing file: {error}"))?;
+            let actual = ContentHash::of_file(&destination_path)
+                .map_err(|error| format!("verify preserved file: {error}"))?;
+            if actual != expected {
+                return Err(format!(
+                    "preserved file {} failed BLAKE3 verification",
+                    destination_path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rollback_replacement(
+    final_root: &Path,
+    staging: &Path,
+    quarantine: &Path,
+) -> Result<(), String> {
+    fs::rename(final_root, staging)
+        .map_err(|error| format!("move failed restore aside: {error}"))?;
+    fs::rename(quarantine, final_root)
+        .map_err(|error| format!("put existing project back: {error}"))
+}
+
+fn remove_path(path: &Path) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+fn write_verified_new(path: &Path, bytes: &[u8]) -> Result<ContentHash, String> {
+    let expected = ContentHash::of(bytes);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("create {}: {error}", path.display()))?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(format!("write {}: {error}", path.display()));
+    }
+    drop(file);
+    let actual = ContentHash::of_file(path)
+        .map_err(|error| format!("verify {}: {error}", path.display()))?;
+    if actual != expected {
+        let _ = fs::remove_file(path);
+        return Err(format!(
+            "{} failed BLAKE3 verification: expected {expected}, read {actual}",
+            path.display()
+        ));
+    }
+    Ok(expected)
 }
 
 fn project_handle(project_path: &Path) -> String {
@@ -1245,13 +1701,9 @@ mod tests {
 
         assert_eq!(history.len(), 1);
         assert_eq!(verification, BackupVerification::Verified);
-        assert_eq!(
-            Sidecar::load(&sidecar_path_for(&project))
-                .expect("sidecar")
-                .primary
-                .as_deref(),
-            Some(listing.entry.id.as_str())
-        );
+        let sidecar = Sidecar::load(&sidecar_path_for(&project)).expect("sidecar");
+        assert_eq!(sidecar.primary.as_deref(), Some(listing.entry.id.as_str()));
+        assert_eq!(sidecar.verified_head, Some(history[0].id));
         assert!(
             destination.join(".auru-pm/projects").is_dir(),
             "real provider storage should exist"
@@ -1312,12 +1764,10 @@ mod tests {
             "restored to {}",
             restored.project_file.display()
         );
-        assert_eq!(
-            Sidecar::load(&sidecar_path_for(&restored.project_file))
-                .expect("restored sidecar")
-                .location,
-            Some(location)
-        );
+        let sidecar =
+            Sidecar::load(&sidecar_path_for(&restored.project_file)).expect("restored sidecar");
+        assert_eq!(sidecar.location, Some(location));
+        assert_eq!(sidecar.verified_head, Some(history[0].id));
     }
 
     #[test]
@@ -1550,7 +2000,7 @@ mod tests {
                 project.clone(),
                 "Jake".to_owned(),
                 rule,
-                false,
+                true,
             )
             .expect("backup") else {
                 panic!("each revision should commit");
@@ -1568,6 +2018,60 @@ mod tests {
                 assert!(receipt.retention_warning.is_none());
             }
         }
+    }
+
+    #[test]
+    fn an_incomplete_backup_should_keep_the_last_verified_version_and_skip_retention() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("Song.auru");
+        let sample = temp.path().join("take.wav");
+        fs::write(&sample, b"irreplaceable audio").expect("sample");
+        let project_bytes = |version| {
+            serde_json::to_vec(&serde_json::json!({
+                "version": 8,
+                "name": version,
+                "channels": [{ "clips": [{
+                    "data": { "Audio": { "file_path": sample.to_str().unwrap() } }
+                }]}]
+            }))
+            .expect("project json")
+        };
+        fs::write(&project, project_bytes("complete")).expect("project");
+        let listing = local_listing(&temp.path().join("Backups"));
+        let rule = Some(RetentionRule::Latest { count: 1 });
+        let BackupResult::Committed(first) = back_up(
+            listing.clone(),
+            project.clone(),
+            "Jake".to_owned(),
+            rule,
+            true,
+        )
+        .expect("complete backup") else {
+            panic!("complete backup should commit");
+        };
+        let verified = first.history[0].id;
+
+        fs::remove_file(&sample).expect("simulate disconnected source");
+        fs::write(&project, project_bytes("incomplete")).expect("changed project");
+        let BackupResult::Committed(second) =
+            back_up(listing, project.clone(), "Jake".to_owned(), rule, true)
+                .expect("incomplete commit remains recoverable")
+        else {
+            panic!("incomplete backup should still preserve history");
+        };
+
+        assert!(matches!(
+            second.verification,
+            BackupVerification::Incomplete(ref unavailable) if unavailable.len() == 1
+        ));
+        assert_eq!(
+            second.history.len(),
+            2,
+            "the verified version must not be pruned"
+        );
+        let sidecar = Sidecar::load(&sidecar_path_for(&project)).expect("sidecar");
+        assert_eq!(sidecar.verified_head, Some(verified));
+        assert_ne!(sidecar.local_head, sidecar.verified_head);
     }
 
     #[test]
@@ -1636,6 +2140,7 @@ mod tests {
 
         assert_eq!(sidecar.primary.as_deref(), Some(listing.entry.id.as_str()));
         assert_eq!(sidecar.local_head, Some(history[0].id));
+        assert_eq!(sidecar.verified_head, Some(history[0].id));
         assert_eq!(
             sidecar.provider_handles.get(&listing.entry.id),
             Some(&remote.handle)
@@ -1686,12 +2191,30 @@ mod tests {
             project_file: PathBuf::from("/recover/Night Drive.als"),
             files_written: 3,
             unavailable: 2,
+            verified_files: 4,
+            previous_copy: None,
         };
 
         let error = require_complete_recovery(result).expect_err("partial restore");
 
         assert!(error.contains("was not enrolled as synchronized"));
         assert!(error.contains("2 referenced file(s) could not be restored"));
+    }
+
+    #[test]
+    fn an_unverified_remote_restore_should_not_be_treated_as_synchronized() {
+        let result = RestoreResult {
+            project_file: PathBuf::from("/recover/Night Drive.als"),
+            files_written: 0,
+            unavailable: 0,
+            verified_files: 0,
+            previous_copy: None,
+        };
+
+        let error = require_complete_recovery(result).expect_err("unverified restore");
+
+        assert!(error.contains("no output files could be hash-verified"));
+        assert!(error.contains("was not enrolled as synchronized"));
     }
 
     #[test]
@@ -1983,6 +2506,76 @@ mod tests {
         );
 
         assert_eq!(root.parent(), Some(temp.path()));
+    }
+
+    #[test]
+    fn delete_and_replace_should_publish_only_after_the_staged_copy_is_verified() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let final_root = temp.path().join("Song Restored");
+        fs::create_dir(&final_root).expect("existing root");
+        fs::write(final_root.join("old.txt"), b"old project").expect("existing project");
+        let staging = create_staging_root(&final_root).expect("staging");
+        write_verified_new(&staging.join("Song.auru"), b"verified restore").expect("write");
+        let hashes = hash_restore_tree(&staging).expect("hash staging");
+
+        publish_verified_restore(
+            &staging,
+            &final_root,
+            &hashes,
+            RestoreCollisionChoice::DeleteAndReplace,
+        )
+        .expect("replace");
+
+        assert_eq!(
+            fs::read(final_root.join("Song.auru")).expect("restored project"),
+            b"verified restore"
+        );
+        assert!(!final_root.join("old.txt").exists());
+    }
+
+    #[test]
+    fn overwrite_should_preserve_unrelated_files_and_replace_matching_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let final_root = temp.path().join("Song Restored");
+        fs::create_dir(&final_root).expect("existing root");
+        fs::write(final_root.join("Song.auru"), b"old project").expect("existing project");
+        fs::write(final_root.join("notes.txt"), b"keep me").expect("existing notes");
+        let staging = create_staging_root(&final_root).expect("staging");
+        write_verified_new(&staging.join("Song.auru"), b"verified restore").expect("write");
+        let hashes = hash_restore_tree(&staging).expect("hash staging");
+
+        publish_verified_restore(
+            &staging,
+            &final_root,
+            &hashes,
+            RestoreCollisionChoice::Overwrite,
+        )
+        .expect("overwrite");
+
+        assert_eq!(
+            fs::read(final_root.join("Song.auru")).expect("restored project"),
+            b"verified restore"
+        );
+        assert_eq!(
+            fs::read(final_root.join("notes.txt")).expect("preserved notes"),
+            b"keep me"
+        );
+    }
+
+    #[test]
+    fn an_unconfirmed_collision_should_leave_the_existing_project_untouched() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let final_root = temp.path().join("Song Restored");
+        fs::create_dir(&final_root).expect("existing root");
+        fs::write(final_root.join("Song.auru"), b"working project").expect("existing project");
+
+        resolve_restore_collision(&final_root, RestoreCollisionChoice::AbortIfExists)
+            .expect_err("choice required");
+
+        assert_eq!(
+            fs::read(final_root.join("Song.auru")).expect("working project"),
+            b"working project"
+        );
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::merge::{ConflictResolution, ConflictedField, MergeOutcome, merge3, re
 use crate::project_format::ProjectSnapshot;
 use crate::project_info::ProjectInfo;
 use crate::provider::{HeadAdvance, ProjectProvider};
-use crate::sample_manifest::{SampleEntry, SampleManifest, plan_assets};
+use crate::sample_manifest::{SampleEntry, SampleManifest, plan_assets_with_report};
 use crate::sidecar::{Sidecar, Stash};
 
 /// Per-mirror push result.
@@ -36,6 +36,12 @@ pub enum PushOutcome {
         commit_id: CommitId,
         was_merge: bool,
         mirror_results: Vec<MirrorResult>,
+        /// Referenced files that were not captured in this commit.
+        ///
+        /// Object verification can only prove the files a manifest names; a
+        /// non-empty list means the commit must never be represented as a
+        /// complete, safely deletable copy.
+        unavailable_assets: Vec<String>,
     },
     /// The remote advanced and the auto-merge found conflicts the user must
     /// resolve. `base` has all disjoint changes already applied.
@@ -472,11 +478,13 @@ async fn build_sample_manifest(
     project_root: Option<&Path>,
     policy: &BundlePolicy,
     detached_resources: &BTreeMap<String, Vec<u8>>,
-) -> Result<(SampleManifest, Vec<(ContentHash, Vec<u8>)>), String> {
+) -> Result<(SampleManifest, Vec<(ContentHash, Vec<u8>)>, Vec<String>), String> {
     let mut manifest = SampleManifest::new();
     let mut blobs: Vec<(ContentHash, Vec<u8>)> = Vec::new();
+    let planned = plan_assets_with_report(snapshot, project_root, policy);
+    let mut unavailable = planned.unavailable;
 
-    for asset in plan_assets(snapshot, project_root, policy) {
+    for asset in planned.assets {
         let bytes = match std::fs::read(&asset.source) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -484,6 +492,7 @@ async fn build_sample_manifest(
                     "[pm] skipping unreadable asset '{}': {e}",
                     asset.source.display()
                 );
+                unavailable.push(asset.bundle_path);
                 continue;
             }
         };
@@ -555,7 +564,9 @@ async fn build_sample_manifest(
         });
     }
 
-    Ok((manifest, blobs))
+    unavailable.sort();
+    unavailable.dedup();
+    Ok((manifest, blobs, unavailable))
 }
 
 /// Derive and store the commit's project summary, returning its blob hash.
@@ -992,7 +1003,7 @@ async fn push_with_optional_resolutions(
         .map_err(|e| format!("parse final snapshot: {e}"))?;
     ProjectSnapshot::from_canonical_bytes(&final_snapshot_bytes)
         .map_err(|error| format!("validate final snapshot: {error}"))?;
-    let (manifest, sample_blobs) = build_sample_manifest(
+    let (manifest, sample_blobs, unavailable_assets) = build_sample_manifest(
         primary,
         &final_snapshot,
         project_root_for(sidecar_path),
@@ -1076,6 +1087,7 @@ async fn push_with_optional_resolutions(
         commit_id,
         was_merge,
         mirror_results,
+        unavailable_assets,
     })
 }
 
@@ -1346,7 +1358,7 @@ mod tests {
             ]
         });
 
-        let (manifest, blobs) = rt()
+        let (manifest, blobs, unavailable) = rt()
             .block_on(build_sample_manifest(
                 &provider,
                 &snapshot,
@@ -1359,6 +1371,7 @@ mod tests {
         // Deduped to two entries, sorted by path.
         assert_eq!(manifest.entries.len(), 2);
         assert_eq!(blobs.len(), 2);
+        assert!(unavailable.is_empty());
 
         // Each entry's hash + size matches the bytes, and the blob landed
         // in the CAS so it's fetchable by hash.
@@ -1394,7 +1407,7 @@ mod tests {
             ]}]
         });
 
-        let (manifest, blobs) = rt()
+        let (manifest, blobs, unavailable) = rt()
             .block_on(build_sample_manifest(
                 &provider,
                 &snapshot,
@@ -1409,6 +1422,7 @@ mod tests {
         assert_eq!(manifest.entries.len(), 1);
         assert_eq!(blobs.len(), 1);
         assert_eq!(manifest.entries[0].path, present.to_str().unwrap());
+        assert_eq!(unavailable, vec![absent.to_string_lossy()]);
     }
 
     #[test]
@@ -1439,7 +1453,7 @@ mod tests {
             .expect("normalize DAWproject");
         let value = serde_json::from_slice(snapshot.as_bytes()).expect("canonical JSON");
 
-        let (manifest, blobs) = rt()
+        let (manifest, blobs, unavailable) = rt()
             .block_on(build_sample_manifest(
                 &provider,
                 &value,
@@ -1452,6 +1466,7 @@ mod tests {
         assert_eq!(manifest.entries.len(), 1);
         assert_eq!(manifest.entries[0].path, "audio/take.wav");
         assert_eq!(manifest.entries[0].hash, ContentHash::of(b"embedded-audio"));
+        assert!(unavailable.is_empty());
         assert_eq!(
             blobs,
             vec![(
@@ -1478,7 +1493,7 @@ mod tests {
         rt().block_on(provider.put_blob(&remote_resource, b"remote version"))
             .unwrap();
 
-        let (manifest, blobs) = rt()
+        let (manifest, blobs, unavailable) = rt()
             .block_on(build_sample_manifest(
                 &provider,
                 &remote_value,
@@ -1490,6 +1505,7 @@ mod tests {
 
         assert_eq!(manifest.entries[0].hash, remote_resource);
         assert_eq!(blobs, vec![(remote_resource, b"remote version".to_vec())]);
+        assert!(unavailable.is_empty());
     }
 
     #[test]
@@ -1499,7 +1515,7 @@ mod tests {
         let local = dawproject_with_resource(b"local version");
         let remote_value = dawproject_v1_value(b"remote inline version");
 
-        let (manifest, blobs) = rt()
+        let (manifest, blobs, unavailable) = rt()
             .block_on(build_sample_manifest(
                 &provider,
                 &remote_value,
@@ -1515,6 +1531,7 @@ mod tests {
             blobs,
             vec![(expected_hash, b"remote inline version".to_vec())]
         );
+        assert!(unavailable.is_empty());
     }
 
     #[test]
@@ -1549,7 +1566,7 @@ mod tests {
         let resolved = resolve_conflicts(base, &conflicts, &choices).unwrap();
         let bytes = serde_json::to_vec(&resolved).unwrap();
         ProjectSnapshot::from_canonical_bytes(&bytes).expect("resolved v2 snapshot is valid");
-        let (manifest, blobs) = rt()
+        let (manifest, blobs, unavailable) = rt()
             .block_on(build_sample_manifest(
                 &provider,
                 &resolved,
@@ -1562,6 +1579,7 @@ mod tests {
         let remote_hash = ContentHash::of(b"remote version");
         assert_eq!(manifest.entries[0].hash, remote_hash);
         assert_eq!(blobs, vec![(remote_hash, b"remote version".to_vec())]);
+        assert!(unavailable.is_empty());
     }
 
     #[test]

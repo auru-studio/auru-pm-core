@@ -292,15 +292,7 @@ async fn in_folder_files_should_be_restored_and_backups_left_out() {
 }
 
 #[tokio::test]
-async fn restoring_twice_should_produce_the_same_folder() {
-    // Restoring over a previous restore is how you move back to an earlier
-    // version, so it has to be safe to repeat.
-    //
-    // Restore reads the commit, never the folder, so the second pass does the
-    // same work as the first rather than skipping it — that is what makes the
-    // result a pure function of the commit, and why two machines restoring the
-    // same version get identical folders. (Rewriting an *already rewritten*
-    // tree is a no-op; that is covered in `ableton::rewrite`.)
+async fn restoring_twice_should_require_an_explicit_collision_choice() {
     let scenario = scenario();
     let commit = commit(&scenario).await;
     let destination = scenario.project.parent().expect("parent").join("Restored");
@@ -312,23 +304,23 @@ async fn restoring_twice_should_produce_the_same_folder() {
     let first_sample =
         std::fs::read(destination.join("Samples/Imported/break.wav")).expect("read sample");
 
-    let second = ableton::restore_bundle(&scenario.provider, &commit, &destination, "Song.als")
+    let error = ableton::restore_bundle(&scenario.provider, &commit, &destination, "Song.als")
         .await
-        .expect("second restore should not be refused");
+        .expect_err("the core restore API must never replace files implicitly");
 
-    assert_eq!(
-        second.rewrite, first.rewrite,
-        "the same commit should always rewrite the same way"
+    assert!(
+        error.to_string().contains("already contains files"),
+        "the refusal should explain that a collision choice is required: {error}"
     );
     assert_eq!(
-        std::fs::read(&second.live_set).expect("read set"),
+        std::fs::read(&first.live_set).expect("read set"),
         first_bytes,
-        "and produce a byte-identical Live Set"
+        "the first restored Live Set must remain byte-identical"
     );
     assert_eq!(
         std::fs::read(destination.join("Samples/Imported/break.wav")).expect("read sample"),
         first_sample,
-        "without duplicating or corrupting the gathered sample"
+        "the gathered sample must remain untouched"
     );
     assert!(
         !destination.join("Samples/Imported/break-2.wav").exists(),
@@ -348,7 +340,7 @@ async fn restoring_into_someone_elses_folder_should_be_refused() {
         .await
         .expect_err("restoring over unrelated files must be refused");
     assert!(
-        error.to_string().contains("already contains other files"),
+        error.to_string().contains("already contains files"),
         "the refusal should explain itself: {error}"
     );
     assert!(

@@ -77,6 +77,13 @@ pub struct Sidecar {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_head: Option<CommitId>,
 
+    /// Most recent commit whose provider objects and source dependencies were
+    /// both verified as complete. This is intentionally separate from
+    /// `local_head`: a commit may exist while still omitting an unreadable
+    /// sample, and that state must never be shown as safe to delete locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_head: Option<CommitId>,
+
     /// Per-remote-provider sync state, keyed by provider id.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub remotes: std::collections::BTreeMap<String, RemoteState>,

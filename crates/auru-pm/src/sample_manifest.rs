@@ -163,10 +163,34 @@ pub fn plan_assets(
     project_directory: Option<&Path>,
     policy: &BundlePolicy,
 ) -> Vec<PlannedAsset> {
+    plan_assets_with_report(snapshot, project_directory, policy).assets
+}
+
+#[derive(Default)]
+pub(crate) struct PlannedAssets {
+    pub assets: Vec<PlannedAsset>,
+    pub unavailable: Vec<String>,
+}
+
+pub(crate) fn plan_assets_with_report(
+    snapshot: &Value,
+    project_directory: Option<&Path>,
+    policy: &BundlePolicy,
+) -> PlannedAssets {
     if crate::ableton::is_ableton_snapshot(snapshot) {
         return match project_directory {
-            Some(root) => crate::ableton::plan_assets_from_value(snapshot, root, policy).assets,
-            None => Vec::new(),
+            Some(root) => {
+                let plan = crate::ableton::plan_assets_from_value(snapshot, root, policy);
+                PlannedAssets {
+                    assets: plan.assets,
+                    unavailable: plan
+                        .unresolved
+                        .into_iter()
+                        .map(|asset| asset.reference)
+                        .collect(),
+                }
+            }
+            None => PlannedAssets::default(),
         };
     }
     if snapshot_format(snapshot) == Some(crate::ProjectFormat::FlStudio) {
@@ -174,22 +198,25 @@ pub fn plan_assets(
     }
     // Native: the manifest path stays the raw clip path, which keeps existing
     // commits and their ids byte-identical.
-    sample_paths_in_snapshot(snapshot)
-        .into_iter()
-        .map(|path| {
-            let recorded = PathBuf::from(&path);
-            let source = match (recorded.is_relative(), project_directory) {
-                (true, Some(root)) => root.join(&recorded),
-                _ => recorded,
-            };
-            PlannedAsset {
-                source,
-                bundle_path: path,
-                kind: AssetKind::Sample,
-                origin: None,
-            }
-        })
-        .collect()
+    PlannedAssets {
+        assets: sample_paths_in_snapshot(snapshot)
+            .into_iter()
+            .map(|path| {
+                let recorded = PathBuf::from(&path);
+                let source = match (recorded.is_relative(), project_directory) {
+                    (true, Some(root)) => root.join(&recorded),
+                    _ => recorded,
+                };
+                PlannedAsset {
+                    source,
+                    bundle_path: path,
+                    kind: AssetKind::Sample,
+                    origin: None,
+                }
+            })
+            .collect(),
+        unavailable: Vec::new(),
+    }
 }
 
 fn snapshot_format(snapshot: &Value) -> Option<crate::ProjectFormat> {
@@ -206,21 +233,25 @@ fn flstudio_assets_from_value(
     snapshot: &Value,
     project_directory: Option<&Path>,
     policy: &BundlePolicy,
-) -> Vec<PlannedAsset> {
+) -> PlannedAssets {
     let source = serde_json::to_vec(snapshot)
         .ok()
         .and_then(|bytes| crate::ProjectSnapshot::from_canonical_bytes(&bytes).ok())
         .and_then(|snapshot| snapshot.restore_bytes().ok());
     let Some(source) = source else {
-        return Vec::new();
+        return PlannedAssets {
+            unavailable: vec!["FL Studio project references could not be read".to_owned()],
+            ..PlannedAssets::default()
+        };
     };
     crate::flstudio::plan_bundle_assets_from_directory(
         &source,
         project_directory,
         &policy.path_aliases,
     )
-    .map(|plan| {
-        plan.assets
+    .map(|plan| PlannedAssets {
+        assets: plan
+            .assets
             .into_iter()
             .map(|asset| PlannedAsset {
                 source: asset.source,
@@ -228,9 +259,19 @@ fn flstudio_assets_from_value(
                 kind: asset.kind,
                 origin: Some(asset.origin),
             })
-            .collect()
+            .collect(),
+        unavailable: plan
+            .unresolved
+            .into_iter()
+            .map(|asset| asset.recorded_path)
+            .collect(),
     })
-    .unwrap_or_default()
+    .unwrap_or_else(|error| PlannedAssets {
+        unavailable: vec![format!(
+            "FL Studio project references could not be read: {error}"
+        )],
+        ..PlannedAssets::default()
+    })
 }
 
 /// Collect the distinct sample file paths referenced by a native Auru project

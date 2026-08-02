@@ -90,7 +90,7 @@ pub async fn restore_bundle(
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        write_atomically(&target, &bytes)?;
+        crate::verified_io::write_verified_new(&target, &bytes)?;
         report.files_written += 1;
         report.bytes_written += bytes.len() as u64;
     }
@@ -103,7 +103,7 @@ pub async fn restore_bundle(
     report.rewrite = rewrite::rewrite_file_refs(&mut portable.project.root, &plan, destination);
 
     let rewritten = ProjectSnapshot::from_portable(portable)?;
-    write_atomically(&report.live_set, &rewritten.restore_bytes()?)?;
+    crate::verified_io::write_verified_new(&report.live_set, &rewritten.restore_bytes()?)?;
 
     // Live recreates this on save, but a folder without it does not read as a
     // project until then.
@@ -124,10 +124,9 @@ fn vendor_plan(manifest: &SampleManifest) -> VendorPlan {
 
 /// Refuse a destination that holds something other than this project.
 ///
-/// Accepted: a path that does not exist, an empty directory, or a directory
-/// already holding this project's `.als`. Anything else — someone's Documents
-/// folder, a different project — is refused, because restoring writes many
-/// files and there is no undo for overwriting the wrong ones.
+/// Accepted: a path that does not exist or an empty directory. Anything else
+/// is refused because choosing whether to replace, merge, duplicate, or ignore
+/// an existing project belongs to the caller and must be explicit.
 fn ensure_safe_destination(destination: &Path, live_set_name: &str) -> Result<()> {
     if !destination.exists() {
         return Ok(());
@@ -142,12 +141,9 @@ fn ensure_safe_destination(destination: &Path, live_set_name: &str) -> Result<()
     if entries.peek().is_none() {
         return Ok(());
     }
-    if destination.join(live_set_name).is_file() {
-        return Ok(());
-    }
     Err(Error::ProjectFormat(format!(
-        "'{}' already contains other files. Restore into a new or empty folder, \
-         or one holding this project's '{live_set_name}'.",
+        "'{}' already contains files, including a possible '{live_set_name}'. \
+         Choose whether to replace, overwrite, duplicate, or ignore it before restoring.",
         destination.display()
     )))
 }
@@ -178,22 +174,6 @@ fn safe_relative_path(path: &str) -> Option<PathBuf> {
         }
     }
     (!out.as_os_str().is_empty()).then_some(out)
-}
-
-/// Write via a temporary file and rename, so an interrupted restore never
-/// leaves a half-written sample that Live would try to play.
-fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".auru-tmp");
-    let tmp = PathBuf::from(tmp);
-    fs::write(&tmp, bytes)?;
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_file(&tmp);
-            Err(Error::Io(error))
-        }
-    }
 }
 
 #[cfg(test)]
@@ -237,13 +217,12 @@ mod tests {
     }
 
     #[test]
-    fn a_destination_holding_this_project_should_be_accepted() {
-        // Restoring over an earlier restore of the same project is the normal
-        // way to move back to a previous version.
+    fn a_destination_holding_this_project_should_require_a_collision_choice() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(temp.path().join("song.als"), b"set").expect("write");
         fs::create_dir_all(temp.path().join("Samples")).expect("mkdir");
-        assert!(ensure_safe_destination(temp.path(), "song.als").is_ok());
+        ensure_safe_destination(temp.path(), "song.als")
+            .expect_err("even the expected project must not be overwritten implicitly");
     }
 
     #[test]
@@ -254,7 +233,7 @@ mod tests {
         let error = ensure_safe_destination(temp.path(), "song.als")
             .expect_err("restoring over unrelated files must be refused");
         assert!(
-            error.to_string().contains("already contains other files"),
+            error.to_string().contains("already contains files"),
             "the message should say why: {error}"
         );
     }

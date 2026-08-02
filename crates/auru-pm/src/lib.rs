@@ -29,6 +29,7 @@ pub mod sample_manifest;
 pub mod sidecar;
 pub mod sync;
 pub mod token_store;
+mod verified_io;
 
 pub use ableton::{
     AbletonBundle, AbletonMetadata, AssetPlan, AssetRef, AssetSummary, BundlePolicy,

@@ -89,7 +89,7 @@ pub fn write_asset(root: &Path, relative: &str, bytes: &[u8]) -> Result<PathBuf>
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&destination, bytes)?;
+    crate::verified_io::write_verified_new(&destination, bytes)?;
     Ok(destination)
 }
 

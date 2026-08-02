@@ -790,6 +790,9 @@ impl ProjectStatus {
         if sidecar.local_head.is_none() {
             return Self::NeverBackedUp;
         }
+        if sidecar.verified_head != sidecar.local_head {
+            return Self::OutOfSync(SyncDirection::LocalAhead);
+        }
 
         let modified = |path: &Path| {
             std::fs::metadata(path)

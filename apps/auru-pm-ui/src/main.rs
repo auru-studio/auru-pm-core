@@ -19,8 +19,8 @@ use auru_pm::{
 };
 use gpui::{
     Anchor, AnyElement, App, Bounds, Context, Div, ElementId, Entity, FocusHandle, Focusable,
-    FontWeight, Hsla, InteractiveElement, Interactivity, IntoElement, ParentElement, Render,
-    RenderOnce, Role, SharedString, Size, Stateful, StyleRefinement, Styled, Subscription,
+    FontWeight, Hsla, InteractiveElement, Interactivity, IntoElement, ParentElement, PromptLevel,
+    Render, RenderOnce, Role, SharedString, Size, Stateful, StyleRefinement, Styled, Subscription,
     TextAlign, UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, prelude::*, px,
     relative, rgb, uniform_list,
 };
@@ -1580,11 +1580,23 @@ impl ProjectManager {
                     Ok(backend::BackupResult::Committed(receipt)) => {
                         let (mut detail, verification_failed) = match &receipt.verification {
                             backend::BackupVerification::Skipped => {
-                                ("Project bytes and history were stored.".to_owned(), false)
+                                (
+                                    "Project bytes and history were stored, but not verified. The original remains the only confirmed complete copy."
+                                        .to_owned(),
+                                    true,
+                                )
                             }
                             backend::BackupVerification::Verified => (
-                                "Project bytes and history were stored and verified.".to_owned(),
+                                "Project bytes and history were stored and BLAKE3 verified."
+                                    .to_owned(),
                                 false,
+                            ),
+                            backend::BackupVerification::Incomplete(unavailable) => (
+                                format!(
+                                    "Project was stored, but {} referenced file(s) could not be captured. The original must be kept.",
+                                    unavailable.len()
+                                ),
+                                true,
                             ),
                             backend::BackupVerification::Failed(error) => (
                                 format!(
@@ -1612,7 +1624,13 @@ impl ProjectManager {
                                 ));
                             }
                         }
-                        project.finish_transfer(receipt.history);
+                        if receipt.verification == backend::BackupVerification::Verified {
+                            project.finish_transfer(receipt.history);
+                        } else {
+                            project.apply_history(receipt.history);
+                            project.status = ProjectStatus::OutOfSync(SyncDirection::LocalAhead);
+                            project.sync_progress = 0.0;
+                        }
                         let notification = if verification_failed {
                             Notification::warning(detail)
                         } else {
@@ -2469,6 +2487,7 @@ impl ProjectManager {
         };
         let project_name = project.name.clone();
         let project_file_name = project.file_name.clone();
+        let project_format = project.format;
         let project_metadata = project.metadata.clone();
         let project_location = project.location.clone();
         let project_id = project.id.clone();
@@ -2496,6 +2515,44 @@ impl ProjectManager {
             let Some(destination) = paths.into_iter().next() else {
                 return;
             };
+            let requested_target = backend::restore_target(
+                &destination,
+                &project_file_name,
+                project_format,
+                project_location.as_ref(),
+                commit_id,
+            );
+            let collision = if requested_target.exists() {
+                let detail = format!(
+                    "A project already exists at {}. Auru will first build and BLAKE3-verify the restored copy. Nothing existing is changed unless you explicitly choose Overwrite or Delete and replace.",
+                    requested_target.display()
+                );
+                let answer = cx
+                    .prompt(
+                        PromptLevel::Warning,
+                        "This restored version already exists",
+                        Some(&detail),
+                        &["Keep both", "Overwrite files", "Delete and replace", "Ignore"],
+                    )
+                    .await;
+                match answer {
+                    Ok(0) => backend::RestoreCollisionChoice::Duplicate,
+                    Ok(1) => backend::RestoreCollisionChoice::Overwrite,
+                    Ok(2) => backend::RestoreCollisionChoice::DeleteAndReplace,
+                    _ => {
+                        _ = this.update_in(cx, |_, window, cx| {
+                            window.push_notification(
+                                Notification::info("The existing project was left unchanged.")
+                                    .title(format!("{project_name} restore ignored")),
+                                cx,
+                            );
+                        });
+                        return;
+                    }
+                }
+            } else {
+                backend::RestoreCollisionChoice::AbortIfExists
+            };
             let restore_library_root = remote_only.then(|| destination.clone());
             let library_root_to_scan = restore_library_root.clone();
             if remote_only {
@@ -2513,9 +2570,15 @@ impl ProjectManager {
             let task = cx.background_executor().spawn(async move {
                 let result = match (project_path, remote) {
                     (Some(project_path), _) => {
-                        backend::restore(provider, project_path, commit_id, destination)
+                        backend::restore_with_collision(
+                            provider,
+                            project_path,
+                            commit_id,
+                            destination,
+                            collision,
+                        )
                     }
-                    (None, Some(remote)) => backend::restore_remote(
+                    (None, Some(remote)) => backend::restore_remote_with_collision(
                         provider,
                         remote.handle,
                         project_file_name,
@@ -2523,6 +2586,7 @@ impl ProjectManager {
                         project_location,
                         commit_id,
                         destination,
+                        collision,
                     ),
                     (None, None) => Err("The project has no provider identity.".to_owned()),
                 };
@@ -2582,11 +2646,19 @@ impl ProjectManager {
                                 }
                             }
                         }
+                        let retained_previous = report.previous_copy.as_ref().map(|path| {
+                            format!(
+                                " The previous copy was retained at {} because cleanup could not remove it.",
+                                path.display()
+                            )
+                        });
                         let notification = if report.unavailable == 0 {
                             Notification::success(format!(
-                                "{} captured file(s) restored to {}",
+                                "{} captured file(s) restored to {} · {} file(s) BLAKE3 verified.{}",
                                 report.files_written,
-                                report.project_file.display()
+                                report.project_file.display(),
+                                report.verified_files,
+                                retained_previous.as_deref().unwrap_or_default()
                             ))
                             .title(format!("{project_name} restored"))
                         } else {

@@ -331,7 +331,7 @@ impl ProjectSnapshot {
                 )));
             }
         }
-        fs::write(path, self.restore_bytes()?)?;
+        crate::verified_io::write_verified_new(path, &self.restore_bytes()?)?;
         Ok(())
     }
 }
@@ -1382,6 +1382,24 @@ mod tests {
             .restore_to_path(Path::new("song.als"))
             .expect_err("mismatched extension must fail");
         assert!(error.to_string().contains("cannot restore Auru snapshot"));
+    }
+
+    #[test]
+    fn restoring_a_snapshot_should_never_overwrite_an_existing_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let destination = temp.path().join("song.auru");
+        std::fs::write(&destination, b"existing project").expect("existing project");
+        let snapshot = ProjectSnapshot::from_source_bytes(ProjectFormat::Auru, br#"{"version":8}"#)
+            .expect("valid Auru JSON");
+
+        snapshot
+            .restore_to_path(&destination)
+            .expect_err("an explicit collision choice is required above the core API");
+
+        assert_eq!(
+            std::fs::read(destination).expect("existing project"),
+            b"existing project"
+        );
     }
 
     #[test]

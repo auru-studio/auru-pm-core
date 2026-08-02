@@ -23,6 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         primary: Some(provider_id.clone()),
         provider_handles: BTreeMap::new(),
         local_head: Some(commit.id),
+        verified_head: Some(commit.id),
         remotes: BTreeMap::from([(
             provider_id,
             RemoteState {
