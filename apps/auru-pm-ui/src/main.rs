@@ -57,8 +57,9 @@ use crate::menus::{
 };
 use crate::model::{
     BpmFilter, ImportKind, LibraryFilterOptions, PLUGIN_SETTINGS_REASSURANCE, Project,
-    ProjectAction, ProjectStatus, SortOrder, SyncDirection, WatchedFolder, format_bytes,
-    import_project, library_filter_options, load_library, replace_provider_projects, sort_projects,
+    ProjectAction, ProjectDetail, ProjectStatus, SortOrder, SyncDirection, WatchedFolder,
+    format_bytes, import_project, library_filter_options, load_library, replace_provider_projects,
+    sort_projects,
 };
 
 const OAUTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -362,13 +363,21 @@ struct ProjectManager {
 
 impl ProjectManager {
     fn new(options: Options, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::from_state(options, crate::state::AppState::load(), window, cx)
+    }
+
+    fn from_state(
+        options: Options,
+        mut state: crate::state::AppState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
         // The library is a view of what is on disk, so it is built from the
         // folders the person told us about rather than carried in the state
         // file. Only the folders themselves persist.
-        let mut state = crate::state::AppState::load();
         let projects = load_library(&mut state);
 
         // The name someone chose last time, if they have been here before.
@@ -670,7 +679,7 @@ impl ProjectManager {
         let automatic_backup_scheduler =
             AutomaticBackupScheduler::from_attempted_revisions(state.backup_attempts());
 
-        Self {
+        let mut manager = Self {
             focus_handle,
             projects,
             selected_project: 0,
@@ -722,7 +731,9 @@ impl ProjectManager {
             pending_conflict: None,
             inspection: None,
             _subscriptions,
-        }
+        };
+        manager.select_project(manager.selected_project, window, cx);
+        manager
     }
 
     fn close_window(&mut self, _: &CloseWindow, window: &mut Window, _: &mut Context<Self>) {
@@ -817,10 +828,10 @@ impl ProjectManager {
             .get(self.selected_project)
             .map(|project| project.id.clone());
         sort_projects(&mut self.projects, order);
-        self.selected_project = selected
+        let selected = selected
             .and_then(|id| self.projects.iter().position(|project| project.id == id))
             .unwrap_or(0);
-        cx.notify();
+        self.focus_project(selected, cx);
     }
 
     fn add_flstudio_project(
@@ -1258,7 +1269,15 @@ impl ProjectManager {
         }
         // The folder's projects join the library straight away — finding them
         // is the point, and nothing about listing them uploads anything.
+        let selected = self
+            .projects
+            .get(self.selected_project)
+            .map(|project| project.id.clone());
         self.projects = load_library(&mut self.state);
+        let selected = selected
+            .and_then(|id| self.projects.iter().position(|project| project.id == id))
+            .unwrap_or(0);
+        self.select_project(selected, window, cx);
 
         let notification = if found == 0 {
             Notification::warning(format!(
@@ -1345,8 +1364,8 @@ impl ProjectManager {
                 self.projects.len() - 1
             }
         };
-        self.selected_project = index;
         self.route = Route::Library;
+        self.select_project(index, window, cx);
 
         // Say what was found rather than just that something happened — the
         // plugin count is the thing worth knowing before opening it.
@@ -2207,11 +2226,20 @@ impl ProjectManager {
     /// megabytes of gunzip apiece. Doing that on selection means the list
     /// appears at once and the cost is paid only for what someone opens.
     fn select_project(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected_project = index;
+        self.focus_project(index, cx);
         self.sync_metadata_inputs(window, cx);
+    }
+
+    /// Make a project current regardless of whether focus came from a click,
+    /// startup, a refresh, or an asynchronous library change.
+    fn focus_project(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.selected_project = index;
         cx.notify();
         self.load_project_history(index, cx);
+        self.load_project_detail(index, cx);
+    }
 
+    fn load_project_detail(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(project) = self.projects.get(index) else {
             return;
         };
@@ -2638,7 +2666,7 @@ impl ProjectManager {
                                 match restored {
                                     Some(restored) => {
                                         this.projects[index] = restored;
-                                        this.selected_project = index;
+                                        this.select_project(index, window, cx);
                                     }
                                     None => {
                                         this.projects[index].status = ProjectStatus::NotDownloaded;
@@ -2749,9 +2777,10 @@ impl ProjectManager {
                 }
                 let sort_order = this.sort_order();
                 sort_projects(&mut this.projects, sort_order);
-                this.selected_project = selected
+                let selected = selected
                     .and_then(|id| this.projects.iter().position(|project| project.id == id))
                     .unwrap_or(0);
+                this.focus_project(selected, cx);
                 if this.remote_refresh_pending {
                     this.refresh_remote_projects(cx);
                 }
@@ -2775,9 +2804,9 @@ impl ProjectManager {
         self.projects.extend(remote_only);
         let sort_order = self.sort_order();
         sort_projects(&mut self.projects, sort_order);
-        self.selected_project = 0;
         self.route = Route::Library;
         self.overlay.clear();
+        self.select_project(0, window, cx);
         self.refresh_remote_projects(cx);
 
         let found = self.projects.len();
@@ -5932,6 +5961,32 @@ impl ProjectManager {
                         if selected {
                             let action = project.status.action();
                             let draft_metadata = self.metadata_from_inputs(cx);
+                            nodes.push(inspection::node(
+                                "project-tempo",
+                                "status",
+                                "Project tempo",
+                                Some(
+                                    project
+                                        .detail
+                                        .as_ref()
+                                        .map_or_else(|| "—".to_owned(), ProjectDetail::tempo_line),
+                                ),
+                                false,
+                                &[],
+                            ));
+                            nodes.push(inspection::node(
+                                "project-key",
+                                "status",
+                                "Project key",
+                                Some(
+                                    project
+                                        .detail
+                                        .as_ref()
+                                        .map_or_else(|| "—".to_owned(), ProjectDetail::key_line),
+                                ),
+                                false,
+                                &[],
+                            ));
                             nodes.push(button(
                                 inspection::stable_id("project-primary-action", &project.id),
                                 format!("{}: {}", project.name, action.label()),
@@ -6838,6 +6893,48 @@ mod cli_tests {
 
     fn parse(args: &[&str]) -> Startup {
         Options::from_args(args.iter().map(|arg| (*arg).to_owned()))
+    }
+
+    #[gpui::test]
+    fn an_initially_focused_project_should_load_its_detail(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            menus::init(cx);
+        });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join("Oracle Project");
+        std::fs::create_dir(&project_dir).expect("project directory");
+        let project_file = project_dir.join("oracle-midi.dawproject");
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../crates/auru-pm/tests/fixtures/interchange/oracle-midi.dawproject"),
+            &project_file,
+        )
+        .expect("fixture project");
+
+        let mut state = crate::state::AppState::default();
+        state.display_name = "Regression Test".to_owned();
+        state.onboarding_complete = true;
+        state.add_project(&project_file);
+        let options = Options {
+            providers_file: Some(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("providers.example.json"),
+            ),
+            inspect: false,
+        };
+
+        let window =
+            cx.add_window(move |window, cx| ProjectManager::from_state(options, state, window, cx));
+        cx.run_until_parked();
+
+        window
+            .update(cx, |manager, _, _| {
+                let project = manager.projects.first().expect("initial project");
+                let detail = project.detail.as_ref().expect("deferred detail loaded");
+                assert_eq!(detail.tempo_line(), "123 BPM · 5/4");
+            })
+            .expect("test window");
     }
 
     #[test]
