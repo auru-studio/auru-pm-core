@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::project_format::XmlElement;
 
 /// Plugin interface a device is loaded through.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PluginFormat {
     Vst2,
@@ -79,7 +79,7 @@ impl PluginFormat {
 }
 
 /// Stable identity for a plugin, independent of its display name or install path.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PluginId {
     /// VST2 four-character code packed into a `u32`.

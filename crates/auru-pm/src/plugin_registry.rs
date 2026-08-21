@@ -271,7 +271,13 @@ impl PluginSearchPaths {
             directories.push(PathBuf::from("C:/Program Files/Steinberg/VSTPlugins"));
             directories.push(PathBuf::from("C:/Program Files/Common Files/CLAP"));
             if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-                directories.push(PathBuf::from(local_app_data).join("Programs/Common/CLAP"));
+                let local_app_data = PathBuf::from(local_app_data);
+                // The per-user half of the VST3 location, where an installer
+                // that was not run as administrator puts a plugin. Missing it
+                // means the guess answers "not on this computer" for something
+                // sitting in the other standard folder.
+                directories.push(local_app_data.join("Programs/Common/VST3"));
+                directories.push(local_app_data.join("Programs/Common/CLAP"));
             }
         } else {
             directories.push(PathBuf::from("/usr/lib/vst3"));

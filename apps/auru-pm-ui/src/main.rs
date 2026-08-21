@@ -6697,8 +6697,16 @@ impl Render for ProjectManager {
     }
 }
 
+/// The dimmed ground a modal sits on.
+///
+/// **Occluding is not optional.** A backdrop that merely draws over the window
+/// still lets clicks reach whatever is underneath, so choosing something in a
+/// modal also presses the thing it happens to be covering. It looks like the
+/// modal is misbehaving, which is the last place anybody would look.
 fn overlay_backdrop(panel: impl IntoElement) -> AnyElement {
     div()
+        .id("overlay-backdrop")
+        .occlude()
         .absolute()
         .top_0()
         .left_0()
@@ -6706,7 +6714,7 @@ fn overlay_backdrop(panel: impl IntoElement) -> AnyElement {
         .size_full()
         .items_center()
         .justify_center()
-        .bg(rgb(0x050706).opacity(0.78))
+        .bg(scrim())
         .child(panel)
         .into_any_element()
 }
@@ -7100,6 +7108,34 @@ mod cli_tests {
     }
 
     #[test]
+    fn the_scrim_should_follow_the_appearance() {
+        // The bug this fixes: the backdrop was a fixed near-black, so opening
+        // a modal in Day dimmed a near-white window behind a dark veil, which
+        // reads as the app going dark rather than as something in front of it.
+        Appearance::Night.set();
+        let night = scrim();
+        Appearance::Day.set();
+        let day = scrim();
+        Appearance::Night.set();
+
+        assert!(
+            day.l > night.l,
+            "the Day scrim ({:.2}) should be lighter than the Night one ({:.2})",
+            day.l,
+            night.l
+        );
+        // A scrim that is opaque hides the window instead of dimming it; one
+        // that is nearly clear does not separate the modal from it.
+        for (appearance, colour) in [("Night", night), ("Day", day)] {
+            assert!(
+                (0.2..1.0).contains(&colour.a),
+                "the {appearance} scrim is {:.2} opaque",
+                colour.a
+            );
+        }
+    }
+
+    #[test]
     fn hover_should_be_a_bigger_step_than_selection() {
         // Selection marks the row you chose and can be quiet; hover has to
         // register the moment the pointer lands.
@@ -7423,6 +7459,29 @@ fn dim() -> Hsla {
 
 fn faint() -> Hsla {
     tone(0x5c645f, 0x8b918b)
+}
+
+/// The dimmed ground behind a modal.
+///
+/// Not a [`tone`], because it is the one colour with an alpha channel. The Day
+/// value is a light scrim rather than the Night near-black: dimming a
+/// near-white window behind a near-black veil reads as the app going dark, not
+/// as something sitting in front of it.
+fn scrim() -> Hsla {
+    match Appearance::current() {
+        Appearance::Night => Hsla {
+            h: 0.42,
+            s: 0.12,
+            l: 0.02,
+            a: 0.78,
+        },
+        Appearance::Day => Hsla {
+            h: 0.36,
+            s: 0.06,
+            l: 0.33,
+            a: 0.42,
+        },
+    }
 }
 
 // Status colours are darkened for the light palette rather than reused: the
