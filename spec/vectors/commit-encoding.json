@@ -1,0 +1,335 @@
+{
+  "cases": [
+    {
+      "canonical": "{\"auru_version\":\"0.1.0\",\"author\":{\"display_name\":\"Test User\",\"provider_id\":\"local-folder\",\"provider_user_id\":\"user-1\"},\"description\":\"\",\"format_version\":8,\"message\":\"first take\",\"parents\":[],\"timestamp\":1700000000,\"tree\":{\"samples\":\"blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc\",\"snapshot\":\"blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5\"}}",
+      "commit": {
+        "auru_version": "0.1.0",
+        "author": {
+          "display_name": "Test User",
+          "provider_id": "local-folder",
+          "provider_user_id": "user-1"
+        },
+        "description": "",
+        "format_version": 8,
+        "id": "blake3:8189ac12713762dcb92c060a1db950b532c06dc10ac9a83d05344a67f25906e7",
+        "message": "first take",
+        "parents": [],
+        "timestamp": 1700000000,
+        "tree": {
+          "samples": "blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc",
+          "snapshot": "blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5"
+        }
+      },
+      "id": "blake3:8189ac12713762dcb92c060a1db950b532c06dc10ac9a83d05344a67f25906e7",
+      "name": "baseline"
+    },
+    {
+      "canonical": "{\"auru_version\":\"0.1.0\",\"author\":{\"display_name\":\"Test User\",\"provider_id\":\"local-folder\",\"provider_user_id\":\"user-1\"},\"description\":\"\",\"format_version\":8,\"message\":\"first take\",\"parents\":[\"blake3:87e596f34bdd4ba9812a5222449c3ed968ef3313c6dc4316dd4e4fcea27e55f2\",\"blake3:744caf711c80a1e8bfac2972e9b12c216ef03ea16489e78981a415c6eb11373a\"],\"timestamp\":1700000000,\"tree\":{\"samples\":\"blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc\",\"snapshot\":\"blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5\"}}",
+      "commit": {
+        "auru_version": "0.1.0",
+        "author": {
+          "display_name": "Test User",
+          "provider_id": "local-folder",
+          "provider_user_id": "user-1"
+        },
+        "description": "",
+        "format_version": 8,
+        "id": "blake3:73d88c09b2048e4eb70534c11ab11399bdbdd72d94e784dc4a9d2c2fe60a1a07",
+        "message": "first take",
+        "parents": [
+          "blake3:87e596f34bdd4ba9812a5222449c3ed968ef3313c6dc4316dd4e4fcea27e55f2",
+          "blake3:744caf711c80a1e8bfac2972e9b12c216ef03ea16489e78981a415c6eb11373a"
+        ],
+        "timestamp": 1700000000,
+        "tree": {
+          "samples": "blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc",
+          "snapshot": "blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5"
+        }
+      },
+      "id": "blake3:73d88c09b2048e4eb70534c11ab11399bdbdd72d94e784dc4a9d2c2fe60a1a07",
+      "name": "merge commit"
+    },
+    {
+      "canonical": "{\"auru_version\":\"0.1.0\",\"author\":{\"display_name\":\"Test User\",\"provider_id\":\"local-folder\",\"provider_user_id\":\"user-1\"},\"description\":\"\",\"format_version\":8,\"message\":\"initial version\",\"parents\":[],\"timestamp\":1700000000,\"tree\":{\"samples\":\"blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc\",\"snapshot\":\"blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5\"}}",
+      "commit": {
+        "auru_version": "0.1.0",
+        "author": {
+          "display_name": "Test User",
+          "provider_id": "local-folder",
+          "provider_user_id": "user-1"
+        },
+        "description": "",
+        "format_version": 8,
+        "id": "blake3:8154e345edc691205e50b7da0313e6996b55a1ec3d76c208a217c64af479bc75",
+        "message": "initial version",
+        "parents": [],
+        "timestamp": 1700000000,
+        "tree": {
+          "samples": "blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc",
+          "snapshot": "blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5"
+        }
+      },
+      "id": "blake3:8154e345edc691205e50b7da0313e6996b55a1ec3d76c208a217c64af479bc75",
+      "name": "root commit"
+    },
+    {
+      "canonical": "{\"auru_version\":\"0.1.0\",\"author\":{\"display_name\":\"Test User\",\"provider_id\":\"local-folder\",\"provider_user_id\":\"user-1\"},\"description\":\"\",\"format_version\":8,\"message\":\"first take\",\"metadata\":\"blake3:46c9e4c124378368fa872bc5a29c843d34ddb9a9ea428c4142db068926fd823a\",\"parents\":[],\"timestamp\":1700000000,\"tree\":{\"samples\":\"blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc\",\"snapshot\":\"blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5\"}}",
+      "commit": {
+        "auru_version": "0.1.0",
+        "author": {
+          "display_name": "Test User",
+          "provider_id": "local-folder",
+          "provider_user_id": "user-1"
+        },
+        "description": "",
+        "format_version": 8,
+        "id": "blake3:eb7eae36f1785275e8365df757a3f8d10adc198733fdea3794b4a18b4840a24b",
+        "message": "first take",
+        "metadata": "blake3:46c9e4c124378368fa872bc5a29c843d34ddb9a9ea428c4142db068926fd823a",
+        "parents": [],
+        "timestamp": 1700000000,
+        "tree": {
+          "samples": "blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc",
+          "snapshot": "blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5"
+        }
+      },
+      "id": "blake3:eb7eae36f1785275e8365df757a3f8d10adc198733fdea3794b4a18b4840a24b",
+      "name": "metadata present"
+    },
+    {
+      "canonical": "{\"auru_version\":\"0.1.0\",\"author\":{\"display_name\":\"Test User\",\"email\":\"user@example.com\",\"provider_id\":\"local-folder\",\"provider_user_id\":\"user-1\"},\"description\":\"\",\"format_version\":8,\"message\":\"first take\",\"parents\":[],\"timestamp\":1700000000,\"tree\":{\"samples\":\"blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc\",\"snapshot\":\"blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5\"}}",
+      "commit": {
+        "auru_version": "0.1.0",
+        "author": {
+          "display_name": "Test User",
+          "email": "user@example.com",
+          "provider_id": "local-folder",
+          "provider_user_id": "user-1"
+        },
+        "description": "",
+        "format_version": 8,
+        "id": "blake3:eb69c8d97bf2c2ebbe78f34c79ece36851f3bc9d3db0a87ade24be928764d3c7",
+        "message": "first take",
+        "parents": [],
+        "timestamp": 1700000000,
+        "tree": {
+          "samples": "blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc",
+          "snapshot": "blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5"
+        }
+      },
+      "id": "blake3:eb69c8d97bf2c2ebbe78f34c79ece36851f3bc9d3db0a87ade24be928764d3c7",
+      "name": "author email present"
+    },
+    {
+      "canonical": "{\"auru_version\":\"0.1.0\",\"author\":{\"display_name\":\"Test User\",\"provider_id\":\"local-folder\",\"provider_user_id\":\"user-1\"},\"description\":\"日本語のテキスト, ελληνικά, עברית\",\"format_version\":8,\"message\":\"renamed Café → Café (NFC vs NFD)\",\"parents\":[],\"timestamp\":1700000000,\"tree\":{\"samples\":\"blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc\",\"snapshot\":\"blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5\"}}",
+      "commit": {
+        "auru_version": "0.1.0",
+        "author": {
+          "display_name": "Test User",
+          "provider_id": "local-folder",
+          "provider_user_id": "user-1"
+        },
+        "description": "日本語のテキスト, ελληνικά, עברית",
+        "format_version": 8,
+        "id": "blake3:241b44c17ceb39eb79b9062003e11520380ebf9a2329cff4c199f0de4b1d43d8",
+        "message": "renamed Café → Café (NFC vs NFD)",
+        "parents": [],
+        "timestamp": 1700000000,
+        "tree": {
+          "samples": "blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc",
+          "snapshot": "blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5"
+        }
+      },
+      "id": "blake3:241b44c17ceb39eb79b9062003e11520380ebf9a2329cff4c199f0de4b1d43d8",
+      "name": "non-ascii text"
+    },
+    {
+      "canonical": "{\"auru_version\":\"0.1.0\",\"author\":{\"display_name\":\"𝕁𝕒𝕜𝕖\",\"provider_id\":\"local-folder\",\"provider_user_id\":\"user-1\"},\"description\":\"\",\"format_version\":8,\"message\":\"🎛️ mixdown 🥁 v2 𝄞\",\"parents\":[],\"timestamp\":1700000000,\"tree\":{\"samples\":\"blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc\",\"snapshot\":\"blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5\"}}",
+      "commit": {
+        "auru_version": "0.1.0",
+        "author": {
+          "display_name": "𝕁𝕒𝕜𝕖",
+          "provider_id": "local-folder",
+          "provider_user_id": "user-1"
+        },
+        "description": "",
+        "format_version": 8,
+        "id": "blake3:774e6263a40806ccbfbc8fb1bd69052633ae33602e36301160118735ce052272",
+        "message": "🎛️ mixdown 🥁 v2 𝄞",
+        "parents": [],
+        "timestamp": 1700000000,
+        "tree": {
+          "samples": "blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc",
+          "snapshot": "blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5"
+        }
+      },
+      "id": "blake3:774e6263a40806ccbfbc8fb1bd69052633ae33602e36301160118735ce052272",
+      "name": "astral plane (surrogate pairs)"
+    },
+    {
+      "canonical": "{\"auru_version\":\"0.1.0\",\"author\":{\"display_name\":\"Test User\",\"provider_id\":\"local-folder\",\"provider_user_id\":\"user-1\"},\"description\":\"carriage \\r backspace \\b formfeed \\f\",\"format_version\":8,\"message\":\"quote \\\" backslash \\\\ slash / tab \\t newline \\n\",\"parents\":[],\"timestamp\":1700000000,\"tree\":{\"samples\":\"blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc\",\"snapshot\":\"blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5\"}}",
+      "commit": {
+        "auru_version": "0.1.0",
+        "author": {
+          "display_name": "Test User",
+          "provider_id": "local-folder",
+          "provider_user_id": "user-1"
+        },
+        "description": "carriage \r backspace \b formfeed \f",
+        "format_version": 8,
+        "id": "blake3:41368561464ab64652869e704570419140b6b9902ad2cf87830326391213f928",
+        "message": "quote \" backslash \\ slash / tab \t newline \n",
+        "parents": [],
+        "timestamp": 1700000000,
+        "tree": {
+          "samples": "blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc",
+          "snapshot": "blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5"
+        }
+      },
+      "id": "blake3:41368561464ab64652869e704570419140b6b9902ad2cf87830326391213f928",
+      "name": "json escapes"
+    },
+    {
+      "canonical": "{\"auru_version\":\"0.1.0\",\"author\":{\"display_name\":\"Test User\",\"provider_id\":\"local-folder\",\"provider_user_id\":\"user-1\"},\"description\":\"\",\"format_version\":8,\"message\":\"null \\u0000 unit \\u001f del  nbsp  \",\"parents\":[],\"timestamp\":1700000000,\"tree\":{\"samples\":\"blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc\",\"snapshot\":\"blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5\"}}",
+      "commit": {
+        "auru_version": "0.1.0",
+        "author": {
+          "display_name": "Test User",
+          "provider_id": "local-folder",
+          "provider_user_id": "user-1"
+        },
+        "description": "",
+        "format_version": 8,
+        "id": "blake3:4b210408a9be2411bd04e5d5c0a41d50ab9a4c057ce27b2c3ac09f9fa5a73ebf",
+        "message": "null \u0000 unit \u001f del  nbsp  ",
+        "parents": [],
+        "timestamp": 1700000000,
+        "tree": {
+          "samples": "blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc",
+          "snapshot": "blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5"
+        }
+      },
+      "id": "blake3:4b210408a9be2411bd04e5d5c0a41d50ab9a4c057ce27b2c3ac09f9fa5a73ebf",
+      "name": "control characters"
+    },
+    {
+      "canonical": "{\"auru_version\":\"\",\"author\":{\"display_name\":\"\",\"provider_id\":\"local-folder\",\"provider_user_id\":\"user-1\"},\"description\":\"\",\"format_version\":8,\"message\":\"\",\"parents\":[],\"timestamp\":1700000000,\"tree\":{\"samples\":\"blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc\",\"snapshot\":\"blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5\"}}",
+      "commit": {
+        "auru_version": "",
+        "author": {
+          "display_name": "",
+          "provider_id": "local-folder",
+          "provider_user_id": "user-1"
+        },
+        "description": "",
+        "format_version": 8,
+        "id": "blake3:14a936e81d23d7f167e8501f63137ce40bd1004e98764d70d4356f46df16d3f6",
+        "message": "",
+        "parents": [],
+        "timestamp": 1700000000,
+        "tree": {
+          "samples": "blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc",
+          "snapshot": "blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5"
+        }
+      },
+      "id": "blake3:14a936e81d23d7f167e8501f63137ce40bd1004e98764d70d4356f46df16d3f6",
+      "name": "empty strings"
+    },
+    {
+      "canonical": "{\"auru_version\":\"0.1.0\",\"author\":{\"display_name\":\"Test User\",\"provider_id\":\"local-folder\",\"provider_user_id\":\"user-1\"},\"description\":\"\",\"format_version\":0,\"message\":\"first take\",\"parents\":[],\"timestamp\":0,\"tree\":{\"samples\":\"blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc\",\"snapshot\":\"blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5\"}}",
+      "commit": {
+        "auru_version": "0.1.0",
+        "author": {
+          "display_name": "Test User",
+          "provider_id": "local-folder",
+          "provider_user_id": "user-1"
+        },
+        "description": "",
+        "format_version": 0,
+        "id": "blake3:f331622b113d7048d833118afbbcc900f9c26ee9f3e99d99a15b97e16081fbde",
+        "message": "first take",
+        "parents": [],
+        "timestamp": 0,
+        "tree": {
+          "samples": "blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc",
+          "snapshot": "blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5"
+        }
+      },
+      "id": "blake3:f331622b113d7048d833118afbbcc900f9c26ee9f3e99d99a15b97e16081fbde",
+      "name": "zero numbers"
+    },
+    {
+      "canonical": "{\"auru_version\":\"0.1.0\",\"author\":{\"display_name\":\"Test User\",\"provider_id\":\"local-folder\",\"provider_user_id\":\"user-1\"},\"description\":\"\",\"format_version\":8,\"message\":\"first take\",\"parents\":[],\"timestamp\":-1700000000,\"tree\":{\"samples\":\"blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc\",\"snapshot\":\"blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5\"}}",
+      "commit": {
+        "auru_version": "0.1.0",
+        "author": {
+          "display_name": "Test User",
+          "provider_id": "local-folder",
+          "provider_user_id": "user-1"
+        },
+        "description": "",
+        "format_version": 8,
+        "id": "blake3:cb1685821f092e94daaf12117b4ccdd3959e5637982d8ec8337fa8237b1b98c5",
+        "message": "first take",
+        "parents": [],
+        "timestamp": -1700000000,
+        "tree": {
+          "samples": "blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc",
+          "snapshot": "blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5"
+        }
+      },
+      "id": "blake3:cb1685821f092e94daaf12117b4ccdd3959e5637982d8ec8337fa8237b1b98c5",
+      "name": "negative timestamp"
+    },
+    {
+      "canonical": "{\"auru_version\":\"0.1.0\",\"author\":{\"display_name\":\"Test User\",\"provider_id\":\"local-folder\",\"provider_user_id\":\"user-1\"},\"description\":\"\",\"format_version\":4294967295,\"message\":\"first take\",\"parents\":[],\"timestamp\":253402300799,\"tree\":{\"samples\":\"blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc\",\"snapshot\":\"blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5\"}}",
+      "commit": {
+        "auru_version": "0.1.0",
+        "author": {
+          "display_name": "Test User",
+          "provider_id": "local-folder",
+          "provider_user_id": "user-1"
+        },
+        "description": "",
+        "format_version": 4294967295,
+        "id": "blake3:aa414e09bf5d6dfb7715937df7ca1e8e49630ec4fd16e4306c326b01ceb6ab73",
+        "message": "first take",
+        "parents": [],
+        "timestamp": 253402300799,
+        "tree": {
+          "samples": "blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc",
+          "snapshot": "blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5"
+        }
+      },
+      "id": "blake3:aa414e09bf5d6dfb7715937df7ca1e8e49630ec4fd16e4306c326b01ceb6ab73",
+      "name": "far-future timestamp, max format_version"
+    },
+    {
+      "canonical": "{\"auru_version\":\"0.1.0\",\"author\":{\"display_name\":\"Test User\",\"provider_id\":\"local-folder\",\"provider_user_id\":\"user-1\"},\"description\":\"\",\"format_version\":8,\"message\":\"first take\",\"parents\":[],\"timestamp\":9007199254740991,\"tree\":{\"samples\":\"blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc\",\"snapshot\":\"blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5\"}}",
+      "commit": {
+        "auru_version": "0.1.0",
+        "author": {
+          "display_name": "Test User",
+          "provider_id": "local-folder",
+          "provider_user_id": "user-1"
+        },
+        "description": "",
+        "format_version": 8,
+        "id": "blake3:58338d1c459d59e343545f31aa5f44495410fe66218d40884a0765a8f124f413",
+        "message": "first take",
+        "parents": [],
+        "timestamp": 9007199254740991,
+        "tree": {
+          "samples": "blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc",
+          "snapshot": "blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5"
+        }
+      },
+      "id": "blake3:58338d1c459d59e343545f31aa5f44495410fe66218d40884a0765a8f124f413",
+      "name": "largest safe integer"
+    }
+  ],
+  "hash": "blake3, rendered as `blake3:<64 lowercase hex>`",
+  "integer_bound": "every integer must lie within +/- (2^53 - 1)",
+  "note": "An implementation is conformant when, for every case, canonicalizing `commit` reproduces `canonical` byte-for-byte and hashing those bytes reproduces `id`.",
+  "rule": "RFC 8785 (JCS) over the commit object with the `id` member removed"
+}

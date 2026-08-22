@@ -1,0 +1,816 @@
+openapi: 3.1.0
+
+info:
+  title: auru-pm-v1
+  version: "1.0.0-beta"
+  summary: HTTP protocol for Auru project-management providers.
+  description: |
+    Machine-readable companion to [auru-pm-v1.md](./auru-pm-v1.md), which
+    remains the normative document. Where the two disagree, the prose and the
+    vectors in `vectors/` are correct and this file is a bug.
+
+    Any third party can implement a provider in any language. Endpoints are
+    capability-gated: a client reads `GET /v1/health` first and only calls what
+    the provider advertises.
+
+    Commit identity is not described here — it is a hashing rule, not an HTTP
+    shape. See "Canonical commit encoding" in the prose spec and the frozen
+    cases in `vectors/commit-encoding.json`.
+  license:
+    name: MIT OR Apache-2.0
+    identifier: MIT OR Apache-2.0
+
+servers:
+  - url: "{endpoint}"
+    description: |
+      Any provider endpoint. There is no canonical host: the endpoint is
+      supplied by the user, which is the point of the protocol.
+    variables:
+      endpoint:
+        default: http://127.0.0.1:4242
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: discovery
+    description: Public provider metadata and authenticated identity.
+  - name: projects
+    description: Account-level project catalogue.
+  - name: history
+    description: Commits, HEAD, and retention.
+  - name: blobs
+    description: Content-addressed storage.
+
+paths:
+  /v1/health:
+    get:
+      tags: [discovery]
+      operationId: getHealth
+      summary: Provider metadata.
+      description: |
+        Always public — a client reads this before prompting for credentials,
+        to learn which auth methods and capabilities the provider supports.
+      security: []
+      responses:
+        "200":
+          description: Provider metadata.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HealthResponse" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/me:
+    get:
+      tags: [discovery]
+      operationId: getMe
+      summary: Identity derived from the verified bearer token.
+      description: |
+        Returns only what the provider derived from the token. The identity key
+        is `(issuer, sub)`, never email. A commit's author provider/user ids
+        must match this response.
+      responses:
+        "200":
+          description: Authenticated identity.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthenticatedIdentity" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/AuthenticationUnavailable" }
+
+  /v1/projects:
+    get:
+      tags: [projects]
+      operationId: listProjects
+      summary: Projects visible to this account, newest first.
+      description: |
+        Capability `project_listing`. The recovery entry point on a machine with
+        no project sidecars yet.
+      responses:
+        "200":
+          description: Project list.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProjectsResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Unsupported" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/projects/{handle}:
+    parameters:
+      - $ref: "#/components/parameters/Handle"
+    put:
+      tags: [projects]
+      operationId: putProjectProfile
+      summary: Register human-facing project metadata.
+      description: |
+        Capability `project_listing`. Idempotent upsert. Does not create a
+        commit or move HEAD. Omitting `metadata` or `location` clears the
+        corresponding catalogue values, except that a provider preserves the
+        last known `location` when an older client omits the field entirely.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProjectProfile" }
+      responses:
+        "200": { description: Profile stored. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Unsupported" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /v1/projects/{handle}/head:
+    parameters:
+      - $ref: "#/components/parameters/Handle"
+    get:
+      tags: [history]
+      operationId: getHead
+      summary: Current HEAD, or null on an empty project.
+      responses:
+        "200":
+          description: Current HEAD.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HeadResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [history]
+      operationId: advanceHead
+      summary: Compare-and-swap HEAD.
+      description: |
+        `from: null` is the initial publish. A stale `from` is refused with
+        `409` carrying the provider's actual HEAD, so the client can rebase
+        without a second round trip.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AdvanceHeadRequest" }
+      responses:
+        "200":
+          description: HEAD advanced.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [result]
+                properties:
+                  result: { type: string, const: advanced }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/HeadConflict" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /v1/projects/{handle}/commits:
+    parameters:
+      - $ref: "#/components/parameters/Handle"
+    post:
+      tags: [history]
+      operationId: putCommit
+      summary: Store a commit.
+      description: |
+        The provider MUST recompute the canonical encoding of every field except
+        `id` and reject a mismatch with `400 bad_request`. Writing a commit you
+        did not compute is an auth-equivalent failure, not a formatting slip.
+
+        Idempotent: re-posting an existing `id` is `200`, not an error.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Commit" }
+      responses:
+        "200":
+          description: Commit stored.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id]
+                properties:
+                  id: { $ref: "#/components/schemas/ContentHash" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /v1/projects/{handle}/commits/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Handle"
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: "#/components/schemas/ContentHash" }
+    get:
+      tags: [history]
+      operationId: getCommit
+      summary: Fetch one commit.
+      responses:
+        "200":
+          description: The commit.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Commit" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/projects/{handle}/history:
+    parameters:
+      - $ref: "#/components/parameters/Handle"
+    get:
+      tags: [history]
+      operationId: listHistory
+      summary: Ordered commit history, newest first.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Max rows. Provider-chosen default, capped at a provider-chosen maximum.
+          schema: { type: integer, format: int32, minimum: 1 }
+        - name: before
+          in: query
+          required: false
+          description: Cursor — return commits strictly older than this id.
+          schema: { $ref: "#/components/schemas/ContentHash" }
+      responses:
+        "200":
+          description: History page.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [commits]
+                properties:
+                  commits:
+                    type: array
+                    items: { $ref: "#/components/schemas/CommitSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/projects/{handle}/retention:
+    parameters:
+      - $ref: "#/components/parameters/Handle"
+    post:
+      tags: [history]
+      operationId: pruneHistory
+      summary: Permanently move the oldest visible-history boundary.
+      description: |
+        Capability `history_retention`. Destructive and irreversible: keeping
+        every version means not calling this endpoint. HEAD is always kept, and
+        `protected_commits` / `protected_blobs` carry in-flight client work
+        (queued mirror pushes, a pre-merge stash) that must survive even when it
+        falls outside the new boundary.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RetentionRequest" }
+      responses:
+        "200":
+          description: What this pass reclaimed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RetentionReport" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Unsupported" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /v1/projects/{handle}/blobs/has:
+    parameters:
+      - $ref: "#/components/parameters/Handle"
+    post:
+      tags: [blobs]
+      operationId: hasBlobs
+      summary: Which of these blobs does the provider already hold?
+      description: |
+        `present` is parallel-indexed with the request — same order, same
+        length. Used by push to skip uploads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [hashes]
+              properties:
+                hashes:
+                  type: array
+                  items: { $ref: "#/components/schemas/ContentHash" }
+      responses:
+        "200":
+          description: Presence flags, parallel-indexed with the request.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [present]
+                properties:
+                  present:
+                    type: array
+                    items: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /v1/projects/{handle}/blobs/{hash}:
+    parameters:
+      - $ref: "#/components/parameters/Handle"
+      - name: hash
+        in: path
+        required: true
+        schema: { $ref: "#/components/schemas/ContentHash" }
+    put:
+      tags: [blobs]
+      operationId: putBlob
+      summary: Upload a blob.
+      description: |
+        The provider MUST verify the uploaded bytes hash to `{hash}` and reject
+        a mismatch with `400`. Idempotent — re-uploading an existing hash is
+        `200`.
+
+        A client may send `Content-Encoding: gzip` only when the provider
+        advertised `compressed_uploads`. Sending it to a provider that ignores
+        the header would store compressed bytes under the plaintext hash —
+        corruption that surfaces much later, on read.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200": { description: Blob stored. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/ServerError" }
+    get:
+      tags: [blobs]
+      operationId: getBlob
+      summary: Download a blob.
+      description: |
+        Clients MUST verify the downloaded bytes hash to `{hash}` before using
+        them. Blob payloads are opaque bytes; a reader never re-derives them.
+      responses:
+        "200":
+          description: Raw blob bytes.
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        An OAuth 2.0 access token or a personal access token, per the provider's
+        advertised `auth_methods`.
+
+  parameters:
+    Handle:
+      name: handle
+      in: path
+      required: true
+      description: |
+        Provider-scoped and opaque to the client. The hosted provider uses
+        `user/song-name`; a self-hosted server might use a UUID.
+      schema: { type: string, minLength: 1 }
+
+  responses:
+    BadRequest:
+      description: Malformed request, or a commit whose id does not match its content.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      headers:
+        WWW-Authenticate:
+          schema: { type: string }
+          example: 'Bearer realm="auru-pm"'
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: No such project, commit, or blob.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    HeadConflict:
+      description: |
+        The expected HEAD is stale. The body carries the provider's actual HEAD
+        rather than a message, so the client can rebase immediately.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ConflictResponse" }
+    Unsupported:
+      description: The endpoint exists but its capability is not enabled.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Per-client request limit exceeded.
+      headers:
+        Retry-After:
+          schema: { type: string }
+          description: Seconds to wait before retrying.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ServerError:
+      description: Provider fault. Retryable.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    AuthenticationUnavailable:
+      description: |
+        The identity provider is unreachable. Distinct from `unauthorized` — the
+        token was never judged, so a client should retry rather than re-prompt.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    ContentHash:
+      type: string
+      description: |
+        BLAKE3, in the canonical `blake3:<64 lowercase hex>` string form. Every
+        hash on the wire uses this shape, commit ids included.
+      pattern: "^blake3:[0-9a-f]{64}$"
+      examples: ["blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5"]
+
+    ErrorCode:
+      type: string
+      description: Closed set. A client may switch on this exhaustively.
+      enum:
+        - bad_request
+        - unauthorized
+        - forbidden
+        - not_found
+        - head_conflict
+        - unsupported
+        - rate_limited
+        - storage_error
+        - internal
+        - authentication_unavailable
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { $ref: "#/components/schemas/ErrorCode" }
+        message: { type: string }
+
+    ConflictResponse:
+      type: object
+      description: The `head_conflict` body. Carries `current` instead of `message`.
+      required: [code]
+      properties:
+        code: { type: string, const: head_conflict }
+        current:
+          oneOf:
+            - { $ref: "#/components/schemas/ContentHash" }
+            - { type: "null" }
+          description: The provider's actual HEAD. Null on an empty project.
+
+    ProjectFormat:
+      type: string
+      enum: [auru, dawproject, ableton-live-set, fl-studio, bitwig-project]
+
+    AuthMethod:
+      type: string
+      enum: [authorization_code_pkce, oauth_device_code, pat, none]
+
+    Capabilities:
+      type: object
+      description: |
+        What this provider implements. A client calls only what is advertised;
+        every field defaults to `false` so a provider written before a capability
+        existed reads as not having it.
+      required: [members, permissions, branches, server_side_merge, auth_methods]
+      properties:
+        project_listing: { type: boolean, default: false }
+        members: { type: boolean }
+        permissions: { type: boolean }
+        branches: { type: boolean }
+        server_side_merge: { type: boolean }
+        compressed_uploads:
+          type: boolean
+          default: false
+          description: |
+            Whether the provider decodes `Content-Encoding: gzip` on blob
+            uploads. Defaults false, which is what makes it safe to add.
+        history_retention: { type: boolean, default: false }
+        project_scoped_blobs: { type: boolean, default: false }
+        auth_methods:
+          type: array
+          items: { $ref: "#/components/schemas/AuthMethod" }
+
+    OAuthFlow:
+      type: string
+      enum: [authorization_code_pkce, device_authorization]
+
+    OAuthClient:
+      type: object
+      description: One registered public client.
+      required: [kind, client_id, redirect_uri, flows]
+      properties:
+        kind:
+          type: string
+          enum: [native, browser]
+          description: |
+            `native` uses an exact loopback redirect; `browser` uses an https
+            redirect registered for a single-page app. They are separate
+            registrations and must not share a client_id.
+        client_id: { type: string }
+        redirect_uri: { type: string, format: uri }
+        flows:
+          type: array
+          items: { $ref: "#/components/schemas/OAuthFlow" }
+
+    OAuthClientConfiguration:
+      type: object
+      description: |
+        Public OAuth configuration. Endpoint URLs are deliberately absent:
+        clients discover them from the exact issuer via OpenID Connect discovery
+        or RFC 8414 metadata, and reject issuer mismatches.
+      required: [issuer, audience, required_scope]
+      properties:
+        issuer: { type: string, format: uri }
+        audience: { type: string }
+        required_scope: { type: string, default: openid }
+        clients:
+          type: array
+          items: { $ref: "#/components/schemas/OAuthClient" }
+        client_id:
+          type: string
+          deprecated: true
+          description: Pre-`clients` singular form. Equivalent to a single `native` entry.
+        redirect_uri:
+          type: string
+          deprecated: true
+          description: Pre-`clients` singular form.
+        flows:
+          type: array
+          deprecated: true
+          items: { $ref: "#/components/schemas/OAuthFlow" }
+
+    HealthResponse:
+      type: object
+      required: [protocol, capabilities]
+      properties:
+        protocol:
+          type: string
+          const: auru-pm-v1
+          description: |
+            A client refuses to talk to a provider whose protocol string does
+            not match its compiled-in wire version.
+        provider_id:
+          type: string
+          description: Stable id used in commit author identities and sidecars.
+        name: { type: string }
+        capabilities: { $ref: "#/components/schemas/Capabilities" }
+        authentication:
+          $ref: "#/components/schemas/OAuthClientConfiguration"
+          description: Absent for unauthenticated and legacy providers.
+
+    AuthenticatedIdentity:
+      type: object
+      required: [provider_id, user_id, display_name]
+      properties:
+        provider_id: { type: string }
+        user_id: { type: string, description: "The token subject. Identity is (issuer, sub)." }
+        display_name: { type: string }
+        email: { type: string }
+
+    ProjectLocation:
+      type: object
+      required: [relative_path]
+      properties:
+        relative_path:
+          type: string
+          description: |
+            `/`-separated path beneath a user-selected library root — never an
+            absolute machine-specific path. Restore clients reject traversal
+            components before recreating parent folders.
+
+    ProjectMetadata:
+      type: object
+      properties:
+        genre:
+          type: string
+          description: Comma-separated categories, e.g. "Drum & Bass, Jungle".
+        tags:
+          type: array
+          items: { type: string }
+
+    ProjectProfile:
+      type: object
+      required: [display_name, format]
+      properties:
+        display_name: { type: string }
+        format: { $ref: "#/components/schemas/ProjectFormat" }
+        metadata: { $ref: "#/components/schemas/ProjectMetadata" }
+        location: { $ref: "#/components/schemas/ProjectLocation" }
+
+    ProviderProject:
+      type: object
+      required: [handle, head, updated_at]
+      properties:
+        handle: { type: string }
+        head: { $ref: "#/components/schemas/ContentHash" }
+        profile:
+          $ref: "#/components/schemas/ProjectProfile"
+          description: |
+            Absent for a project written before catalogues existed. The client
+            then reads the HEAD snapshot for its format and falls back to the
+            handle as a display name.
+        updated_at:
+          type: integer
+          format: int64
+          description: Unix epoch seconds of the HEAD commit.
+
+    ProjectsResponse:
+      type: object
+      required: [projects]
+      properties:
+        projects:
+          type: array
+          items: { $ref: "#/components/schemas/ProviderProject" }
+
+    HeadResponse:
+      type: object
+      required: [commit_id]
+      properties:
+        commit_id:
+          oneOf:
+            - { $ref: "#/components/schemas/ContentHash" }
+            - { type: "null" }
+
+    AdvanceHeadRequest:
+      type: object
+      required: [to]
+      properties:
+        from:
+          oneOf:
+            - { $ref: "#/components/schemas/ContentHash" }
+            - { type: "null" }
+          description: Expected current HEAD. Null is the initial publish.
+        to: { $ref: "#/components/schemas/ContentHash" }
+
+    AuthorIdentity:
+      type: object
+      description: |
+        Captured inline rather than looked up, so history renders without a live
+        provider connection and attribution survives a user leaving a workspace.
+      required: [display_name, provider_user_id, provider_id]
+      properties:
+        display_name: { type: string }
+        provider_user_id: { type: string }
+        provider_id: { type: string }
+        email: { type: string }
+
+    TreeRef:
+      type: object
+      required: [snapshot, samples]
+      properties:
+        snapshot:
+          $ref: "#/components/schemas/ContentHash"
+          description: Blob holding the canonical project JSON for this commit.
+        samples:
+          $ref: "#/components/schemas/ContentHash"
+          description: |
+            Blob listing (path, hash) pairs the project depends on. Samples are
+            fetched lazily, so this is the cheap "what do I need before
+            playback" probe.
+
+    SafeInteger:
+      type: integer
+      description: |
+        Canonical encoding is RFC 8785, whose numbers are IEEE-754 binary64, so
+        every integer on a commit must stay inside +/- (2^53 - 1). A provider
+        should reject one outside it rather than store a commit whose id cannot
+        be reproduced.
+      minimum: -9007199254740991
+      maximum: 9007199254740991
+
+    Commit:
+      type: object
+      description: |
+        `parents` length is the commit shape: 0 root, 1 normal, 2 merge. See
+        "Canonical commit encoding" in the prose spec for how `id` is derived.
+      required: [id, parents, tree, author, timestamp, message, auru_version, format_version]
+      properties:
+        id:
+          $ref: "#/components/schemas/ContentHash"
+          description: BLAKE3 of the canonical encoding of every other field.
+        parents:
+          type: array
+          items: { $ref: "#/components/schemas/ContentHash" }
+          maxItems: 2
+        tree: { $ref: "#/components/schemas/TreeRef" }
+        author: { $ref: "#/components/schemas/AuthorIdentity" }
+        timestamp:
+          allOf:
+            - { $ref: "#/components/schemas/SafeInteger" }
+          description: Unix epoch seconds.
+        message: { type: string, description: One-line summary entered at Save Version time. }
+        description: { type: string, default: "" }
+        auru_version: { type: string }
+        format_version:
+          allOf:
+            - { $ref: "#/components/schemas/SafeInteger" }
+          description: |
+            Snapshot schema version at commit time. History uses it to know
+            whether a snapshot needs migration before restore.
+        metadata:
+          $ref: "#/components/schemas/ContentHash"
+          description: |
+            Blob holding this commit's ProjectInfo — a few kilobytes of tempo,
+            key, tracks and plugins. Lets a client show what a version *is*
+            without fetching the snapshot, which for a real Live Set is around
+            7 MB. Absent on older commits and on formats this crate does not
+            read; a reader that finds it missing falls back to the snapshot.
+
+    CommitSummary:
+      type: object
+      description: History row. Omits TreeRef so listing does not force a tree fetch per row.
+      required: [id, parents, author, timestamp, message]
+      properties:
+        id: { $ref: "#/components/schemas/ContentHash" }
+        parents:
+          type: array
+          items: { $ref: "#/components/schemas/ContentHash" }
+        author: { $ref: "#/components/schemas/AuthorIdentity" }
+        timestamp:
+          allOf:
+            - { $ref: "#/components/schemas/SafeInteger" }
+        message: { type: string }
+        description: { type: string, default: "" }
+
+    RetentionRule:
+      description: |
+        There is deliberately no "everything" variant: keeping everything means
+        not calling the endpoint. Once a provider has removed a version, changing
+        a client setting cannot resurrect it.
+      oneOf:
+        - type: object
+          title: latest
+          required: [policy, count]
+          properties:
+            policy: { type: string, const: latest }
+            count:
+              type: integer
+              format: int32
+              minimum: 0
+              description: |
+                Keep the newest `count` versions. Providers always keep HEAD,
+                including when a malformed client sends 0.
+        - type: object
+          title: since
+          required: [policy, timestamp]
+          properties:
+            policy: { type: string, const: since }
+            timestamp:
+              type: integer
+              format: int64
+              description: |
+                Keep HEAD and the connected history prefix through the oldest
+                commit at or after this Unix timestamp.
+
+    RetentionRequest:
+      type: object
+      required: [rule]
+      properties:
+        rule: { $ref: "#/components/schemas/RetentionRule" }
+        protected_commits:
+          type: array
+          default: []
+          items: { $ref: "#/components/schemas/ContentHash" }
+        protected_blobs:
+          type: array
+          default: []
+          items: { $ref: "#/components/schemas/ContentHash" }
+
+    RetentionReport:
+      type: object
+      required: [versions_removed, objects_removed, bytes_freed]
+      properties:
+        versions_removed:
+          type: integer
+          format: int64
+          description: Versions that disappeared from this project's visible history.
+        objects_removed:
+          type: integer
+          format: int64
+          description: |
+            Objects physically reclaimed this pass. May be zero even when
+            versions were removed, if the provider keeps orphans for a grace
+            period.
+        bytes_freed:
+          type: integer
+          format: int64

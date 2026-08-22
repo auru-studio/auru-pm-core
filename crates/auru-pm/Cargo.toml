@@ -20,6 +20,7 @@ rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
+serde_jcs.workspace = true
 sha2 = "0.10"
 thiserror.workspace = true
 # tokio needed in regular deps for tokio::time::sleep in oauth.rs polling loop.

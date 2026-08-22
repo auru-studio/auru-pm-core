@@ -97,11 +97,13 @@ impl ProjectInfo {
         Self::from_snapshot(&serde_json::from_slice(bytes).ok()?)
     }
 
-    /// Canonical JSON, with map keys in sorted order — the same rule commit
-    /// hashing uses, so the same summary always hashes to the same blob.
+    /// Canonical JSON, with map keys in sorted order, so the same summary
+    /// always hashes to the same blob.
+    ///
+    /// The blob rule, not the commit rule — see [`crate::canonical`] for why
+    /// the two differ.
     pub fn canonical_encoding(&self) -> Result<Vec<u8>, serde_json::Error> {
-        let value = serde_json::to_value(self)?;
-        serde_json::to_vec(&value)
+        crate::canonical::blob_encoding(&serde_json::to_value(self)?)
     }
 
     pub fn content_hash(&self) -> Result<ContentHash, serde_json::Error> {

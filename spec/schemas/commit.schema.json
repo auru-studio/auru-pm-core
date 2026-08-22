@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auru.studio/spec/auru-pm-v1/commit.schema.json",
+  "title": "Commit",
+  "description": "A single commit in an auru-pm-v1 project history. Standalone on purpose: the canonical encoding is a hashing contract, not an HTTP one, so an SDK needs this shape without pulling in openapi.yaml. See 'Canonical commit encoding' in auru-pm-v1.md.",
+  "type": "object",
+  "required": [
+    "id",
+    "parents",
+    "tree",
+    "author",
+    "timestamp",
+    "message",
+    "auru_version",
+    "format_version"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "$ref": "#/$defs/contentHash",
+      "description": "BLAKE3 of the RFC 8785 canonical encoding of every other field."
+    },
+    "parents": {
+      "type": "array",
+      "description": "Length is the commit shape: 0 root, 1 normal, 2 merge.",
+      "maxItems": 2,
+      "items": { "$ref": "#/$defs/contentHash" }
+    },
+    "tree": { "$ref": "#/$defs/treeRef" },
+    "author": { "$ref": "#/$defs/authorIdentity" },
+    "timestamp": {
+      "$ref": "#/$defs/safeInteger",
+      "description": "Unix epoch seconds."
+    },
+    "message": {
+      "type": "string",
+      "description": "One-line summary entered at Save Version time."
+    },
+    "description": {
+      "type": "string",
+      "default": "",
+      "description": "Free-form body. May be empty."
+    },
+    "auru_version": {
+      "type": "string",
+      "description": "Version of the client that produced the commit."
+    },
+    "format_version": {
+      "$ref": "#/$defs/safeInteger",
+      "description": "Snapshot schema version at commit time, so a reader knows whether a snapshot needs migration before restore."
+    },
+    "metadata": {
+      "$ref": "#/$defs/contentHash",
+      "description": "Blob holding this commit's ProjectInfo — a few kilobytes describing tempo, key, tracks and plugins, so a client can show what a version is without fetching the ~7 MB snapshot. Absent on older commits and on formats the writer could not summarize; a reader that finds it missing falls back to the snapshot."
+    }
+  },
+  "$defs": {
+    "contentHash": {
+      "type": "string",
+      "description": "BLAKE3 in canonical `blake3:<64 lowercase hex>` form.",
+      "pattern": "^blake3:[0-9a-f]{64}$"
+    },
+    "safeInteger": {
+      "type": "integer",
+      "description": "RFC 8785 numbers are IEEE-754 binary64, so every integer on a commit must stay inside +/- (2^53 - 1). Outside it, two conformant implementations derive different ids from the same commit.",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991
+    },
+    "treeRef": {
+      "type": "object",
+      "required": ["snapshot", "samples"],
+      "additionalProperties": false,
+      "properties": {
+        "snapshot": {
+          "$ref": "#/$defs/contentHash",
+          "description": "Blob holding the canonical project JSON for this commit."
+        },
+        "samples": {
+          "$ref": "#/$defs/contentHash",
+          "description": "Blob listing (path, hash) pairs the project depends on. Samples download lazily, so this is the cheap 'what do I need before playback' probe."
+        }
+      }
+    },
+    "authorIdentity": {
+      "type": "object",
+      "description": "Captured inline rather than looked up, so history renders without a live provider connection and attribution survives a user leaving a workspace.",
+      "required": ["display_name", "provider_user_id", "provider_id"],
+      "additionalProperties": false,
+      "properties": {
+        "display_name": { "type": "string" },
+        "provider_user_id": { "type": "string" },
+        "provider_id": { "type": "string" },
+        "email": { "type": "string" }
+      }
+    }
+  }
+}

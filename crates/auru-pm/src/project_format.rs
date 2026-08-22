@@ -1086,26 +1086,8 @@ fn portable_snapshot_format(value: &Value) -> Result<Option<ProjectFormat>> {
         .map_err(Error::from)
 }
 
-fn canonical_json(mut value: Value) -> Result<Vec<u8>> {
-    sort_json_objects(&mut value);
-    serde_json::to_vec(&value).map_err(Error::from)
-}
-
-fn sort_json_objects(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            for child in object.values_mut() {
-                sort_json_objects(child);
-            }
-            object.sort_keys();
-        }
-        Value::Array(values) => {
-            for child in values {
-                sort_json_objects(child);
-            }
-        }
-        _ => {}
-    }
+fn canonical_json(value: Value) -> Result<Vec<u8>> {
+    crate::canonical::blob_encoding(&value).map_err(Error::from)
 }
 
 fn append_element(

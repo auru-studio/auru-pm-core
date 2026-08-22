@@ -6,15 +6,20 @@ all providers — bundled filesystem, the Auru-hosted reference, custom
 user URLs — through this protocol (or, for in-process providers, through
 the matching `ProjectProvider` Rust trait).
 
-Status: **draft, M0**. The shapes are frozen for M1 work to build
-against; breaking changes between draft and the M3 hosted launch will be
-noted in `CHANGELOG.md` and gated by the version string below.
+Status: **v1 beta**. The shapes are frozen; remaining breaking changes are
+batched into a single window before the hosted launch, noted in `CHANGELOG.md`
+and gated by the version string below.
+
+This document is normative. Where it and any implementation disagree, this
+document and the vectors in [`vectors/`](./vectors) are correct. Machine-readable
+companions live alongside it: [`openapi.yaml`](./openapi.yaml) for the HTTP
+surface, [`schemas/`](./schemas) for the wire types.
 
 ## Versioning
 
 Providers advertise `"protocol": "auru-pm-v1"` from `GET /v1/health`.
 The Auru client refuses to talk to a provider whose protocol string
-doesn't match its compiled-in [`WIRE_VERSION`](./lib.rs).
+doesn't match its compiled-in [`WIRE_VERSION`](../crates/auru-pm-protocol/src/lib.rs).
 
 ## Authentication
 
@@ -74,29 +79,92 @@ and sidecar to move together without changing remote identity.
 ## Hash format
 
 All hashes on the wire are the canonical `blake3:<64-hex>` string form
-(lowercase, no padding). The Rust client uses [`crate::ContentHash`]'s
-`Display` / `FromStr` impls; providers in other languages must produce
-the same string.
+(lowercase, no padding). The Rust client uses `ContentHash`'s `Display` / `FromStr` impls
+([hash.rs](../crates/auru-pm/src/hash.rs)); implementations in other
+languages must produce the same string.
+
+## Canonical commit encoding
+
+A commit's `id` is the BLAKE3 of the canonical encoding of every *other* field.
+Providers verify it (see `POST /v1/projects/{handle}/commits`), so any client
+that writes commits must reproduce these bytes exactly.
+
+The rule is **RFC 8785, the JSON Canonicalization Scheme (JCS)**, applied to the
+commit object with the `id` member removed:
+
+1. Serialize the commit to JSON.
+2. Remove the top-level `id` member. Identity is a function of content, not of
+   itself.
+3. Canonicalize per RFC 8785 — object members sorted by UTF-16 code unit, no
+   insignificant whitespace, ECMAScript string escaping and number formatting.
+4. `id` is `blake3:<64-hex>` of the resulting UTF-8 bytes.
+
+JCS was chosen over a house rule because it has a library in every language an
+implementation is likely to be written in; nobody should have to reverse-engineer
+a serializer to write a commit.
+
+### Integer bound
+
+JCS defines numbers by ECMAScript `Number::toString`, which is IEEE-754
+binary64. **Every integer on a commit must lie within ±(2^53 − 1).** Beyond that
+an encoder loses precision and two implementations will disagree: `timestamp`
+`9223372036854775807` canonicalizes to `9223372036854776000`. `timestamp` (Unix
+seconds) and `format_version` are both far inside the bound. Providers should
+reject a commit carrying an integer outside it rather than store one whose id
+cannot be reproduced.
+
+### Blobs are not JCS
+
+This rule covers commits only. Blob payloads — snapshots, project info, sample
+manifests — are **opaque bytes** addressed by the BLAKE3 of exactly what was
+uploaded. A reader verifies the hash of the bytes it received; it never
+re-derives them, so no cross-language encoding agreement is required.
+
+This is deliberate. Snapshots carry DAW numbers, and JCS would rewrite `120.0`
+to `120` and `-0.0` to `0` — changing every derived content hash and discarding
+the sign of negative zero. Writers must therefore preserve blob bytes verbatim
+rather than re-canonicalizing them in transit.
+
+### Vectors
+
+[`vectors/commit-encoding.json`](./vectors/commit-encoding.json) carries frozen
+cases: each is a commit, its canonical bytes, and the resulting id. An
+implementation is conformant when it reproduces all of them. They cover
+non-ASCII text, astral-plane characters, JSON escapes, control characters,
+merge commits, absent optional fields, and the numeric edges.
+
+The commit shape itself is also published standalone as
+[`schemas/commit.schema.json`](./schemas/commit.schema.json), separate from
+[`openapi.yaml`](./openapi.yaml) because canonical encoding is a hashing
+contract rather than an HTTP one.
 
 ## Errors
 
 JSON body on non-2xx responses:
 
 ```json
-{ "code": "head_conflict", "message": "HEAD moved since you fetched it" }
+{ "code": "unauthorized", "message": "a bearer token is required" }
 ```
 
-Codes:
+`code` is a closed set. A client may switch on it exhaustively; a provider must
+not invent codes outside this table.
 
-| Code              | HTTP | Maps to                          |
-| ----------------- | ---- | -------------------------------- |
-| `bad_request`     | 400  | `Error::Other`                   |
-| `unauthorized`    | 401  | `Error::Auth`                    |
-| `forbidden`       | 403  | `Error::Auth`                    |
-| `not_found`       | 404  | `Error::NotFound`                |
-| `head_conflict`   | 409  | `Error::HeadConflict`            |
-| `unsupported`     | 422  | `Error::Unsupported`             |
-| `internal`        | 500  | `Error::Other`                   |
+| Code                         | HTTP | Maps to               | Notes                                                     |
+| ---------------------------- | ---- | --------------------- | --------------------------------------------------------- |
+| `bad_request`                | 400  | `Error::Other`        |                                                             |
+| `unauthorized`               | 401  | `Error::Auth`         | Carries `WWW-Authenticate: Bearer realm="auru-pm"`.         |
+| `forbidden`                  | 403  | `Error::Auth`         | Authenticated, but not entitled to this project.            |
+| `not_found`                  | 404  | `Error::NotFound`     |                                                             |
+| `head_conflict`              | 409  | `Error::HeadConflict` | Body is `{ code, current }`, **not** `{ code, message }`.   |
+| `unsupported`                | 422  | `Error::Unsupported`  | Endpoint exists but its capability is off.                  |
+| `rate_limited`               | 429  | `Error::Other`        | Carries `Retry-After` in seconds.                           |
+| `storage_error`              | 500  | `Error::Other`        | Provider storage failed. Retryable.                         |
+| `internal`                   | 500  | `Error::Other`        | Generic provider fault.                                     |
+| `authentication_unavailable` | 503  | `Error::Auth`         | Identity provider unreachable. Retryable; not a bad token.  |
+
+`head_conflict` is the one shape that differs: it replaces `message` with
+`current`, the provider's actual HEAD, so a client can rebase without a second
+round trip.
 
 ## Endpoints
 
@@ -235,7 +303,7 @@ Compare-and-swap HEAD. Body:
 
 ### `GET /v1/projects/{handle}/commits/{id}`
 
-Returns the full [`Commit`](./commit.rs) JSON. `404` if the commit isn't
+Returns the full [`Commit`](../crates/auru-pm/src/commit.rs) JSON. `404` if the commit isn't
 in the provider's log.
 
 ### `POST /v1/projects/{handle}/commits`
@@ -255,7 +323,7 @@ Query params:
 - `limit` — max rows, default provider-chosen, capped at provider-chosen max.
 - `before` — `blake3:<hex>` cursor; return commits strictly older than this id.
 
-Response: array of [`CommitSummary`](./commit.rs).
+Response: array of [`CommitSummary`](../crates/auru-pm/src/commit.rs).
 
 ```json
 { "commits": [ { "id": "blake3:...", "parents": [...], "author": {...}, ... } ] }
@@ -331,7 +399,7 @@ never reveal existence or grant access. The client retains the old global
 
 ### `GET /v1/projects/{handle}/members` *(capability: `members`)*
 
-Response: array of [`Member`](./provider.rs).
+Response: array of [`Member`](../crates/auru-pm/src/provider.rs).
 
 ```json
 { "members": [ { "user_id": "...", "display_name": "...", "email": "..." } ] }
@@ -341,7 +409,7 @@ Providers without the capability respond `422 unsupported`.
 
 ### `GET /v1/projects/{handle}/permissions/{user}` *(capability: `permissions`)*
 
-Response: [`PermSet`](./provider.rs).
+Response: [`PermSet`](../crates/auru-pm/src/provider.rs).
 
 ```json
 { "can_read": true, "can_write": true, "can_admin": false }

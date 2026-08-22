@@ -124,15 +124,14 @@ impl SampleManifest {
         }
     }
 
-    /// Canonical JSON encoding — sorted entries already, plus
-    /// serde_json's default sorted keys means the byte sequence is
-    /// stable for a given logical manifest.
+    /// Canonical JSON encoding — entries are already sorted, and every object
+    /// key is sorted explicitly, so the byte sequence is stable for a given
+    /// logical manifest.
+    ///
+    /// The blob rule, not the commit rule — see [`crate::canonical`] for why
+    /// the two differ.
     pub fn canonical_encoding(&self) -> Result<Vec<u8>, serde_json::Error> {
-        // Round-trip through Value so map keys serialize alphabetically
-        // (BTreeMap-backed by default), matching the rule in
-        // canonical.rs for commit hashing.
-        let value = serde_json::to_value(self)?;
-        serde_json::to_vec(&value)
+        crate::canonical::blob_encoding(&serde_json::to_value(self)?)
     }
 
     /// blake3 of `canonical_encoding`. The matching value goes into

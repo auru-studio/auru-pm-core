@@ -4,7 +4,7 @@
 //! The crate supplies the commit model, content-addressed storage, structural
 //! merge and diff support, local and HTTP providers, and reversible adapters
 //! for the supported project formats. See the `auru-pm-v1` HTTP contract in
-//! [`spec.md`](./spec.md).
+//! [`spec/auru-pm-v1.md`](../../spec/auru-pm-v1.md).
 
 pub mod ableton;
 pub mod canonical;

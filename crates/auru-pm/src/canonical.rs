@@ -6,12 +6,22 @@
 //! that build the same logical commit must produce byte-identical
 //! encodings.
 //!
-//! We get determinism by round-tripping through [`serde_json::Value`],
-//! explicitly sorting every object, and re-serializing. Explicit sorting is
-//! required because Cargo feature unification can enable serde_json's
-//! `preserve_order` feature through another workspace crate. The `id` field is
-//! stripped before hashing so the commit's identity is a function of its
-//! content, not of itself.
+//! The rule is RFC 8785 (JSON Canonicalization Scheme). It is a published
+//! standard with an implementation in every language we intend to ship an SDK
+//! for, which is the whole reason to prefer it over a house rule: a Java or
+//! TypeScript client reaches for a JCS library rather than reverse-engineering
+//! `serde_json`. The `id` field is stripped before hashing so the commit's
+//! identity is a function of its content, not of itself.
+//!
+//! JCS defines numbers by ECMAScript `Number::toString`, i.e. IEEE-754
+//! binary64, so every integer on a commit must stay within +/- (2^53 - 1).
+//! `timestamp` (Unix seconds) and `format_version` are both far inside that
+//! bound; see `jcs_equivalence::documents_the_integer_precision_boundary`.
+//!
+//! This rule applies to *commits* only. Blob payloads — snapshots, project
+//! info, sample manifests — keep their own encoding, because JCS would rewrite
+//! the DAW floats they carry (`120.0` becomes `120`, `-0.0` becomes `0`) and
+//! change every content hash derived from them.
 
 use crate::commit::{Commit, CommitId};
 use crate::hash::ContentHash;
@@ -26,6 +36,21 @@ pub fn canonical_encoding(commit: &Commit) -> Result<Vec<u8>, serde_json::Error>
     if let serde_json::Value::Object(map) = &mut value {
         map.remove("id");
     }
+    serde_jcs::to_vec(&value)
+}
+
+/// Encode a blob payload — snapshot, project info, or sample manifest.
+///
+/// Deliberately *not* JCS: these carry DAW numbers, and JCS would rewrite
+/// `120.0` to `120` and `-0.0` to `0`, changing every content hash derived
+/// from them and losing the sign of negative zero. The rule is instead
+/// serde_json with every object explicitly sorted.
+///
+/// Explicit sorting is required rather than relying on `Value`'s BTreeMap
+/// backing, because Cargo feature unification can enable serde_json's
+/// `preserve_order` feature through any other crate in the graph.
+pub(crate) fn blob_encoding(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
+    let mut value = value.clone();
     sort_json_objects(&mut value);
     serde_json::to_vec(&value)
 }
