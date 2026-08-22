@@ -21,6 +21,16 @@ pub struct ServerConfig {
     pub data_dir: PathBuf,
     #[serde(default = "default_requests_per_minute")]
     pub requests_per_minute: u32,
+    /// Browser origins permitted to call this server cross-origin.
+    ///
+    /// Empty by default, which installs no CORS layer at all — a server that
+    /// only serves native clients should not answer preflights. Each entry is
+    /// a bare origin (`https://dashboard.example.com`), never a wildcard: the
+    /// dashboard sends a bearer token in `Authorization`, and an origin
+    /// allow-list is what keeps another site from asking the browser to send
+    /// requests here on the user's behalf.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
     #[serde(default)]
     pub authentication: AuthenticationConfig,
 }
@@ -45,6 +55,7 @@ impl ServerConfig {
             public_base_url: None,
             data_dir,
             requests_per_minute,
+            allowed_origins: Vec::new(),
             authentication: AuthenticationConfig::default(),
         }
     }
@@ -58,6 +69,9 @@ impl ServerConfig {
         }
         if self.provider_id.trim().is_empty() {
             return Err("provider_id must not be empty".to_owned());
+        }
+        for origin in &self.allowed_origins {
+            validate_origin(origin)?;
         }
         match &self.authentication {
             AuthenticationConfig::None {
@@ -105,6 +119,32 @@ impl ServerConfig {
                         "authentication.required_scope must contain exactly one scope token"
                             .to_owned(),
                     );
+                }
+                if let Some(browser) = &oauth.browser_client {
+                    if browser.client_id.trim().is_empty() {
+                        return Err(
+                            "authentication.browser_client.client_id must not be empty".to_owned()
+                        );
+                    }
+                    if browser.client_id == oauth.desktop_client_id {
+                        return Err(
+                            "authentication.browser_client.client_id must differ from desktop_client_id"
+                                .to_owned(),
+                        );
+                    }
+                    validate_browser_redirect(&browser.redirect_uri)?;
+                    if browser.flows.is_empty() {
+                        return Err(
+                            "authentication.browser_client.flows must declare at least one flow"
+                                .to_owned(),
+                        );
+                    }
+                    if self.allowed_origins.is_empty() {
+                        return Err(
+                            "authentication.browser_client is configured but allowed_origins is empty; the dashboard's origin could not reach this server"
+                                .to_owned(),
+                        );
+                    }
                 }
                 if oauth.flows.is_empty() {
                     return Err("authentication.flows must declare at least one flow".to_owned());
@@ -187,6 +227,14 @@ pub struct OAuthConfig {
     pub redirect_uri: String,
     #[serde(default = "default_oauth_flows")]
     pub flows: Vec<OAuthFlow>,
+    /// A second public client for a browser dashboard, if one exists.
+    ///
+    /// Separate from the desktop registration rather than a shared client id:
+    /// an identity provider's redirect allow-list is per client, and a native
+    /// loopback redirect and an https single-page redirect cannot both live on
+    /// one entry without widening it past either app's needs.
+    #[serde(default)]
+    pub browser_client: Option<BrowserClientConfig>,
     #[serde(default)]
     pub legacy_owner_subject: Option<String>,
     pub validation: TokenValidationConfig,
@@ -238,6 +286,79 @@ fn default_display_name_claims() -> Vec<String> {
 
 fn default_email_claim() -> String {
     "email".to_owned()
+}
+
+/// A browser single-page app registered as a second public client.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserClientConfig {
+    pub client_id: String,
+    pub redirect_uri: String,
+    #[serde(default = "default_oauth_flows")]
+    pub flows: Vec<OAuthFlow>,
+}
+
+/// Whether `host` is a loopback name, for which plain http is acceptable.
+fn is_loopback_host(url: &Url) -> bool {
+    match url.host_str() {
+        Some("localhost") => true,
+        Some(host) => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback()),
+        None => false,
+    }
+}
+
+/// A browser redirect is an https URL the app serves, not a loopback callback.
+fn validate_browser_redirect(value: &str) -> Result<(), String> {
+    let field = "authentication.browser_client.redirect_uri";
+    let url = Url::parse(value).map_err(|error| format!("{field}: {error}"))?;
+    if url.host_str().is_none() {
+        return Err(format!("{field} must name a host"));
+    }
+    // http is tolerated only for a loopback dev server; anything else on the
+    // open internet would put an authorization code on the wire in clear.
+    if url.scheme() != "https" && !(url.scheme() == "http" && is_loopback_host(&url)) {
+        return Err(format!(
+            "{field} must use https, or http on loopback for local development"
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return Err(format!(
+            "{field} must not contain credentials or a fragment"
+        ));
+    }
+    Ok(())
+}
+
+/// A CORS allow-list entry is a bare origin: scheme, host, optional port.
+fn validate_origin(value: &str) -> Result<(), String> {
+    let field = "allowed_origins";
+    if value == "*" {
+        return Err(format!(
+            "{field} must name explicit origins; `*` would let any site drive authenticated requests from a user's browser"
+        ));
+    }
+    let url = Url::parse(value).map_err(|error| format!("{field}: {value:?}: {error}"))?;
+    if url.host_str().is_none() {
+        return Err(format!("{field}: {value:?} must name a host"));
+    }
+    if url.scheme() != "https" && !(url.scheme() == "http" && is_loopback_host(&url)) {
+        return Err(format!(
+            "{field}: {value:?} must use https, or http on loopback for local development"
+        ));
+    }
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return Err(format!(
+            "{field}: {value:?} must be a bare origin with no path, query, or fragment"
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!("{field}: {value:?} must not contain credentials"));
+    }
+    Ok(())
 }
 
 fn require_https(value: &str, field: &str) -> Result<(), String> {
@@ -333,5 +454,111 @@ mode = "none"
         )
         .expect_err("unauthenticated public listener");
         assert!(error.contains("loopback"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod browser_client_tests {
+    use super::*;
+
+    fn config(extra: &str) -> Result<ServerConfig, String> {
+        ServerConfig::from_toml(&format!(
+            r#"
+version = 1
+provider_id = "studio-pm"
+public_base_url = "https://pm.example.com"
+{extra}
+[authentication.validation]
+strategy = "jwt"
+"#
+        ))
+    }
+
+    const OAUTH: &str = r#"
+[authentication]
+mode = "oauth"
+issuer = "https://identity.example.com"
+audience = "auru-pm"
+desktop_client_id = "desktop"
+redirect_uri = "http://127.0.0.1:43827/oauth/callback"
+"#;
+
+    #[test]
+    fn a_wildcard_origin_is_refused() {
+        let error = config(&format!("allowed_origins = [\"*\"]\n{OAUTH}")).unwrap_err();
+        assert!(error.contains("explicit origins"), "{error}");
+    }
+
+    #[test]
+    fn plain_http_origins_are_refused_off_loopback() {
+        let error = config(&format!(
+            "allowed_origins = [\"http://dashboard.example.com\"]\n{OAUTH}"
+        ))
+        .unwrap_err();
+        assert!(error.contains("must use https"), "{error}");
+    }
+
+    #[test]
+    fn loopback_http_origins_are_allowed_for_local_development() {
+        let config = config(&format!(
+            "allowed_origins = [\"http://localhost:5173\", \"http://127.0.0.1:5173\"]\n{OAUTH}"
+        ))
+        .unwrap();
+        assert_eq!(config.allowed_origins.len(), 2);
+    }
+
+    #[test]
+    fn an_origin_with_a_path_is_refused() {
+        let error = config(&format!(
+            "allowed_origins = [\"https://dashboard.example.com/app\"]\n{OAUTH}"
+        ))
+        .unwrap_err();
+        assert!(error.contains("bare origin"), "{error}");
+    }
+
+    #[test]
+    fn the_browser_client_may_not_reuse_the_desktop_client_id() {
+        let error = config(&format!(
+            r#"allowed_origins = ["https://dashboard.example.com"]
+{OAUTH}
+[authentication.browser_client]
+client_id = "desktop"
+redirect_uri = "https://dashboard.example.com/oauth/callback"
+"#
+        ))
+        .unwrap_err();
+        assert!(
+            error.contains("must differ from desktop_client_id"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_browser_client_without_allowed_origins_is_refused() {
+        // Registering the client but forgetting the origin list produces a
+        // dashboard that authenticates and then cannot reach the server at all.
+        let error = config(&format!(
+            r#"{OAUTH}
+[authentication.browser_client]
+client_id = "dashboard"
+redirect_uri = "https://dashboard.example.com/oauth/callback"
+"#
+        ))
+        .unwrap_err();
+        assert!(error.contains("allowed_origins is empty"), "{error}");
+    }
+
+    #[test]
+    fn a_browser_redirect_must_not_be_plain_http_off_loopback() {
+        let error = config(&format!(
+            r#"allowed_origins = ["https://dashboard.example.com"]
+{OAUTH}
+[authentication.browser_client]
+client_id = "dashboard"
+redirect_uri = "http://dashboard.example.com/oauth/callback"
+"#
+        ))
+        .unwrap_err();
+        assert!(error.contains("must use https"), "{error}");
     }
 }

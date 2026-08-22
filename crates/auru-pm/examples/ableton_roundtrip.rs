@@ -17,8 +17,8 @@ use std::process::ExitCode;
 
 use auru_pm::ableton::{self, BundlePolicy};
 use auru_pm::{
-    AuthorIdentity, ContentHash, FilesystemProvider, ProjectProvider, ProjectSnapshot, PushOutcome,
-    SampleEntry, SampleManifest, push_with_freshness_check, sidecar_path_for,
+    AuthorIdentity, ContentHash, FilesystemProvider, ProjectProvider, PushOutcome, SampleEntry,
+    SampleManifest, push_with_freshness_check, sidecar_path_for,
 };
 
 #[tokio::main]
@@ -39,7 +39,7 @@ async fn main() -> ExitCode {
         .unwrap_or("Song.als")
         .to_owned();
 
-    let snapshot = match ProjectSnapshot::load(bundle.live_set()) {
+    let snapshot = match auru_pm::snapshot_project(bundle.live_set()) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             eprintln!("could not read the Live Set: {error}");
@@ -155,7 +155,7 @@ async fn main() -> ExitCode {
 
     // The real question: does the restored set find its own media with no
     // aliases configured — as it would on a machine that never saw the source?
-    let restored = ProjectSnapshot::load(&report.live_set).expect("load restored set");
+    let restored = auru_pm::snapshot_project(&report.live_set).expect("load restored set");
     let restored_bundle = ableton::AbletonBundle::detect(&destination)
         .expect("detect")
         .expect("restored folder is a project");

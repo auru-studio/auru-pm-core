@@ -165,7 +165,7 @@ fn nonempty_attribute<'a>(element: &'a XmlElement, name: &str) -> Option<&'a str
     element.attribute(name).filter(|value| !value.is_empty())
 }
 
-pub(crate) fn classify(path: &str) -> AssetKind {
+pub fn classify(path: &str) -> AssetKind {
     let extension = Path::new(path)
         .extension()
         .and_then(|extension| extension.to_str())

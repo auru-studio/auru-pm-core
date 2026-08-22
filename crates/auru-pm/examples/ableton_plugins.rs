@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use auru_pm::plugin_registry::{self, PluginAvailability, PluginSearchPaths};
-use auru_pm::{ProjectFormat, ProjectSnapshot, ableton};
+use auru_pm::{ProjectFormat, ableton};
 
 fn main() -> ExitCode {
     let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) else {
@@ -20,7 +20,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let snapshot = match ProjectSnapshot::load(&path) {
+    let snapshot = match auru_pm::snapshot_project(&path) {
         Ok(snapshot) if snapshot.format() == ProjectFormat::AbletonLiveSet => snapshot,
         Ok(snapshot) => {
             eprintln!("'{}' is a {} project", path.display(), snapshot.format());

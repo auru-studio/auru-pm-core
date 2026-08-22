@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/auru-pm",
     "crates/auru-pm-client",
+    "crates/auru-pm-ffi",
+    "crates/auru-pm-kernel",
     "crates/auru-pm-protocol",
     "crates/auru-pm-server",
 ]
@@ -10,6 +12,8 @@ exclude = ["apps/auru-pm-ui"]
 default-members = [
     "crates/auru-pm",
     "crates/auru-pm-client",
+    "crates/auru-pm-ffi",
+    "crates/auru-pm-kernel",
     "crates/auru-pm-protocol",
     "crates/auru-pm-server",
 ]
@@ -24,6 +28,8 @@ repository = "https://github.com/auru-studio/auru-pm-core"
 [workspace.dependencies]
 auru-pm = { path = "crates/auru-pm" }
 auru-pm-client = { path = "crates/auru-pm-client" }
+auru-pm-ffi = { path = "crates/auru-pm-ffi" }
+auru-pm-kernel = { path = "crates/auru-pm-kernel" }
 auru-pm-protocol = { path = "crates/auru-pm-protocol" }
 async-trait = "0.1"
 base64 = "0.22"
@@ -42,3 +48,19 @@ unsafe-code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Size-first profile for the browser binding.
+#
+# A dashboard downloads this before it can render anything, so bytes matter more
+# than the last few percent of throughput — the kernel's hot paths are hashing
+# and parsing, which are dominated by the work itself rather than by codegen.
+# `panic = "abort"` is deliberate: every fallible entry point already returns a
+# Result, so a panic here is a bug, and carrying unwinding tables to describe
+# one costs every user of the page.
+[profile.release-wasm]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,27 @@
+[package]
+name = "auru-pm-kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Portable core of Auru PM: commit identity, project formats, diff, and merge, with no filesystem, network, or platform dependencies."
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+
+# Every dependency here must build for `wasm32-unknown-unknown`. That is the
+# point of the crate: the browser SDK compiles this and nothing else, so a
+# platform dependency added here is a bug, not a trade-off.
+[dependencies]
+auru-pm-protocol.workspace = true
+base64.workspace = true
+blake3.workspace = true
+flate2 = "1"
+quick-xml = "0.37"
+serde.workspace = true
+serde_jcs.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[lints]
+workspace = true

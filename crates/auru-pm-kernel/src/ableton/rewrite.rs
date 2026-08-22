@@ -41,7 +41,7 @@ impl VendorPlan {
         self.placements.is_empty()
     }
 
-    fn destination_for(&self, reference: &str) -> Option<&str> {
+    pub fn destination_for(&self, reference: &str) -> Option<&str> {
         self.placements.get(reference).map(String::as_str)
     }
 }
@@ -80,7 +80,7 @@ impl RewriteReport {
 /// restore starts from the committed snapshot, which still holds the original
 /// reference, so it performs the same rewrite again and produces the same
 /// bytes. That is what keeps a restore a pure function of its commit.
-pub(crate) fn rewrite_file_refs(
+pub fn rewrite_file_refs(
     root: &mut XmlElement,
     plan: &VendorPlan,
     project_root: &Path,
@@ -93,7 +93,7 @@ pub(crate) fn rewrite_file_refs(
 }
 
 /// Depth-first walk invoking `visit` on every `FileRef`.
-fn visit_file_refs(element: &mut XmlElement, visit: &mut impl FnMut(&mut XmlElement)) {
+pub fn visit_file_refs(element: &mut XmlElement, visit: &mut impl FnMut(&mut XmlElement)) {
     if element.tag == "FileRef" {
         visit(element);
         // A FileRef never nests another.
@@ -104,7 +104,7 @@ fn visit_file_refs(element: &mut XmlElement, visit: &mut impl FnMut(&mut XmlElem
     }
 }
 
-fn rewrite_one(
+pub fn rewrite_one(
     file_ref: &mut XmlElement,
     plan: &VendorPlan,
     project_root: &Path,
@@ -158,7 +158,7 @@ fn rewrite_one(
 }
 
 /// Point one reference at `destination`, a folder-relative `/`-separated path.
-fn write_reference(file_ref: &mut XmlElement, destination: &str, project_root: &Path) {
+pub fn write_reference(file_ref: &mut XmlElement, destination: &str, project_root: &Path) {
     file_ref.set_child_value(
         "RelativePathType",
         super::refs::PROJECT_FOLDER_PATH_TYPE.to_string(),
@@ -172,7 +172,7 @@ fn write_reference(file_ref: &mut XmlElement, destination: &str, project_root: &
 }
 
 /// The host-absolute form of a folder-relative path, in Ableton's slash style.
-fn absolute_path_for(project_root: &Path, destination: &str) -> String {
+pub fn absolute_path_for(project_root: &Path, destination: &str) -> String {
     let mut path = project_root.to_string_lossy().replace('\\', "/");
     if !path.ends_with('/') {
         path.push('/');

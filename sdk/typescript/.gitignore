@@ -1,0 +1,6 @@
+native/
+node_modules/
+dist/
+wasm/
+platforms/
+*.tgz

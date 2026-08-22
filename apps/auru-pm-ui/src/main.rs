@@ -6915,8 +6915,9 @@ mod cli_tests {
         std::fs::create_dir(&project_dir).expect("project directory");
         let project_file = project_dir.join("oracle-midi.dawproject");
         std::fs::copy(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../crates/auru-pm/tests/fixtures/interchange/oracle-midi.dawproject"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+                "../../crates/auru-pm-kernel/tests/fixtures/interchange/oracle-midi.dawproject",
+            ),
             &project_file,
         )
         .expect("fixture project");

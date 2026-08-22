@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use auru_pm::{ProjectFormat, ProjectSnapshot, structured_diff};
+use auru_pm::{ProjectFormat, structured_diff};
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1).map(PathBuf::from);
@@ -21,7 +21,7 @@ fn main() -> ExitCode {
 
     let mut snapshots = Vec::new();
     for path in [&before_path, &after_path] {
-        match ProjectSnapshot::load(path) {
+        match auru_pm::snapshot_project(path) {
             Ok(snapshot) if snapshot.format() == ProjectFormat::AbletonLiveSet => {
                 let value: serde_json::Value =
                     serde_json::from_slice(snapshot.as_bytes()).expect("canonical JSON");

@@ -147,16 +147,8 @@ fn restoring_to_the_wrong_extension_should_be_refused() {
     let snapshot = ProjectSnapshot::from_source_bytes(ProjectFormat::FlStudio, &fixture_project())
         .expect("snapshot");
     let temp = tempfile::tempdir().expect("tempdir");
-    assert!(
-        snapshot
-            .restore_to_path(&temp.path().join("Song.als"))
-            .is_err()
-    );
-    assert!(
-        snapshot
-            .restore_to_path(&temp.path().join("Song.flp"))
-            .is_ok()
-    );
+    assert!(auru_pm::restore_snapshot_to_path(&snapshot, &temp.path().join("Song.als")).is_err());
+    assert!(auru_pm::restore_snapshot_to_path(&snapshot, &temp.path().join("Song.flp")).is_ok());
 }
 
 #[test]

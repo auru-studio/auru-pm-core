@@ -5,10 +5,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// A single field that could not be auto-resolved.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConflictedField {
     /// Dot-separated path; arrays use `[id=X]` or `.N` notation.
     pub path: String,
@@ -18,6 +19,8 @@ pub struct ConflictedField {
 }
 
 /// Result of a 3-way merge.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum MergeOutcome {
     /// Every field was resolved without ambiguity.
     Clean { merged: Value },
@@ -31,7 +34,8 @@ pub enum MergeOutcome {
 }
 
 /// User choice for one field in a conflicted three-way merge.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConflictChoice {
     Local,
     Remote,

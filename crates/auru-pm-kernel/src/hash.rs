@@ -1,8 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
-use std::fs::File;
 use std::io::{self, Read};
-use std::path::Path;
 use std::str::FromStr;
 
 /// 32-byte blake3 content hash.
@@ -26,13 +24,15 @@ impl ContentHash {
         ContentHash(*blake3::hash(data).as_bytes())
     }
 
-    /// Stream a file through BLAKE3 without loading it all into memory.
-    pub fn of_file(path: &Path) -> io::Result<Self> {
-        let mut file = File::open(path)?;
+    /// Stream a reader through BLAKE3 without loading it all into memory.
+    ///
+    /// Takes a reader rather than a path so the hashing itself stays portable;
+    /// `auru_pm::hash_file` opens the file and calls this.
+    pub fn of_reader(mut reader: impl Read) -> io::Result<Self> {
         let mut hasher = blake3::Hasher::new();
         let mut buffer = [0_u8; 64 * 1024];
         loop {
-            let read = file.read(&mut buffer)?;
+            let read = reader.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
@@ -113,19 +113,6 @@ mod tests {
         let b = ContentHash::of(b"hello");
         assert_eq!(a, b);
         assert_ne!(a, ContentHash::of(b"world"));
-    }
-
-    #[test]
-    fn file_hash_should_match_the_same_bytes_in_memory() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("large-enough-to-stream.bin");
-        let bytes = b"auru restore verification".repeat(8_192);
-        std::fs::write(&path, &bytes).unwrap();
-
-        assert_eq!(
-            ContentHash::of_file(&path).unwrap(),
-            ContentHash::of(&bytes)
-        );
     }
 
     #[test]

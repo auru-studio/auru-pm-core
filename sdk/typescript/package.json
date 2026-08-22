@@ -1,0 +1,66 @@
+{
+  "name": "@auru/pm",
+  "version": "0.1.0",
+  "description": "Client for auru-pm-v1 project-management providers. Connects to any endpoint you give it.",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/auru-studio/auru-pm-core.git",
+    "directory": "sdk/typescript"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./kernel": {
+      "types": "./dist/kernel/index.d.ts",
+      "default": "./dist/kernel/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "wasm",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "npm run build:wasm && tsc -p tsconfig.build.json",
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "build:native": "node scripts/build-native.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build:wasm && npm run build:native && vitest run",
+    "test:only": "vitest run",
+    "test:watch": "vitest",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0",
+    "binaryen": "^132.0.0"
+  },
+  "keywords": [
+    "auru",
+    "daw",
+    "ableton",
+    "fl-studio",
+    "dawproject",
+    "version-control"
+  ],
+  "optionalDependencies": {
+    "@auru/pm-darwin-arm64": "0.1.0",
+    "@auru/pm-darwin-x64": "0.1.0",
+    "@auru/pm-linux-x64-gnu": "0.1.0",
+    "@auru/pm-linux-arm64-gnu": "0.1.0",
+    "@auru/pm-linux-x64-musl": "0.1.0",
+    "@auru/pm-win32-x64-msvc": "0.1.0"
+  }
+}

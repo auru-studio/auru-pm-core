@@ -218,8 +218,9 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::ableton::bundle::{PROJECT_INFO_DIR, PathAlias};
-    use crate::ableton::test_support::parse_xml;
+    use crate::ableton::bundle::PROJECT_INFO_DIR;
+    use auru_pm_kernel::ableton::PathAlias;
+    use auru_pm_kernel::ableton::test_support::parse_xml;
 
     fn touch(path: &Path, bytes: &[u8]) {
         fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");

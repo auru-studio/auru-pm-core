@@ -83,12 +83,12 @@ pub fn requires_resource_hydration(snapshot: &ProjectSnapshot) -> Result<bool> {
         .any(|resource| resource.data.is_none()))
 }
 
-pub(crate) struct SnapshotParts {
+pub struct SnapshotParts {
     pub project: XmlDocument,
     pub metadata: Option<XmlDocument>,
 }
 
-pub(crate) fn snapshot_parts_from_value(snapshot: &serde_json::Value) -> Option<SnapshotParts> {
+pub fn snapshot_parts_from_value(snapshot: &serde_json::Value) -> Option<SnapshotParts> {
     if serde_json::from_value::<ProjectFormat>(snapshot.get("format")?.clone()).ok()?
         != ProjectFormat::Dawproject
     {
@@ -114,7 +114,7 @@ pub(crate) fn metadata_from_value(snapshot: &serde_json::Value) -> Option<Dawpro
     ))
 }
 
-pub(crate) struct SnapshotResource {
+pub struct SnapshotResource {
     pub path: String,
     pub hash: ContentHash,
     pub size: u64,
@@ -122,7 +122,7 @@ pub(crate) struct SnapshotResource {
     pub inline_data: Option<Vec<u8>>,
 }
 
-pub(crate) fn snapshot_resources_from_value(
+pub fn snapshot_resources_from_value(
     snapshot: &serde_json::Value,
 ) -> Result<Vec<SnapshotResource>> {
     if snapshot_parts_from_value(snapshot).is_none() {
@@ -182,7 +182,7 @@ pub(crate) fn snapshot_resources_from_value(
         .collect()
 }
 
-fn portable(snapshot: &ProjectSnapshot) -> Result<PortableSnapshot> {
+pub fn portable(snapshot: &ProjectSnapshot) -> Result<PortableSnapshot> {
     if snapshot.format() != ProjectFormat::Dawproject {
         return Err(Error::ProjectFormat(format!(
             "expected a DAWproject snapshot, found {}",

@@ -9,6 +9,7 @@ repository.workspace = true
 readme = "../../README.md"
 
 [dependencies]
+auru-pm-kernel.workspace = true
 auru-pm-protocol.workspace = true
 async-trait.workspace = true
 base64.workspace = true

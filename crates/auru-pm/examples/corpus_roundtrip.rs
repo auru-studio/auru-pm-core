@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     for (path, format) in &projects {
-        let snapshot = ProjectSnapshot::load(path)?;
+        let snapshot = auru_pm::snapshot_project(path)?;
         let restored = snapshot.restore_bytes()?;
         let round_trip = ProjectSnapshot::from_source_bytes(*format, &restored)?;
         if snapshot.as_bytes() != round_trip.as_bytes() {

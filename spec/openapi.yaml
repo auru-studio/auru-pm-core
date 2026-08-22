@@ -108,6 +108,10 @@ paths:
         commit or move HEAD. Omitting `metadata` or `location` clears the
         corresponding catalogue values, except that a provider preserves the
         last known `location` when an older client omits the field entirely.
+
+        This is also how a project handle comes into existence: until a profile
+        is registered, every other project-scoped endpoint answers `404`,
+        including blob upload. Publish a profile before uploading anything.
       requestBody:
         required: true
         content:

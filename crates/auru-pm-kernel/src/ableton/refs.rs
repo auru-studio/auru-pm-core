@@ -152,7 +152,7 @@ impl AssetRef {
 }
 
 /// Collect every `FileRef` in document order.
-pub(crate) fn collect(root: &XmlElement) -> Vec<AssetRef> {
+pub fn collect(root: &XmlElement) -> Vec<AssetRef> {
     let mut refs = Vec::new();
     walk(root, &mut Vec::new(), &mut refs);
     refs
@@ -294,7 +294,7 @@ fn decode_data_path(data: &XmlElement) -> Option<String> {
     (looks_like_a_path && is_readable).then_some(decoded)
 }
 
-fn classify(
+pub fn classify(
     relative_path_type: RelativePathType,
     relative_path: &str,
     absolute_path: &str,

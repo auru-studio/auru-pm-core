@@ -106,7 +106,8 @@ async fn an_ableton_commit_should_describe_its_project() {
 
 #[tokio::test]
 async fn a_dawproject_commit_should_describe_its_project() {
-    let source = include_bytes!("fixtures/interchange/oracle-midi.dawproject");
+    let source =
+        include_bytes!("../../auru-pm-kernel/tests/fixtures/interchange/oracle-midi.dawproject");
     let snapshot = ProjectSnapshot::from_source_bytes(auru_pm::ProjectFormat::Dawproject, source)
         .expect("normalize DAWproject");
     let (_root, provider, commit) =

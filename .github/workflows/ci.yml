@@ -21,6 +21,167 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+  # The browser SDK compiles auru-pm-kernel and nothing else. If a filesystem,
+  # socket, or keychain dependency reaches the kernel, this job fails — which is
+  # the whole reason the kernel is a separate crate rather than a feature flag.
+  portable-kernel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p auru-pm-kernel --target wasm32-unknown-unknown --locked
+
+  # Every SDK verifies the same canonical-encoding vectors. A vector that passes
+  # in one language and fails in another is exactly what the spec exists to catch.
+  spec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p auru-pm --test spec_vectors --locked
+      - run: npx --yes @redocly/cli@latest lint spec/openapi.yaml
+
+  # Both bindings must reproduce the published vectors, and agree with each
+  # other. A commit whose id an implementation cannot reproduce is rejected by
+  # every provider, so this is the check that keeps an SDK honest.
+  bindings:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # Pinned to the wasm-bindgen crate version in Cargo.lock; a CLI that
+      # disagrees with the crate produces a module that will not load.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.126
+
+      - name: Build the browser binding
+        run: |
+          cargo build -p auru-pm-ffi --features wasm \
+            --target wasm32-unknown-unknown --release --locked
+          wasm-bindgen --target nodejs --out-dir dist/wasm \
+            target/wasm32-unknown-unknown/release/auru_pm_ffi.wasm
+      - name: Verify the browser binding against the vectors
+        run: node spec/conformance/verify-vectors.mjs dist/wasm/auru_pm_ffi.js
+
+      - name: Build the Node binding
+        run: |
+          cargo build -p auru-pm-ffi --features node --release --locked
+          cp target/release/libauru_pm_ffi.so dist/auru_pm_ffi.node
+      - name: Verify the Node binding against the vectors
+        run: node spec/conformance/verify-vectors.mjs dist/auru_pm_ffi.node
+
+  # The TypeScript SDK, including its end-to-end tests: those start a real
+  # auru-pm-server and push commits through it, because mocked HTTP only proves
+  # the client agrees with the test's idea of the protocol.
+  #
+  # `typecheck` is a separate step from `test` on purpose — vitest does not
+  # typecheck, so a type error can otherwise sail through a green test run.
+  sdk-typescript:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.126
+      - run: npm ci
+      - run: npm run typecheck
+      # `build` compiles the wasm binding first, so this covers both.
+      - run: npm run build
+      - run: npm run build:native
+      - run: npm run test:only
+      # The published tarball must carry the wasm binding; without it the
+      # package installs and then cannot compute a commit id.
+      - run: npm pack --dry-run 2>&1 | grep -q 'wasm/auru_pm_ffi_bg.wasm'
+
+  # One runner per platform, because a native addon has to be linked where it
+  # will run. Every artifact is checked against the vectors before it is kept:
+  # a binary that cannot reproduce a commit id is worse than a missing one,
+  # since the fallback would have worked.
+  native-addons:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            target: aarch64-apple-darwin
+            runs-on: macos-14
+          - platform: darwin-x64
+            target: x86_64-apple-darwin
+            runs-on: macos-13
+          - platform: linux-x64-gnu
+            target: x86_64-unknown-linux-gnu
+            runs-on: ubuntu-latest
+          - platform: linux-arm64-gnu
+            target: aarch64-unknown-linux-gnu
+            runs-on: ubuntu-24.04-arm
+          - platform: linux-x64-musl
+            target: x86_64-unknown-linux-musl
+            runs-on: ubuntu-latest
+            musl: true
+          - platform: win32-x64-msvc
+            target: x86_64-pc-windows-msvc
+            runs-on: windows-latest
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      # A glibc binary will not load on Alpine; the musl target needs its own
+      # linker, and the failure without it is an opaque link error.
+      - name: Install the musl toolchain
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build and package the addon
+        working-directory: sdk/typescript
+        run: node scripts/prepare-platform-package.mjs ${{ matrix.platform }} --build
+      # A musl addon cannot be loaded by the glibc Node on this runner, so it is
+      # verified where it can actually run rather than skipped.
+      - name: Verify it reproduces the vectors
+        if: '!matrix.musl'
+        working-directory: sdk/typescript
+        shell: bash
+        run: |
+          node ../../spec/conformance/verify-vectors.mjs \
+            "platforms/${{ matrix.platform }}/auru-pm-${{ matrix.platform }}.node"
+      - name: Verify the musl addon inside Alpine
+        if: matrix.musl
+        run: |
+          docker run --rm -v "$PWD":/work -w /work node:22-alpine \
+            node spec/conformance/verify-vectors.mjs \
+              "sdk/typescript/platforms/linux-x64-musl/auru-pm-linux-x64-musl.node"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: auru-pm-${{ matrix.platform }}
+          path: sdk/typescript/platforms/${{ matrix.platform }}
+
   desktop:
     runs-on: ubuntu-latest
     defaults:

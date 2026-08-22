@@ -855,14 +855,17 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.local_addr().unwrap().port()
         };
-        let configuration = OAuthClientConfiguration {
-            issuer: "https://identity.example.com".to_owned(),
-            audience: "auru-pm".to_owned(),
-            client_id: "desktop-client".to_owned(),
-            required_scope: "openid".to_owned(),
-            redirect_uri: format!("http://127.0.0.1:{callback_port}/oauth/callback"),
-            flows: vec![OAuthFlow::AuthorizationCodePkce],
-        };
+        let configuration = OAuthClientConfiguration::new(
+            "https://identity.example.com",
+            "auru-pm",
+            "openid",
+            vec![auru_pm_protocol::OAuthClient {
+                kind: auru_pm_protocol::OAuthClientKind::Native,
+                client_id: "desktop-client".to_owned(),
+                redirect_uri: format!("http://127.0.0.1:{callback_port}/oauth/callback"),
+                flows: vec![OAuthFlow::AuthorizationCodePkce],
+            }],
+        );
         let metadata = AuthorizationServerMetadata {
             issuer: configuration.issuer.clone(),
             authorization_endpoint: "https://identity.example.com/authorize".to_owned(),

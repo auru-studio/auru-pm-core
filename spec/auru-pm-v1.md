@@ -45,12 +45,64 @@ An OAuth-enabled health response includes a public `authentication` descriptor:
 {
   "issuer": "https://identity.example.com",
   "audience": "auru-pm",
-  "client_id": "auru-pm-desktop",
   "required_scope": "openid",
+  "client_id": "auru-pm-desktop",
   "redirect_uri": "http://127.0.0.1:43827/oauth/callback",
-  "flows": ["authorization_code_pkce"]
+  "flows": ["authorization_code_pkce"],
+  "clients": [
+    {
+      "kind": "native",
+      "client_id": "auru-pm-desktop",
+      "redirect_uri": "http://127.0.0.1:43827/oauth/callback",
+      "flows": ["authorization_code_pkce"]
+    },
+    {
+      "kind": "browser",
+      "client_id": "auru-pm-dashboard",
+      "redirect_uri": "https://dashboard.example.com/oauth/callback",
+      "flows": ["authorization_code_pkce"]
+    }
+  ]
 }
 ```
+
+### Public clients
+
+A provider may register more than one public client, because a desktop app and
+a browser dashboard cannot share one. A `native` client redirects to an exact
+loopback URI; a `browser` client redirects to an `https` URL the single-page app
+serves itself. An identity provider's redirect allow-list is per client, so
+sharing a `client_id` between them means widening it past what either app needs.
+
+`clients` is the current form. The singular `client_id`, `redirect_uri`, and
+`flows` fields describe the **native** client and are still published, so a
+client written before `clients` existed keeps working. A provider should write
+both. A client reading either form should treat the other as equivalent:
+
+- Reading only singular fields — treat them as the sole `native` entry.
+- Reading only `clients` — take the singular values from its `native` entry.
+
+Most providers register one client and publish a single-entry list. `browser` is
+absent unless the provider actually serves a dashboard.
+
+### Cross-origin access
+
+A browser client cannot reach a provider that does not answer CORS preflights.
+A provider serving a dashboard must:
+
+- allow its dashboard origins explicitly — never `*`, since requests carry a
+  bearer token and a wildcard would let any site drive them from a signed-in
+  user's browser;
+- allow the `Authorization` and `Content-Type` request headers, and the `GET`,
+  `PUT`, `POST`, and `OPTIONS` methods;
+- answer `OPTIONS` **before** authentication and rate limiting. A preflight
+  carries no `Authorization` header, so a provider that authenticates it first
+  rejects every preflight and the real request is never sent.
+
+Credentialed CORS is not required and should not be enabled: tokens travel in
+`Authorization`, never in a cookie.
+
+A provider that serves only native clients should answer no preflights at all.
 
 Endpoint URLs are deliberately absent. Clients discover them from the exact
 issuer using OpenID Connect discovery or RFC 8414 metadata and reject issuer
@@ -248,6 +300,18 @@ uses the opaque handle as a fallback display name.
 Idempotently registers the human-facing metadata required by the account
 project list. It does not create a commit or move HEAD.
 
+**This is also how a project handle comes into existence.** Until a profile has
+been registered for it, every other project-scoped endpoint answers `404
+not_found` — including blob upload, which a client would otherwise reach for
+first. A client publishing a project for the first time therefore calls this
+before uploading anything.
+
+That ties project creation to `project_listing`. A provider that does not
+advertise the capability has no endpoint here that creates a handle, and must
+say in its own documentation how one is created — out-of-band provisioning, or
+handles that always exist. Treat a provider without `project_listing` as
+read-only unless it says otherwise.
+
 ```json
 {
   "display_name": "Night Drive",
@@ -310,6 +374,11 @@ in the provider's log.
 
 Body: full `Commit` JSON. Provider MUST verify `id` matches the canonical
 encoding of the other fields; a mismatch is `400 bad_request`.
+
+The commit's `author.provider_id` and `author.provider_user_id` must match what
+`GET /v1/me` returns for the presented token, and `display_name` and `email`
+must match when present. A client reads its identity once and reuses it rather
+than composing an author from local settings.
 
 Idempotent: re-posting an existing commit (same `id`) is `200 OK`,
 not an error.

@@ -420,7 +420,7 @@ fn load_stable_snapshot(path: &Path) -> Result<(ProjectSnapshot, Option<SystemTi
     const MAX_ATTEMPTS: usize = 3;
     for _ in 0..MAX_ATTEMPTS {
         let before = project_modified_at(path);
-        let snapshot = ProjectSnapshot::load(path)
+        let snapshot = auru_pm::snapshot_project(path)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
         let after = project_modified_at(path);
         if before == after {
@@ -963,8 +963,7 @@ fn restore_opaque_project(
     std::fs::create_dir_all(restore_root)
         .map_err(|error| format!("create restore folder: {error}"))?;
     let project_file = restore_root.join(file_name);
-    snapshot
-        .restore_to_path(&project_file)
+    auru_pm::restore_snapshot_to_path(snapshot, &project_file)
         .map_err(|error| format!("restore project: {error}"))?;
     Ok(RestoreResult {
         project_file,
@@ -1010,8 +1009,7 @@ async fn restore_dawproject(
     std::fs::create_dir_all(restore_root)
         .map_err(|error| format!("create restore folder: {error}"))?;
     let project_file = restore_root.join(file_name);
-    hydrated
-        .restore_to_path(&project_file)
+    auru_pm::restore_snapshot_to_path(&hydrated, &project_file)
         .map_err(|error| format!("restore project: {error}"))?;
     Ok(RestoreResult {
         project_file,
@@ -1073,8 +1071,7 @@ async fn restore_auru(
     let restored_snapshot = ProjectSnapshot::from_source_bytes(ProjectFormat::Auru, &encoded)
         .map_err(|error| format!("rebuild native project: {error}"))?;
     let project_file = restore_root.join(file_name);
-    restored_snapshot
-        .restore_to_path(&project_file)
+    auru_pm::restore_snapshot_to_path(&restored_snapshot, &project_file)
         .map_err(|error| format!("restore project: {error}"))?;
 
     Ok(RestoreResult {
@@ -1400,7 +1397,7 @@ fn hash_restore_tree(root: &Path) -> Result<Vec<(PathBuf, ContentHash)>, String>
                     .strip_prefix(root)
                     .map(Path::to_path_buf)
                     .map_err(|_| "staged restore escaped its root".to_owned())?;
-                let hash = ContentHash::of_file(&path)
+                let hash = auru_pm::hash_file(&path)
                     .map_err(|error| format!("BLAKE3 hash {}: {error}", path.display()))?;
                 hashes.push((relative, hash));
             }
@@ -1419,7 +1416,7 @@ fn verify_restore_tree(
 ) -> Result<(), String> {
     for (relative, expected) in expected_files {
         let path = root.join(relative);
-        let actual = ContentHash::of_file(&path)
+        let actual = auru_pm::hash_file(&path)
             .map_err(|error| format!("verify restored file {}: {error}", path.display()))?;
         if actual != *expected {
             return Err(format!(
@@ -1531,9 +1528,9 @@ fn copy_missing_entries(source: &Path, destination: &Path) -> Result<(), String>
         } else if metadata.is_file() {
             fs::copy(&source_path, &destination_path)
                 .map_err(|error| format!("preserve existing file: {error}"))?;
-            let expected = ContentHash::of_file(&source_path)
+            let expected = auru_pm::hash_file(&source_path)
                 .map_err(|error| format!("hash existing file: {error}"))?;
-            let actual = ContentHash::of_file(&destination_path)
+            let actual = auru_pm::hash_file(&destination_path)
                 .map_err(|error| format!("verify preserved file: {error}"))?;
             if actual != expected {
                 return Err(format!(
@@ -1579,8 +1576,8 @@ fn write_verified_new(path: &Path, bytes: &[u8]) -> Result<ContentHash, String> 
         return Err(format!("write {}: {error}", path.display()));
     }
     drop(file);
-    let actual = ContentHash::of_file(path)
-        .map_err(|error| format!("verify {}: {error}", path.display()))?;
+    let actual =
+        auru_pm::hash_file(path).map_err(|error| format!("verify {}: {error}", path.display()))?;
     if actual != expected {
         let _ = fs::remove_file(path);
         return Err(format!(
@@ -1847,8 +1844,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let project = temp.path().join("Song.dawproject");
         std::fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../crates/auru-pm/tests/fixtures/interchange/oracle-midi.dawproject"),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../../crates/auru-pm-kernel/tests/fixtures/interchange/oracle-midi.dawproject",
+            ),
             &project,
         )
         .expect("project");
@@ -1897,8 +1895,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let project = temp.path().join("Song.dawproject");
         std::fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../crates/auru-pm/tests/fixtures/interchange/oracle-midi.dawproject"),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../../crates/auru-pm-kernel/tests/fixtures/interchange/oracle-midi.dawproject",
+            ),
             &project,
         )
         .expect("project");

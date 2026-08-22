@@ -122,7 +122,7 @@ fn scenario() -> Scenario {
 
 /// Commit the project folder and return the commit.
 async fn commit(scenario: &Scenario) -> auru_pm::Commit {
-    let snapshot = ProjectSnapshot::load(&scenario.live_set).expect("snapshot");
+    let snapshot = auru_pm::snapshot_project(&scenario.live_set).expect("snapshot");
     let mut options = PushOptions::default();
     options.bundle_policy = scenario.policy.clone();
     let PushOutcome::Committed { commit_id, .. } = push_with_options(
@@ -187,7 +187,7 @@ async fn the_restored_live_set_should_point_inside_its_own_folder() {
         .expect("restore");
 
     // Re-read the restored set the same way Live would: gunzip, parse, walk.
-    let restored = ProjectSnapshot::load(&report.live_set).expect("load restored set");
+    let restored = auru_pm::snapshot_project(&report.live_set).expect("load restored set");
     let refs = ableton::read_asset_refs(&restored).expect("read refs");
 
     let outside = refs
@@ -235,7 +235,7 @@ async fn core_library_and_empty_references_should_survive_untouched() {
     );
     assert_eq!(report.rewrite.empty, 1, "the empty reference is not a file");
 
-    let restored = ProjectSnapshot::load(&report.live_set).expect("load restored set");
+    let restored = auru_pm::snapshot_project(&report.live_set).expect("load restored set");
     let refs = ableton::read_asset_refs(&restored).expect("read refs");
     assert!(
         refs.iter()
@@ -253,7 +253,7 @@ async fn the_restored_project_should_keep_its_musical_detail() {
         .await
         .expect("restore");
 
-    let restored = ProjectSnapshot::load(&report.live_set).expect("load restored set");
+    let restored = auru_pm::snapshot_project(&report.live_set).expect("load restored set");
     let metadata = ableton::read_metadata(&restored).expect("metadata");
 
     assert_eq!(metadata.tempo, Some(175.0));

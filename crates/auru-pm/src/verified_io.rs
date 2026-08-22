@@ -29,7 +29,7 @@ pub(crate) fn write_verified_new(path: &Path, bytes: &[u8]) -> Result<ContentHas
 }
 
 pub(crate) fn verify_file(path: &Path, expected: ContentHash) -> Result<()> {
-    let actual = ContentHash::of_file(path)?;
+    let actual = crate::project_io::hash_file(path)?;
     if actual == expected {
         return Ok(());
     }
@@ -61,6 +61,6 @@ mod tests {
 
         let hash = write_verified_new(&path, b"restored copy").unwrap();
 
-        assert_eq!(hash, ContentHash::of_file(&path).unwrap());
+        assert_eq!(hash, crate::project_io::hash_file(&path).unwrap());
     }
 }

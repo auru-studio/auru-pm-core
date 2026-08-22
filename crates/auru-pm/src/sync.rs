@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::ableton::BundlePolicy;
 use crate::ableton::validate::IntegrityProblem;
+use crate::asset_plan::plan_assets_with_report;
 use crate::canonical::compute_commit_id;
 use crate::commit::{AuthorIdentity, Commit, CommitId, TreeRef};
 use crate::error::{Error, Result};
@@ -18,7 +19,7 @@ use crate::merge::{ConflictResolution, ConflictedField, MergeOutcome, merge3, re
 use crate::project_format::ProjectSnapshot;
 use crate::project_info::ProjectInfo;
 use crate::provider::{HeadAdvance, ProjectProvider};
-use crate::sample_manifest::{SampleEntry, SampleManifest, plan_assets_with_report};
+use crate::sample_manifest::{SampleEntry, SampleManifest};
 use crate::sidecar::{Sidecar, Stash};
 
 /// Per-mirror push result.
@@ -1297,7 +1298,7 @@ mod tests {
         let sidecar = dir.path().join("song.dawproject-pm.json");
         let source = std::fs::read(
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/interchange/oracle-midi.dawproject"),
+                .join("../auru-pm-kernel/tests/fixtures/interchange/oracle-midi.dawproject"),
         )
         .unwrap();
         let snapshot =

@@ -21,6 +21,7 @@
 //! is gathered in alongside. See [`crate::ableton::refs`] for how those
 //! outside references are found and classified.
 
+use auru_pm_kernel::ableton::path_alias::{PathAlias, to_native_relative};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -90,95 +91,6 @@ impl Default for BundlePolicy {
             path_aliases: PathAlias::from_environment(),
         }
     }
-}
-
-/// Rewrite rule mapping a path prefix recorded in a Live Set onto a local one.
-///
-/// Live records absolute paths from whichever machine saved the set — a
-/// Windows volume such as `E:/Music Production/samples/…`. Opening that
-/// project from a Linux or macOS host, the same drive is mounted elsewhere.
-/// An alias bridges the two without the user re-linking every sample by hand.
-///
-/// Matching is case-insensitive on the prefix, because Windows paths are.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PathAlias {
-    /// Prefix as written in the Live Set, eg `E:/Music Production`.
-    pub from: String,
-    /// Local directory it corresponds to.
-    pub to: PathBuf,
-}
-
-impl PathAlias {
-    pub fn new(from: impl Into<String>, to: impl Into<PathBuf>) -> Self {
-        Self {
-            from: from.into(),
-            to: to.into(),
-        }
-    }
-
-    /// Read aliases from `AURU_PATH_ALIASES`.
-    ///
-    /// Format is `from=to`; separate multiple mappings with `;`:
-    ///
-    /// ```text
-    /// AURU_PATH_ALIASES='E:/Music Production=/mnt/ssd/Music Production'
-    /// ```
-    ///
-    /// `AURU_ABLETON_PATH_ALIASES` remains a fallback for existing setups.
-    /// The neutral name is used first because the same aliases resolve paths
-    /// recorded by Ableton, FL Studio, and future DAW adapters.
-    pub fn from_environment() -> Vec<Self> {
-        let raw = std::env::var("AURU_PATH_ALIASES")
-            .or_else(|_| std::env::var("AURU_ABLETON_PATH_ALIASES"));
-        let Ok(raw) = raw else {
-            return Vec::new();
-        };
-        parse_path_aliases(&raw)
-    }
-
-    /// Apply this alias to `path`, if it matches.
-    fn apply(&self, path: &str) -> Option<PathBuf> {
-        let from = self.from.trim_end_matches(['/', '\\']);
-        if path.len() < from.len() || !path[..from.len()].eq_ignore_ascii_case(from) {
-            return None;
-        }
-        let rest = path[from.len()..].trim_start_matches(['/', '\\']);
-        Some(self.to.join(to_native_relative(rest)))
-    }
-}
-
-fn parse_path_aliases(raw: &str) -> Vec<PathAlias> {
-    // `:` was the original Unix separator, despite Windows source paths also
-    // containing one. Preserve multi-entry values written in that form, but
-    // never split a drive prefix before its mapping's `=`.
-    let mut entries = Vec::new();
-    for semicolon_entry in raw.split(';') {
-        let mut start = 0;
-        let mut saw_equals = false;
-        for (index, character) in semicolon_entry.char_indices() {
-            match character {
-                '=' => saw_equals = true,
-                ':' if saw_equals && semicolon_entry[index + 1..].contains('=') => {
-                    entries.push(&semicolon_entry[start..index]);
-                    start = index + 1;
-                    saw_equals = false;
-                }
-                _ => {}
-            }
-        }
-        entries.push(&semicolon_entry[start..]);
-    }
-
-    entries
-        .into_iter()
-        .filter_map(|entry| {
-            // Split on the first `=`; a Windows prefix contains a colon,
-            // so `=` is the only safe separator within an entry.
-            let (from, to) = entry.split_once('=')?;
-            let (from, to) = (from.trim(), to.trim());
-            (!from.is_empty() && !to.is_empty()).then(|| PathAlias::new(from, to))
-        })
-        .collect()
 }
 
 /// An Ableton project folder on disk.
@@ -623,16 +535,6 @@ fn classify(relative: &str, policy: &BundlePolicy) -> Option<AssetKind> {
     }
 }
 
-/// Convert an Ableton-style relative path to a native one.
-///
-/// These always use `/`, even when written on Windows, and `..` segments are
-/// resolved lexically by [`normalize`] afterwards.
-fn to_native_relative(path: &str) -> PathBuf {
-    path.split(['/', '\\'])
-        .filter(|segment| !segment.is_empty())
-        .collect()
-}
-
 /// Fold `.` and `..` lexically.
 ///
 /// Not [`std::fs::canonicalize`]: that requires the path to exist, and this
@@ -872,38 +774,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_should_bridge_a_windows_path_through_an_alias() {
-        // The real case: a set saved on Windows referencing `E:/Music
-        // Production/samples/…`, opened where that volume is mounted at
-        // `/mnt/ssd/Music Production`.
-        let temp = tempfile::tempdir().expect("tempdir");
-        let project = temp.path().join("proj");
-        project_folder(&project);
-        let library = temp.path().join("mnt/ssd/Music Production/samples");
-        touch(&library.join("SPLICE/break.wav"), b"audio");
-
-        let bundle = AbletonBundle::detect(&project)
-            .expect("detect")
-            .expect("is a bundle");
-        let policy = BundlePolicy {
-            path_aliases: vec![PathAlias::new(
-                "E:/Music Production",
-                temp.path().join("mnt/ssd/Music Production"),
-            )],
-            ..BundlePolicy::default()
-        };
-
-        let found = bundle
-            .resolve(
-                "../../samples/SPLICE/break.wav",
-                "E:/Music Production/samples/SPLICE/break.wav",
-                &policy,
-            )
-            .expect("resolved through alias");
-        assert_eq!(fs::read(&found).expect("read"), b"audio");
-    }
-
-    #[test]
     fn resolve_should_never_treat_a_drive_path_as_relative_to_the_cwd() {
         // `Path::new("E:/x")` on Unix is a *relative* path named `E:`. If a
         // directory called `E:` happened to exist beside us, resolving it
@@ -936,16 +806,6 @@ mod tests {
                 .resolve("Samples/gone.wav", "", &BundlePolicy::default())
                 .is_none()
         );
-    }
-
-    #[test]
-    fn path_alias_should_match_case_insensitively_and_join_the_remainder() {
-        let alias = PathAlias::new("E:/Music Production", "/mnt/ssd/Music");
-        assert_eq!(
-            alias.apply("e:/MUSIC PRODUCTION/samples/a.wav"),
-            Some(PathBuf::from("/mnt/ssd/Music/samples/a.wav"))
-        );
-        assert_eq!(alias.apply("F:/Other/a.wav"), None);
     }
 
     #[test]
@@ -1148,23 +1008,34 @@ mod tests {
     }
 
     #[test]
-    fn path_aliases_should_parse_from_the_environment_format() {
-        // Parsed directly rather than through the env var, so the test does
-        // not depend on process-global state.
-        let aliases =
-            parse_path_aliases("E:/Music Production=/mnt/ssd/Music Production;D:\\Packs=/packs");
-        assert_eq!(aliases.len(), 2);
-        assert_eq!(aliases[0].from, "E:/Music Production");
-        assert_eq!(aliases[0].to, PathBuf::from("/mnt/ssd/Music Production"));
-        assert_eq!(aliases[1].from, "D:\\Packs");
-        assert_eq!(aliases[1].to, PathBuf::from("/packs"));
-    }
+    fn resolve_should_bridge_a_windows_path_through_an_alias() {
+        // The real case: a set saved on Windows referencing `E:/Music
+        // Production/samples/…`, opened where that volume is mounted at
+        // `/mnt/ssd/Music Production`.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("proj");
+        project_folder(&project);
+        let library = temp.path().join("mnt/ssd/Music Production/samples");
+        touch(&library.join("SPLICE/break.wav"), b"audio");
 
-    #[test]
-    fn legacy_colon_separated_path_aliases_should_still_parse() {
-        let aliases = parse_path_aliases("/old=/new:/another=/elsewhere");
-        assert_eq!(aliases.len(), 2);
-        assert_eq!(aliases[0], PathAlias::new("/old", "/new"));
-        assert_eq!(aliases[1], PathAlias::new("/another", "/elsewhere"));
+        let bundle = AbletonBundle::detect(&project)
+            .expect("detect")
+            .expect("is a bundle");
+        let policy = BundlePolicy {
+            path_aliases: vec![PathAlias::new(
+                "E:/Music Production",
+                temp.path().join("mnt/ssd/Music Production"),
+            )],
+            ..BundlePolicy::default()
+        };
+
+        let found = bundle
+            .resolve(
+                "../../samples/SPLICE/break.wav",
+                "E:/Music Production/samples/SPLICE/break.wav",
+                &policy,
+            )
+            .expect("resolved through alias");
+        assert_eq!(fs::read(&found).expect("read"), b"audio");
     }
 }

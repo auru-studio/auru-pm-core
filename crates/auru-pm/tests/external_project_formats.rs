@@ -9,7 +9,8 @@ use auru_pm::{
 };
 use tempfile::TempDir;
 
-const DAWPROJECT_FIXTURE: &[u8] = include_bytes!("fixtures/interchange/oracle-midi.dawproject");
+const DAWPROJECT_FIXTURE: &[u8] =
+    include_bytes!("../../auru-pm-kernel/tests/fixtures/interchange/oracle-midi.dawproject");
 const ABLETON_XML: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
 <Ableton MajorVersion="5" MinorVersion="12.0_12049" Creator="Ableton Live 12">
   <LiveSet>

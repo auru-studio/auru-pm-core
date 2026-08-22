@@ -1,0 +1,40 @@
+[package]
+name = "auru-pm-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Language bindings for the Auru PM kernel: wasm-bindgen for the browser, N-API for Node."
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+publish = false
+
+[lib]
+# `cdylib` is what both bindings load as; `rlib` keeps the shared surface
+# testable with an ordinary `cargo test`.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Browser build. Only meaningful for `--target wasm32-unknown-unknown`.
+wasm = ["dep:wasm-bindgen"]
+# Node and Electron build. Only meaningful for a native target.
+node = ["dep:napi", "dep:napi-derive", "dep:napi-build"]
+
+[dependencies]
+auru-pm-kernel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { version = "0.2", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+napi = { version = "3", default-features = false, features = ["napi8"], optional = true }
+napi-derive = { version = "3", optional = true }
+
+[build-dependencies]
+napi-build = { version = "2", optional = true }
+
+[lints]
+workspace = true

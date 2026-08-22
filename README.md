@@ -2,14 +2,28 @@
 
 Auru PM keeps DAW project history in a content-addressed store. It can snapshot native Auru projects, DAWproject archives, and gzip-compressed Ableton Live Sets; commits can live on disk or move over the `auru-pm-v1` HTTP protocol.
 
+The wire contract lives in [`spec/`](spec/) — the specification, an OpenAPI 3.1
+description, JSON Schema, and frozen conformance vectors for the canonical
+commit encoding. Anyone can implement a client or provider against it.
+
 The repository is usable without Auru. The DAW remains closed source, while this project owns the file adapters, commit model, merge code, HTTP client, server, and standalone desktop client.
 
 ## Repository layout
 
-- `crates/auru-pm` contains snapshots, commits, diffs, merges, the local store, and provider traits.
+- `crates/auru-pm-kernel` is the portable core: commit identity, project formats,
+  diff, and merge. No filesystem, no sockets, no keychain — it builds for
+  `wasm32-unknown-unknown`, which CI enforces, so a browser client can run it.
+- `crates/auru-pm` adds the machine: the local store, discovery, providers,
+  OAuth, the OS keychain, and the sync engine. It re-exports the kernel in full,
+  so `auru_pm::Commit` and friends resolve unchanged.
 - `crates/auru-pm-protocol` names the wire version and shared HTTP payloads.
 - `crates/auru-pm-client` is the client-facing entry point. It currently re-exports the HTTP provider from the core crate so downstream code has a stable dependency before that implementation moves.
 - `crates/auru-pm-server` runs the persistent reference HTTP server.
+- `sdk/typescript` is `@auru/pm`, the JavaScript client. TypeScript owns the
+  network; commit identity, project formats, diff, and merge come from
+  `auru-pm-kernel` compiled to wasm for the browser and to an N-API addon for
+  Node and Electron, so no runtime can drift from the canonical encoding.
+- `crates/auru-pm-ffi` holds those bindings — one shared surface, two wrappers.
 - `apps/auru-pm-ui` is the GPUI desktop client. It remains a standalone nested Cargo workspace until `gpui-audio-components` has its first public revision.
 
 Native `.auru` compatibility tests stay in the private Auru repository because they depend on its project model. Public tests use DAWproject, Ableton Live Set, and protocol fixtures.

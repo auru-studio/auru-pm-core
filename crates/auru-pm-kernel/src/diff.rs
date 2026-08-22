@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -392,7 +393,8 @@ fn fmt_length_beats(beats: f64) -> String {
 
 /// Whether a row represents an addition, a removal, or a modification.
 /// Drives icon/colour choice in the Save Version sidebar.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ChangeKind {
     Add,
     Remove,
@@ -400,7 +402,8 @@ pub enum ChangeKind {
 }
 
 /// Category of channel — used for the per-card AUDIO / MIDI / PLUGIN badge.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ChannelKind {
     Audio,
     Midi,
@@ -409,7 +412,8 @@ pub enum ChannelKind {
 }
 
 /// Specific kind of clip-level (or channel-level) change.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ChangeTag {
     Added,
     Removed,
@@ -463,7 +467,7 @@ impl ChangeTag {
 }
 
 /// One change row inside a channel card.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChangeRow {
     pub tag: ChangeTag,
     pub kind: ChangeKind,
@@ -477,7 +481,7 @@ pub struct ChangeRow {
 }
 
 /// One channel card in the Save Version right panel.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChannelDiff {
     pub name: String,
     pub kind: ChannelKind,
@@ -489,7 +493,7 @@ pub struct ChannelDiff {
 }
 
 /// Project-level structured diff. Returned by [`structured_diff`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProjectDiff {
     /// Project-wide changes that don't belong to any single channel
     /// (tempo, key/scale, automation, markers, notes).

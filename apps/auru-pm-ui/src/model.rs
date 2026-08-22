@@ -384,7 +384,7 @@ pub fn import_project(kind: ImportKind, path: &Path) -> Result<Project, String> 
         ));
     }
 
-    let snapshot = ProjectSnapshot::load(&project_file)
+    let snapshot = auru_pm::snapshot_project(&project_file)
         .map_err(|error| format!("Couldn't read {}. {error}", display_name(&project_file)))?;
 
     if snapshot.format() != kind.format() {
@@ -1132,7 +1132,7 @@ impl Project {
     /// gunzip and parse — so it is a free function the caller can run off the
     /// UI thread and hand back via [`Self::apply_detail`].
     pub fn detail_for(live_set: &Path) -> LoadedDetail {
-        let Ok(snapshot) = ProjectSnapshot::load(live_set) else {
+        let Ok(snapshot) = auru_pm::snapshot_project(live_set) else {
             return LoadedDetail::default();
         };
         let detail = ProjectInfo::from_snapshot_bytes(snapshot.as_bytes())
@@ -2788,7 +2788,7 @@ mod tests {
     #[test]
     fn dawproject_detail_should_come_from_the_real_file() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../crates/auru-pm/tests/fixtures/interchange/oracle-midi.dawproject");
+            .join("../../crates/auru-pm-kernel/tests/fixtures/interchange/oracle-midi.dawproject");
 
         let loaded = Project::detail_for(&path);
         let detail = loaded.detail.expect("detail");

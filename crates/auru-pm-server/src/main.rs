@@ -25,13 +25,14 @@ use auru_pm_protocol::{
 };
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::{Request, StatusCode, header};
+use axum::http::{HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tower_http::cors::CorsLayer;
 use tower_http::decompression::RequestDecompressionLayer;
 
 mod auth;
@@ -384,6 +385,25 @@ async fn enforce_rate_limit(
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
+/// Every public client a provider has registered, native first.
+fn oauth_clients(oauth: &config::OAuthConfig) -> Vec<auru_pm_protocol::OAuthClient> {
+    let mut clients = vec![auru_pm_protocol::OAuthClient {
+        kind: auru_pm_protocol::OAuthClientKind::Native,
+        client_id: oauth.desktop_client_id.clone(),
+        redirect_uri: oauth.redirect_uri.clone(),
+        flows: oauth.flows.clone(),
+    }];
+    if let Some(browser) = &oauth.browser_client {
+        clients.push(auru_pm_protocol::OAuthClient {
+            kind: auru_pm_protocol::OAuthClientKind::Browser,
+            client_id: browser.client_id.clone(),
+            redirect_uri: browser.redirect_uri.clone(),
+            flows: browser.flows.clone(),
+        });
+    }
+    clients
+}
+
 #[derive(Clone)]
 struct HealthDocument(HealthResponse<Value>);
 
@@ -392,14 +412,14 @@ impl HealthDocument {
         let (authentication, auth_methods) = match &config.authentication {
             config::AuthenticationConfig::None { .. } => (None, json!(["none"])),
             config::AuthenticationConfig::OAuth(oauth) => (
-                Some(OAuthClientConfiguration {
-                    issuer: oauth.issuer.clone(),
-                    audience: oauth.audience.clone(),
-                    client_id: oauth.desktop_client_id.clone(),
-                    required_scope: oauth.required_scope.clone(),
-                    redirect_uri: oauth.redirect_uri.clone(),
-                    flows: oauth.flows.clone(),
-                }),
+                // `new` derives the singular compatibility fields from the
+                // native entry, so the two forms cannot disagree.
+                Some(OAuthClientConfiguration::new(
+                    oauth.issuer.clone(),
+                    oauth.audience.clone(),
+                    oauth.required_scope.clone(),
+                    oauth_clients(oauth),
+                )),
                 Value::Array(
                     oauth
                         .flows
@@ -902,11 +922,49 @@ fn app_with_auth(db: SharedDb, requests_per_minute: u32, auth: auth::AuthState) 
     )
 }
 
+/// The CORS layer for `allowed_origins`, or `None` when the list is empty.
+///
+/// `None` rather than an empty allow-list on purpose: a server with no browser
+/// dashboard should not answer preflights at all, which is also exactly the
+/// behaviour every existing deployment already has.
+///
+/// Credentials are deliberately not allowed. The dashboard holds its access
+/// token in memory and sends it in `Authorization`; it never relies on a
+/// cookie, so enabling `Access-Control-Allow-Credentials` would widen the
+/// server's exposure without giving the client anything.
+fn cors_layer(allowed_origins: &[String]) -> Option<CorsLayer> {
+    let origins: Vec<HeaderValue> = allowed_origins
+        .iter()
+        .filter_map(|origin| origin.parse().ok())
+        .collect();
+    if origins.is_empty() {
+        return None;
+    }
+    Some(
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([Method::GET, Method::PUT, Method::POST, Method::OPTIONS])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+            .max_age(Duration::from_secs(600)),
+    )
+}
+
+#[cfg(test)]
 fn app_with_auth_and_health(
     db: SharedDb,
     requests_per_minute: u32,
     auth: auth::AuthState,
     health: HealthDocument,
+) -> Router {
+    app_with_auth_health_and_cors(db, requests_per_minute, auth, health, None)
+}
+
+fn app_with_auth_health_and_cors(
+    db: SharedDb,
+    requests_per_minute: u32,
+    auth: auth::AuthState,
+    health: HealthDocument,
+    cors: Option<CorsLayer>,
 ) -> Router {
     let limiter = Arc::new(RateLimiter::new(requests_per_minute));
     let protected = Router::new()
@@ -924,7 +982,7 @@ fn app_with_auth_and_health(
             put(put_blob).get(get_blob),
         )
         .layer(middleware::from_fn_with_state(auth, auth::require_auth));
-    Router::new()
+    let router = Router::new()
         .route("/v1/health", get(get_health))
         .merge(protected)
         // Unwrap `Content-Encoding: gzip` request bodies before they reach a
@@ -933,8 +991,16 @@ fn app_with_auth_and_health(
         // `/v1/health`; clients only compress when they have seen that.
         .layer(RequestDecompressionLayer::new().gzip(true))
         .layer(middleware::from_fn_with_state(limiter, enforce_rate_limit))
-        .layer(Extension(health))
-        .with_state(db)
+        .layer(Extension(health));
+    // CORS goes outermost, so a preflight is answered before auth or the rate
+    // limiter can reject it. A browser sends `OPTIONS` without the
+    // `Authorization` header, so a preflight behind auth always fails — and a
+    // failed preflight means the real request is never sent at all.
+    match cors {
+        Some(cors) => router.layer(cors),
+        None => router,
+    }
+    .with_state(db)
 }
 
 #[tokio::main]
@@ -994,11 +1060,12 @@ async fn main() {
     let auth = auth::build_auth_state(&config.provider_id, &config.authentication)
         .await
         .unwrap_or_else(|error| panic!("initialize authentication: {error}"));
-    let app = app_with_auth_and_health(
+    let app = app_with_auth_health_and_cors(
         db,
         config.requests_per_minute,
         auth,
         HealthDocument::from_config(&config),
+        cors_layer(&config.allowed_origins),
     );
 
     println!(
@@ -1007,6 +1074,14 @@ async fn main() {
         config.data_dir.display(),
         config.requests_per_minute
     );
+    if config.allowed_origins.is_empty() {
+        println!("cross-origin browser access: disabled (allowed_origins is empty)");
+    } else {
+        println!(
+            "cross-origin browser access: {}",
+            config.allowed_origins.join(", ")
+        );
+    }
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .expect("server address should be available");
@@ -1580,6 +1655,214 @@ strategy = "jwt"
                 .and_then(|project| project.history_floor.as_deref())
                 .map(str::to_owned),
             Some("second".to_owned())
+        );
+    }
+}
+
+#[cfg(test)]
+mod browser_access_tests {
+    //! `clients` and CORS: what a browser dashboard needs from a provider.
+
+    use super::*;
+    use auru_pm_protocol::{OAuthClientConfiguration, OAuthClientKind};
+    use tower::ServiceExt as _;
+
+    struct RejectAll;
+
+    #[async_trait::async_trait]
+    impl auth::TokenVerifier for RejectAll {
+        async fn verify(&self, _token: &str) -> Result<auth::TokenIdentity, auth::AuthError> {
+            Err(auth::AuthError::InvalidToken)
+        }
+    }
+
+    const WITH_BROWSER: &str = r#"
+version = 1
+provider_id = "studio-pm"
+public_base_url = "https://pm.example.com"
+allowed_origins = ["https://dashboard.example.com"]
+[authentication]
+mode = "oauth"
+issuer = "https://identity.example.com"
+audience = "auru-pm"
+desktop_client_id = "desktop"
+redirect_uri = "http://127.0.0.1:43827/oauth/callback"
+[authentication.browser_client]
+client_id = "dashboard"
+redirect_uri = "https://dashboard.example.com/oauth/callback"
+[authentication.validation]
+strategy = "jwt"
+"#;
+
+    fn app_for(config: &config::ServerConfig) -> Router {
+        app_with_auth_health_and_cors(
+            Arc::new(Mutex::new(Db::default())),
+            600,
+            auth::AuthState::oauth("studio-pm", Arc::new(RejectAll)),
+            HealthDocument::from_config(config),
+            cors_layer(&config.allowed_origins),
+        )
+    }
+
+    async fn health_of(config: &config::ServerConfig) -> OAuthClientConfiguration {
+        let response = app_for(config)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice::<HealthResponse<Value>>(&body)
+            .unwrap()
+            .authentication
+            .expect("authentication descriptor")
+    }
+
+    #[tokio::test]
+    async fn health_should_publish_both_registered_clients() {
+        let config = config::ServerConfig::from_toml(WITH_BROWSER).unwrap();
+        let authentication = health_of(&config).await;
+
+        let native = authentication.client(OAuthClientKind::Native).unwrap();
+        assert_eq!(native.client_id, "desktop");
+        assert_eq!(native.redirect_uri, "http://127.0.0.1:43827/oauth/callback");
+
+        let browser = authentication.browser_client().unwrap();
+        assert_eq!(browser.client_id, "dashboard");
+        assert_eq!(
+            browser.redirect_uri,
+            "https://dashboard.example.com/oauth/callback"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_should_still_carry_the_singular_fields_for_older_clients() {
+        // A client built before `clients` existed reads these and must still
+        // find the native registration where it always was.
+        let config = config::ServerConfig::from_toml(WITH_BROWSER).unwrap();
+        let authentication = health_of(&config).await;
+        assert_eq!(authentication.client_id, "desktop");
+        assert_eq!(
+            authentication.redirect_uri,
+            "http://127.0.0.1:43827/oauth/callback"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_without_a_dashboard_publishes_only_the_native_client() {
+        let config = config::ServerConfig::from_toml(
+            r#"
+version = 1
+provider_id = "studio-pm"
+public_base_url = "https://pm.example.com"
+[authentication]
+mode = "oauth"
+issuer = "https://identity.example.com"
+audience = "auru-pm"
+desktop_client_id = "desktop"
+redirect_uri = "http://127.0.0.1:43827/oauth/callback"
+[authentication.validation]
+strategy = "jwt"
+"#,
+        )
+        .unwrap();
+        let authentication = health_of(&config).await;
+        assert_eq!(authentication.clients.len(), 1);
+        assert!(authentication.browser_client().is_none());
+    }
+
+    #[tokio::test]
+    async fn preflight_should_succeed_for_a_configured_origin_without_a_token() {
+        // The browser sends OPTIONS with no Authorization header. If auth or
+        // the rate limiter saw it first, the preflight would fail and the real
+        // request would never be sent.
+        let config = config::ServerConfig::from_toml(WITH_BROWSER).unwrap();
+        let response = app_for(&config)
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/v1/projects")
+                    .header("origin", "https://dashboard.example.com")
+                    .header("access-control-request-method", "GET")
+                    .header("access-control-request-headers", "authorization")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.status().is_success(), "{:?}", response.status());
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get("access-control-allow-origin")
+                .map(|value| value.to_str().unwrap()),
+            Some("https://dashboard.example.com")
+        );
+        assert!(
+            headers
+                .get("access-control-allow-headers")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("authorization")
+        );
+        // Tokens live in memory and travel in `Authorization`, never a cookie,
+        // so credentialed CORS is deliberately not enabled.
+        assert!(headers.get("access-control-allow-credentials").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_origin_is_not_granted_access() {
+        let config = config::ServerConfig::from_toml(WITH_BROWSER).unwrap();
+        let response = app_for(&config)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/health")
+                    .header("origin", "https://attacker.example.com")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn no_cors_layer_at_all_when_no_origins_are_configured() {
+        let config = config::ServerConfig::unauthenticated_legacy(
+            SocketAddr::from(([127, 0, 0, 1], 4242)),
+            PathBuf::from("auru-pm-server-data"),
+            600,
+        );
+        assert!(cors_layer(&config.allowed_origins).is_none());
+
+        let response = app_for(&config)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/health")
+                    .header("origin", "https://dashboard.example.com")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
         );
     }
 }

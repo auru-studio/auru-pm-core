@@ -9,6 +9,7 @@ and any implementation disagree, this directory is correct.
 | [`openapi.yaml`](./openapi.yaml) | OpenAPI 3.1 for the HTTP surface — 13 operations, 27 schemas. |
 | [`schemas/commit.schema.json`](./schemas/commit.schema.json) | Standalone JSON Schema for `Commit`. Separate from the OpenAPI because canonical encoding is a hashing contract, not an HTTP one. |
 | [`vectors/commit-encoding.json`](./vectors/commit-encoding.json) | Frozen conformance cases: commit in, canonical bytes out, resulting id. |
+| [`conformance/verify-vectors.mjs`](./conformance/verify-vectors.mjs) | Runs the vectors against any JavaScript-reachable implementation. |
 
 ## Writing an implementation
 
@@ -44,3 +45,12 @@ regenerate with `UPDATE_SPEC_VECTORS=1`.
 ```sh
 npx @redocly/cli lint spec/openapi.yaml
 ```
+
+Any binding reachable from JavaScript can be checked against the same cases:
+
+```sh
+node spec/conformance/verify-vectors.mjs path/to/binding.js
+```
+
+CI runs it against both the wasm build and the N-API addon. They must agree with
+the Rust implementation and with each other.

@@ -17,7 +17,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path};
 use std::sync::Arc;
@@ -87,7 +86,7 @@ impl ProjectFormat {
         }
     }
 
-    fn detect(path: &Path, source: &[u8]) -> Result<Self> {
+    pub fn detect(path: &Path, source: &[u8]) -> Result<Self> {
         if let Some(format) = Self::from_path(path) {
             return Ok(format);
         }
@@ -132,13 +131,14 @@ impl fmt::Display for ProjectFormat {
 
 /// A project normalized into canonical JSON bytes for the PM snapshot CAS.
 ///
-/// Use [`Self::load`] for a project on disk, pass [`Self::as_bytes`] to a push
-/// API, and construct [`crate::PushOptions`] with
-/// [`crate::PushOptions::for_snapshot`] so detached DAWproject resources travel
-/// with it. Use [`Self::restore_to_path`] when checking out an old version.
+/// Build one from project bytes with [`Self::from_source_bytes`] and pass
+/// [`Self::as_bytes`] to a push API. Anything involving a path lives a layer
+/// up, in `auru-pm`: `snapshot_project` to read a project file,
+/// `restore_snapshot_to_path` to write one back, and `PushOptions::for_snapshot`
+/// so detached DAWproject resources travel with it.
 ///
 /// ```
-/// use auru_pm::{ProjectFormat, ProjectSnapshot};
+/// use auru_pm_kernel::{ProjectFormat, ProjectSnapshot};
 ///
 /// let snapshot = ProjectSnapshot::from_source_bytes(
 ///     ProjectFormat::Auru,
@@ -146,7 +146,7 @@ impl fmt::Display for ProjectFormat {
 /// )?;
 /// assert_eq!(snapshot.format(), ProjectFormat::Auru);
 /// assert!(snapshot.as_bytes().starts_with(b"{"));
-/// # Ok::<(), auru_pm::Error>(())
+/// # Ok::<(), auru_pm_kernel::Error>(())
 /// ```
 #[derive(Clone)]
 pub struct ProjectSnapshot {
@@ -167,13 +167,6 @@ impl fmt::Debug for ProjectSnapshot {
 }
 
 impl ProjectSnapshot {
-    /// Read and normalize a supported project file.
-    pub fn load(path: &Path) -> Result<Self> {
-        let source = fs::read(path)?;
-        let format = ProjectFormat::detect(path, &source)?;
-        Self::from_source_bytes(format, &source)
-    }
-
     /// Normalize source project bytes of a known format.
     pub fn from_source_bytes(format: ProjectFormat, source: &[u8]) -> Result<Self> {
         let (value, detached_resources) = match format {
@@ -237,7 +230,7 @@ impl ProjectSnapshot {
         self.canonical_bytes
     }
 
-    pub(crate) fn detached_resources_handle(&self) -> Arc<BTreeMap<String, Vec<u8>>> {
+    pub fn detached_resources_handle(&self) -> Arc<BTreeMap<String, Vec<u8>>> {
         Arc::clone(&self.detached_resources)
     }
 
@@ -246,7 +239,7 @@ impl ProjectSnapshot {
     /// `Ok(None)` for native Auru and opaque Bitwig projects. Readers for the
     /// XML-backed external formats go through here rather than re-parsing the
     /// canonical bytes themselves.
-    pub(crate) fn portable(&self) -> Result<Option<PortableSnapshot>> {
+    pub fn portable(&self) -> Result<Option<PortableSnapshot>> {
         if matches!(
             self.format,
             ProjectFormat::Auru | ProjectFormat::BitwigProject
@@ -264,7 +257,7 @@ impl ProjectSnapshot {
     /// Ableton `FileRef` at a gathered copy of its file on restore; see
     /// [`crate::ableton::rewrite`]. Re-canonicalizing here means the result is
     /// indistinguishable from a snapshot of the rewritten project.
-    pub(crate) fn from_portable(portable: PortableSnapshot) -> Result<Self> {
+    pub fn from_portable(portable: PortableSnapshot) -> Result<Self> {
         portable.validate()?;
         let format = portable.format;
         let value = serde_json::to_value(portable)?;
@@ -318,39 +311,6 @@ impl ProjectSnapshot {
             }
         }
     }
-
-    /// Reconstruct the source project file at `path`.
-    pub fn restore_to_path(&self, path: &Path) -> Result<()> {
-        if let Some(destination_format) = ProjectFormat::from_path(path) {
-            if destination_format != self.format {
-                return Err(Error::ProjectFormat(format!(
-                    "cannot restore {} snapshot to '{}'; expected .{}",
-                    self.format,
-                    path.display(),
-                    self.format.extension()
-                )));
-            }
-        }
-        crate::verified_io::write_verified_new(path, &self.restore_bytes()?)?;
-        Ok(())
-    }
-}
-
-/// Read a project file and convert it to canonical PM snapshot JSON.
-pub fn snapshot_project(path: &Path) -> Result<ProjectSnapshot> {
-    ProjectSnapshot::load(path)
-}
-
-/// Reconstruct a project file from canonical PM snapshot JSON.
-///
-/// This byte-only convenience cannot restore a detached DAWproject v2
-/// snapshot fetched from a provider. Fetch its manifest resources, hydrate a
-/// [`ProjectSnapshot`] with [`crate::dawproject::hydrate_embedded_assets`], and
-/// call [`ProjectSnapshot::restore_to_path`] instead.
-pub fn restore_project(snapshot_bytes: &[u8], path: &Path) -> Result<ProjectFormat> {
-    let snapshot = ProjectSnapshot::from_canonical_bytes(snapshot_bytes)?;
-    snapshot.restore_to_path(path)?;
-    Ok(snapshot.format())
 }
 
 /// Wrapper the external formats normalize into.
@@ -359,14 +319,14 @@ pub fn restore_project(snapshot_bytes: &[u8], path: &Path) -> Result<ProjectForm
 /// can walk — and, on restore, rewrite — the XML tree without re-deriving it
 /// from raw JSON.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct PortableSnapshot {
-    pub(crate) auru_pm_snapshot: u32,
-    pub(crate) format: ProjectFormat,
-    pub(crate) project: XmlDocument,
+pub struct PortableSnapshot {
+    pub auru_pm_snapshot: u32,
+    pub format: ProjectFormat,
+    pub project: XmlDocument,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) metadata: Option<XmlDocument>,
+    pub metadata: Option<XmlDocument>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) resources: Vec<ArchiveResource>,
+    pub resources: Vec<ArchiveResource>,
 }
 
 /// Snapshot wrapper for formats Auru deliberately treats as opaque.
@@ -469,7 +429,7 @@ impl PortableSnapshot {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct ArchiveResource {
+pub struct ArchiveResource {
     /// Archive path doubles as the stable array identity for three-way merge.
     pub(crate) id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -481,8 +441,8 @@ pub(crate) struct ArchiveResource {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct XmlDocument {
-    pub(crate) root: XmlElement,
+pub struct XmlDocument {
+    pub root: XmlElement,
 }
 
 impl XmlDocument {
@@ -579,7 +539,7 @@ impl XmlDocument {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct XmlElement {
+pub struct XmlElement {
     pub(crate) tag: String,
     /// Duplicated from an `id`/`Id` attribute to give JSON array merge a
     /// stable identity. XML reconstruction uses the original attribute map.
@@ -747,7 +707,7 @@ impl XmlElement {
     }
 
     /// Direct child elements in document order, mutably.
-    pub(crate) fn child_elements_mut(&mut self) -> impl Iterator<Item = &mut Self> {
+    pub fn child_elements_mut(&mut self) -> impl Iterator<Item = &mut Self> {
         self.children.iter_mut().filter_map(|child| match child {
             XmlContent::Element(element) => Some(element),
             _ => None,
@@ -760,7 +720,7 @@ impl XmlElement {
     /// Writing through this rather than by hand keeps the duplicated `id`
     /// field consistent with the attribute map — see [`Self::from_start`] for
     /// why that duplication exists.
-    pub(crate) fn set_child_value(&mut self, tag: &str, value: impl Into<String>) {
+    pub fn set_child_value(&mut self, tag: &str, value: impl Into<String>) {
         let value = value.into();
         if let Some(child) = self.children.iter_mut().find_map(|child| match child {
             XmlContent::Element(element) if element.tag == tag => Some(element),
@@ -1354,34 +1314,6 @@ mod tests {
         let encoded = serde_json::to_string(&json).expect("JSON string");
         assert!(encoded.contains(r#""id":"7""#));
         assert!(encoded.contains(r#""Id":"7""#));
-    }
-
-    #[test]
-    fn mismatched_restore_extension_should_be_rejected() {
-        let snapshot = ProjectSnapshot::from_source_bytes(ProjectFormat::Auru, br#"{"version":8}"#)
-            .expect("valid Auru JSON");
-        let error = snapshot
-            .restore_to_path(Path::new("song.als"))
-            .expect_err("mismatched extension must fail");
-        assert!(error.to_string().contains("cannot restore Auru snapshot"));
-    }
-
-    #[test]
-    fn restoring_a_snapshot_should_never_overwrite_an_existing_file() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let destination = temp.path().join("song.auru");
-        std::fs::write(&destination, b"existing project").expect("existing project");
-        let snapshot = ProjectSnapshot::from_source_bytes(ProjectFormat::Auru, br#"{"version":8}"#)
-            .expect("valid Auru JSON");
-
-        snapshot
-            .restore_to_path(&destination)
-            .expect_err("an explicit collision choice is required above the core API");
-
-        assert_eq!(
-            std::fs::read(destination).expect("existing project"),
-            b"existing project"
-        );
     }
 
     #[test]

@@ -28,17 +28,167 @@ pub struct HealthResponse<C> {
 /// Endpoint URLs are deliberately absent: clients discover them from the
 /// issuer's RFC 8414 / OpenID Connect metadata instead of trusting duplicated
 /// configuration.
+///
+/// A provider may register more than one public client, because a desktop app
+/// and a browser dashboard cannot share one. A native client redirects to an
+/// exact loopback URI; a single-page app redirects to an `https` URL it serves
+/// itself. Identity providers treat those as separate registrations, so
+/// [`clients`](Self::clients) is a list and each entry names its
+/// [`OAuthClientKind`].
+///
+/// The singular `client_id` / `redirect_uri` / `flows` fields predate that list
+/// and describe the native client. They are still written, so a client built
+/// before `clients` existed keeps working, and still read, so a provider that
+/// publishes only the list is understood: whichever form arrives, both are
+/// populated after deserialization.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(from = "OAuthClientConfigurationWire")]
 pub struct OAuthClientConfiguration {
     pub issuer: String,
     pub audience: String,
-    pub client_id: String,
     pub required_scope: String,
+    /// Native client id. Equal to the [`OAuthClientKind::Native`] entry of
+    /// [`clients`](Self::clients).
+    pub client_id: String,
+    /// Native client redirect. An exact loopback URI.
+    pub redirect_uri: String,
+    /// Flows permitted for the native client.
+    pub flows: Vec<OAuthFlow>,
+    /// Every public client this provider has registered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clients: Vec<OAuthClient>,
+}
+
+impl OAuthClientConfiguration {
+    /// Build from the registered clients, deriving the compatibility fields.
+    ///
+    /// The only constructor worth using: building the struct literally makes it
+    /// possible to publish a `clients` list and singular fields that disagree,
+    /// which readers on either side of the change would resolve differently.
+    /// This runs the same normalization as deserialization, so there is exactly
+    /// one definition of the consistent form.
+    pub fn new(
+        issuer: impl Into<String>,
+        audience: impl Into<String>,
+        required_scope: impl Into<String>,
+        clients: Vec<OAuthClient>,
+    ) -> Self {
+        OAuthClientConfigurationWire {
+            issuer: issuer.into(),
+            audience: audience.into(),
+            required_scope: required_scope.into(),
+            client_id: None,
+            redirect_uri: None,
+            flows: None,
+            clients,
+        }
+        .into()
+    }
+
+    /// The client registration matching `kind`, if the provider published one.
+    pub fn client(&self, kind: OAuthClientKind) -> Option<&OAuthClient> {
+        self.clients.iter().find(|client| client.kind == kind)
+    }
+
+    /// The browser (single-page app) client, if this provider supports one.
+    ///
+    /// Absent is the normal case: a provider only serving a desktop app has no
+    /// reason to register a second client.
+    pub fn browser_client(&self) -> Option<&OAuthClient> {
+        self.client(OAuthClientKind::Browser)
+    }
+}
+
+/// One public client registered with the provider's identity provider.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OAuthClient {
+    pub kind: OAuthClientKind,
+    pub client_id: String,
     pub redirect_uri: String,
     pub flows: Vec<OAuthFlow>,
 }
 
-/// OAuth grants a provider permits its public desktop client to use.
+/// Which kind of public client a registration is for.
+///
+/// The distinction is not cosmetic: the two use different redirect URI rules
+/// and must not share a `client_id`, because an identity provider's redirect
+/// allow-list is per client.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthClientKind {
+    /// Desktop or CLI. Redirects to an exact `http://127.0.0.1:<port>/` URI.
+    Native,
+    /// Single-page app. Redirects to an `https` URL the app serves itself.
+    Browser,
+}
+
+/// Wire form, accepting either the singular fields or the `clients` list.
+///
+/// Kept private: callers see an [`OAuthClientConfiguration`] with both forms
+/// already reconciled, so nothing downstream has to ask which one arrived.
+#[derive(Deserialize)]
+struct OAuthClientConfigurationWire {
+    issuer: String,
+    audience: String,
+    required_scope: String,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    redirect_uri: Option<String>,
+    #[serde(default)]
+    flows: Option<Vec<OAuthFlow>>,
+    #[serde(default)]
+    clients: Vec<OAuthClient>,
+}
+
+impl From<OAuthClientConfigurationWire> for OAuthClientConfiguration {
+    fn from(wire: OAuthClientConfigurationWire) -> Self {
+        let native = wire
+            .clients
+            .iter()
+            .find(|client| client.kind == OAuthClientKind::Native)
+            .cloned();
+
+        // Whichever form the provider sent, fill in the other.
+        let client_id = wire
+            .client_id
+            .or_else(|| native.as_ref().map(|client| client.client_id.clone()))
+            .unwrap_or_default();
+        let redirect_uri = wire
+            .redirect_uri
+            .or_else(|| native.as_ref().map(|client| client.redirect_uri.clone()))
+            .unwrap_or_default();
+        let flows = wire
+            .flows
+            .or_else(|| native.as_ref().map(|client| client.flows.clone()))
+            .unwrap_or_default();
+
+        let mut clients = wire.clients;
+        if native.is_none() && !client_id.is_empty() {
+            clients.insert(
+                0,
+                OAuthClient {
+                    kind: OAuthClientKind::Native,
+                    client_id: client_id.clone(),
+                    redirect_uri: redirect_uri.clone(),
+                    flows: flows.clone(),
+                },
+            );
+        }
+
+        Self {
+            issuer: wire.issuer,
+            audience: wire.audience,
+            required_scope: wire.required_scope,
+            client_id,
+            redirect_uri,
+            flows,
+            clients,
+        }
+    }
+}
+
+/// OAuth grants a provider permits a public client to use.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OAuthFlow {
@@ -341,17 +491,20 @@ mod tests {
             provider_id: Some("studio-pm".to_owned()),
             name: Some("Studio PM".to_owned()),
             capabilities: serde_json::json!({}),
-            authentication: Some(OAuthClientConfiguration {
-                issuer: "https://auth.example.com".to_owned(),
-                audience: "auru-pm".to_owned(),
-                client_id: "auru-desktop".to_owned(),
-                required_scope: "openid".to_owned(),
-                redirect_uri: "http://127.0.0.1:43827/oauth/callback".to_owned(),
-                flows: vec![
-                    OAuthFlow::AuthorizationCodePkce,
-                    OAuthFlow::DeviceAuthorization,
-                ],
-            }),
+            authentication: Some(OAuthClientConfiguration::new(
+                "https://auth.example.com",
+                "auru-pm",
+                "openid",
+                vec![OAuthClient {
+                    kind: OAuthClientKind::Native,
+                    client_id: "auru-desktop".to_owned(),
+                    redirect_uri: "http://127.0.0.1:43827/oauth/callback".to_owned(),
+                    flows: vec![
+                        OAuthFlow::AuthorizationCodePkce,
+                        OAuthFlow::DeviceAuthorization,
+                    ],
+                }],
+            )),
         };
         let encoded = serde_json::to_string(&configured).expect("health response");
         let decoded: HealthResponse<serde_json::Value> =
@@ -362,5 +515,96 @@ mod tests {
             serde_json::from_str(r#"{"protocol":"auru-pm-v1","capabilities":{}}"#)
                 .expect("legacy health response");
         assert!(legacy.authentication.is_none());
+    }
+}
+
+#[cfg(test)]
+mod oauth_client_tests {
+    use super::*;
+
+    #[test]
+    fn a_provider_publishing_only_the_singular_fields_gains_a_native_entry() {
+        // What every server written before `clients` existed sends.
+        let json = r#"{
+            "issuer": "https://identity.example.com",
+            "audience": "auru-pm",
+            "client_id": "desktop",
+            "required_scope": "openid",
+            "redirect_uri": "http://127.0.0.1:43827/oauth/callback",
+            "flows": ["authorization_code_pkce"]
+        }"#;
+        let config: OAuthClientConfiguration = serde_json::from_str(json).unwrap();
+        let native = config.client(OAuthClientKind::Native).unwrap();
+        assert_eq!(native.client_id, "desktop");
+        assert_eq!(native.redirect_uri, "http://127.0.0.1:43827/oauth/callback");
+        assert_eq!(native.flows, vec![OAuthFlow::AuthorizationCodePkce]);
+        assert!(config.browser_client().is_none());
+    }
+
+    #[test]
+    fn a_provider_publishing_only_clients_fills_the_singular_fields() {
+        // What a third-party provider written against the new shape may send.
+        // The desktop client reads the singular fields, so they cannot be empty.
+        let json = r#"{
+            "issuer": "https://identity.example.com",
+            "audience": "auru-pm",
+            "required_scope": "openid",
+            "clients": [
+                {
+                    "kind": "browser",
+                    "client_id": "dashboard",
+                    "redirect_uri": "https://dashboard.example.com/oauth/callback",
+                    "flows": ["authorization_code_pkce"]
+                },
+                {
+                    "kind": "native",
+                    "client_id": "desktop",
+                    "redirect_uri": "http://127.0.0.1:43827/oauth/callback",
+                    "flows": ["authorization_code_pkce", "device_authorization"]
+                }
+            ]
+        }"#;
+        let config: OAuthClientConfiguration = serde_json::from_str(json).unwrap();
+        assert_eq!(config.client_id, "desktop");
+        assert_eq!(config.redirect_uri, "http://127.0.0.1:43827/oauth/callback");
+        assert_eq!(
+            config.flows,
+            vec![
+                OAuthFlow::AuthorizationCodePkce,
+                OAuthFlow::DeviceAuthorization
+            ]
+        );
+        assert_eq!(config.browser_client().unwrap().client_id, "dashboard");
+    }
+
+    #[test]
+    fn both_forms_survive_a_round_trip() {
+        let json = r#"{
+            "issuer": "https://identity.example.com",
+            "audience": "auru-pm",
+            "required_scope": "openid",
+            "client_id": "desktop",
+            "redirect_uri": "http://127.0.0.1:43827/oauth/callback",
+            "flows": ["authorization_code_pkce"],
+            "clients": [
+                {
+                    "kind": "native",
+                    "client_id": "desktop",
+                    "redirect_uri": "http://127.0.0.1:43827/oauth/callback",
+                    "flows": ["authorization_code_pkce"]
+                },
+                {
+                    "kind": "browser",
+                    "client_id": "dashboard",
+                    "redirect_uri": "https://dashboard.example.com/oauth/callback",
+                    "flows": ["authorization_code_pkce"]
+                }
+            ]
+        }"#;
+        let config: OAuthClientConfiguration = serde_json::from_str(json).unwrap();
+        let round_tripped: OAuthClientConfiguration =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(config, round_tripped);
+        assert_eq!(round_tripped.clients.len(), 2);
     }
 }

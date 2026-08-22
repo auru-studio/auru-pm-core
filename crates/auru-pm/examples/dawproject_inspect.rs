@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .nth(1)
         .map(PathBuf::from)
         .ok_or("pass the path to a .dawproject file")?;
-    let snapshot = ProjectSnapshot::load(&path)?;
+    let snapshot = auru_pm::snapshot_project(&path)?;
     if snapshot.format() != ProjectFormat::Dawproject {
         return Err(format!("{} is a {}", path.display(), snapshot.format()).into());
     }

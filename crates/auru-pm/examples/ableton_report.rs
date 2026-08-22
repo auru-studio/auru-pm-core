@@ -12,8 +12,8 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use auru_pm::ProjectFormat;
 use auru_pm::ableton::{self, RefClass};
-use auru_pm::{ProjectFormat, ProjectSnapshot};
 
 fn main() -> ExitCode {
     let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) else {
@@ -21,7 +21,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let snapshot = match ProjectSnapshot::load(&path) {
+    let snapshot = match auru_pm::snapshot_project(&path) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             eprintln!("could not read '{}': {error}", path.display());

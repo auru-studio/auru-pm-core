@@ -19,8 +19,8 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use auru_pm::ProjectFormat;
 use auru_pm::ableton::{self, BundlePolicy};
-use auru_pm::{ProjectFormat, ProjectSnapshot};
 
 fn main() -> ExitCode {
     let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) else {
@@ -37,7 +37,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let snapshot = match ProjectSnapshot::load(bundle.live_set()) {
+    let snapshot = match auru_pm::snapshot_project(bundle.live_set()) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             eprintln!("could not read '{}': {error}", bundle.live_set().display());

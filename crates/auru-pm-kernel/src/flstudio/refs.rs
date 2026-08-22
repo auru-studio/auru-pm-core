@@ -163,7 +163,7 @@ pub fn distinct(refs: &[AssetRef]) -> Vec<&AssetRef> {
         .collect()
 }
 
-fn classify(recorded: &str, expanded: &str) -> RefClass {
+pub fn classify(recorded: &str, expanded: &str) -> RefClass {
     if recorded.trim().is_empty() {
         return RefClass::Missing;
     }

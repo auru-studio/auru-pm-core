@@ -6,6 +6,13 @@ public_base_url = "https://pm.example.com"
 data_dir = "./auru-pm-server-data"
 requests_per_minute = 600
 
+# Browser origins allowed to call this server cross-origin. Empty by default,
+# which installs no CORS layer at all — leave it that way unless you actually
+# serve a browser dashboard. Never `*`: the dashboard authenticates with a
+# bearer token, and this list is what stops another site from driving requests
+# here from a signed-in user's browser. Plain http is accepted only on loopback.
+# allowed_origins = ["https://dashboard.example.com"]
+
 [authentication]
 mode = "oauth"
 # The exact issuer published by your OAuth 2.0 / OpenID Connect provider.
@@ -20,6 +27,15 @@ required_scope = "openid"
 # Register this exact redirect URI with the identity provider.
 redirect_uri = "http://127.0.0.1:43827/oauth/callback"
 flows = ["authorization_code_pkce"]
+
+# A browser dashboard needs its own registration: an identity provider's
+# redirect allow-list is per client, and a loopback callback and an https
+# single-page callback cannot share one entry without widening it past what
+# either app needs. Requires allowed_origins above.
+# [authentication.browser_client]
+# client_id = "auru-pm-dashboard"
+# redirect_uri = "https://dashboard.example.com/oauth/callback"
+# flows = ["authorization_code_pkce"]
 
 # Required only when enabling OAuth over a data directory created by an older
 # unauthenticated server. Set it to the provider subject that owns all existing
