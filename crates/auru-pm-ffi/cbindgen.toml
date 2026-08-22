@@ -1,0 +1,36 @@
+# The header is generated and checked in, and CI fails if regenerating changes
+# it — the same arrangement as the conformance vectors. A hand-written header
+# would drift from the Rust silently, and the symptom would be memory
+# corruption rather than a compile error.
+language = "C"
+header = """
+/*
+ * auru-pm C ABI.
+ *
+ * Generated from crates/auru-pm-ffi/src/capi.rs by cbindgen. Do not edit.
+ *
+ * Memory: every call returns an AuruBuffer that the caller must release with
+ * auru_pm_buffer_free, exactly once, and never with free(). Rust allocated it,
+ * so Rust has to release it.
+ *
+ * Errors: AuruBuffer.error is 0 on success, 1 when the buffer holds a UTF-8
+ * error message instead of a result.
+ */
+"""
+include_guard = "AURU_PM_H"
+autogen_warning = ""
+cpp_compat = true
+documentation = true
+documentation_style = "doxy"
+
+[export]
+prefix = ""
+
+[parse]
+parse_deps = false
+
+# No `[defines]`. Mapping the cfgs to macros would wrap every declaration in an
+# `#if` that a consumer then has to define, and this header only ever ships
+# beside a build that already has the feature on. cbindgen warns about the
+# unmapped cfgs; the warnings are expected and the output is unconditional,
+# which is what a consumer wants.

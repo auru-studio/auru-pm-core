@@ -1,0 +1,138 @@
+{
+  "cases": [
+    {
+      "hash": "blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+      "length": 0
+    },
+    {
+      "hash": "blake3:2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213",
+      "length": 1
+    },
+    {
+      "hash": "blake3:7b7015bb92cf0b318037702a6cdd81dee41224f734684c2c122cd6359cb1ee63",
+      "length": 2
+    },
+    {
+      "hash": "blake3:e1be4d7a8ab5560aa4199eea339849ba8e293d55ca0a81006726d184519e647f",
+      "length": 3
+    },
+    {
+      "hash": "blake3:bda80c7fe2db38be6387b35c870bd7728d67b7b6cc5eb9b0e5c7dcb21ea754c2",
+      "length": 31
+    },
+    {
+      "hash": "blake3:e528e95798037df410543d9f31e396ecdd458d71b157d6014398bae32fb56c65",
+      "length": 32
+    },
+    {
+      "hash": "blake3:e9bc37a594daad83be9470df7f7b3798297c3d834ce80ba85d6e207627b7db7b",
+      "length": 63
+    },
+    {
+      "hash": "blake3:4eed7141ea4a5cd4b788606bd23f46e212af9cacebacdc7d1f4c6dc7f2511b98",
+      "length": 64
+    },
+    {
+      "hash": "blake3:de1e5fa0be70df6d2be8fffd0e99ceaa8eb6e8c93a63f2d8d1c30ecb6b263dee",
+      "length": 65
+    },
+    {
+      "hash": "blake3:d81293fda863f008c09e92fc382a81f5a0b4a1251cba1634016a0f86a6bd640d",
+      "length": 127
+    },
+    {
+      "hash": "blake3:f17e570564b26578c33bb7f44643f539624b05df1a76c81f30acd548c44b45ef",
+      "length": 128
+    },
+    {
+      "hash": "blake3:683aaae9f3c5ba37eaaf072aed0f9e30bac0865137bae68b1fde4ca2aebdcb12",
+      "length": 129
+    },
+    {
+      "hash": "blake3:cb97b80a66306dd2d4f1ab7ff9fd17d3d62d88c974e8daf0ea9fbd0b1ae1b1c1",
+      "length": 255
+    },
+    {
+      "hash": "blake3:f462b63aae56ed9fb899ad8eb93aa35d3dd62773fda9c33bfe20f9dab5d3df5f",
+      "length": 256
+    },
+    {
+      "hash": "blake3:3d41df314e2c7af6919d994b391780a7d8abb9a57b1abf64e04ec5d49428788e",
+      "length": 257
+    },
+    {
+      "hash": "blake3:7469b385b5290a1011288fc80a7fdb8677497dbc1d3b6daf93667725f68708f5",
+      "length": 511
+    },
+    {
+      "hash": "blake3:87aa0321ee04decf72d6fe8d5799d6216db538c0da4a367d6d456643e9ea7994",
+      "length": 512
+    },
+    {
+      "hash": "blake3:8e89cd63966193dfaecf124fe5893bf609aba748067b321afadc974d58374498",
+      "length": 513
+    },
+    {
+      "hash": "blake3:10108970eeda3eb932baac1428c7a2163b0e924c9a9e25b35bba72b28f70bd11",
+      "length": 1023
+    },
+    {
+      "hash": "blake3:42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af7",
+      "length": 1024
+    },
+    {
+      "hash": "blake3:d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444",
+      "length": 1025
+    },
+    {
+      "hash": "blake3:58830fbf51a4423c573b164471690570e544cfe793bead46225664796b4b1467",
+      "length": 2047
+    },
+    {
+      "hash": "blake3:e776b6028c7cd22a4d0ba182a8bf62205d2ef576467e838ed6f2529b85fba24a",
+      "length": 2048
+    },
+    {
+      "hash": "blake3:5f4d72f40d7a5f82b15ca2b2e44b1de3c2ef86c426c95c1af0b6879522563030",
+      "length": 2049
+    },
+    {
+      "hash": "blake3:b98cb0ff3623be03326b373de6b9095218513e64f1ee2edd2525c7ad1e5cffd2",
+      "length": 3072
+    },
+    {
+      "hash": "blake3:7124b49501012f81cc7f11ca069ec9226cecb8a2c850cfe644e327d22d3e1cd3",
+      "length": 3073
+    },
+    {
+      "hash": "blake3:0cdbdde4d038f0509412a5d1c3b1fb767d5e8c8a0eb2aae963fd36d1f544791a",
+      "length": 4095
+    },
+    {
+      "hash": "blake3:015094013f57a5277b59d8475c0501042c0b642e531b0a1c8f58d2163229e969",
+      "length": 4096
+    },
+    {
+      "hash": "blake3:9b4052b38f1c5fc8b1f9ff7ac7b27cd242487b3d890d15c96a1c25b8aa0fb995",
+      "length": 4097
+    },
+    {
+      "hash": "blake3:aae792484c8efe4f19e2ca7d371d8c467ffb10748d8a5a1ae579948f718a2a63",
+      "length": 8192
+    },
+    {
+      "hash": "blake3:1dabe216be2578830263b049de1639f39f05a4da616b9b78c7a5e4e41662fd1f",
+      "length": 16385
+    },
+    {
+      "hash": "blake3:62b6960e1a44bcc1eb1a611a8d6235b6b4b78f32e7abc4fb4c6cdcce94895c47",
+      "length": 31744
+    },
+    {
+      "hash": "blake3:d93c23eedaf165a7e0be908ba86f1a7a520d568d2d13cde787c8580c5c72cc54",
+      "length": 100000
+    }
+  ],
+  "hash": "blake3, rendered as `blake3:<64 lowercase hex>`",
+  "input": "Byte i of an input of length n is `i % 251`, the pattern BLAKE3's own test suite uses. Lengths cover the 64-byte block, the 1024-byte chunk, and each point where the Merkle tree gains a level."
+}

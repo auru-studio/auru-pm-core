@@ -12,7 +12,9 @@ publish = false
 [lib]
 # `cdylib` is what both bindings load as; `rlib` keeps the shared surface
 # testable with an ordinary `cargo test`.
-crate-type = ["cdylib", "rlib"]
+# `staticlib` is what an iOS xcframework links; `cdylib` is what Node and
+# Android load; `rlib` keeps the shared surface testable with `cargo test`.
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 default = []
@@ -20,6 +22,12 @@ default = []
 wasm = ["dep:wasm-bindgen"]
 # Node and Electron build. Only meaningful for a native target.
 node = ["dep:napi", "dep:napi-derive", "dep:napi-build"]
+# C ABI, for Swift and anything else that speaks C. Used for the iOS
+# xcframework; the caller owns memory management, see `capi.rs`.
+capi = []
+# JNI, for Android. Loaded from `jniLibs`; the Java side is
+# `studio.auru.pm.Kernel`.
+jni = ["dep:jni"]
 
 [dependencies]
 auru-pm-kernel.workspace = true
@@ -32,6 +40,10 @@ wasm-bindgen = { version = "0.2", optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 napi = { version = "3", default-features = false, features = ["napi8"], optional = true }
 napi-derive = { version = "3", optional = true }
+# Pinned to 0.21 rather than 0.22: the newer release deprecates `JNIEnv` in
+# favour of a split `Env`/`EnvUnowned` API that is still settling, and this
+# binding should not be the place that shakes it out.
+jni = { version = "0.21", optional = true }
 
 [build-dependencies]
 napi-build = { version = "2", optional = true }

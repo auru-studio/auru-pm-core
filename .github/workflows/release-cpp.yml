@@ -1,0 +1,90 @@
+name: Release auru-pm (C++)
+
+# Tag-triggered and manual, like the other two. A published package version can
+# be removed from a private remote, but anything that already resolved it has
+# moved on — treat it as permanent.
+on:
+  push:
+    tags: ["cpp-v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and test the package without uploading
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: ubuntu-latest
+            name: linux-x64
+          - runs-on: ubuntu-24.04-arm
+            name: linux-arm64
+          - runs-on: macos-14
+            name: macos-arm64
+          - runs-on: macos-13
+            name: macos-x64
+          - runs-on: windows-latest
+            name: windows-x64
+    runs-on: ${{ matrix.runs-on }}
+    defaults:
+      run:
+        working-directory: sdk/cpp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "conan>=2.0,<3"
+      - run: conan profile detect --force
+
+      - name: Check the tag matches the recipe version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tagged="${GITHUB_REF_NAME#cpp-v}"
+          declared="$(conan inspect . --format=json | python -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+          if [ "$tagged" != "$declared" ]; then
+            echo "tag $tagged does not match recipe version $declared" >&2
+            exit 1
+          fi
+
+      # test_package runs as part of `create`, so a binary that cannot
+      # reproduce the published commit-encoding vector never gets uploaded.
+      - name: Build and test the package
+        run: conan create . --build=missing
+      - name: Build and test with the libcurl adapter
+        run: conan create . -o "&:with_curl=True" --build=missing
+
+      - name: Upload to the remote
+        if: ${{ !inputs.dry_run }}
+        shell: bash
+        env:
+          CONAN_REMOTE_URL: ${{ secrets.CONAN_REMOTE_URL }}
+          CONAN_REMOTE_USER: ${{ secrets.CONAN_REMOTE_USER }}
+          CONAN_REMOTE_PASSWORD: ${{ secrets.CONAN_REMOTE_PASSWORD }}
+        run: |
+          conan remote add auru "$CONAN_REMOTE_URL" --force
+          conan remote login auru "$CONAN_REMOTE_USER" --password "$CONAN_REMOTE_PASSWORD"
+          conan upload "auru-pm/*" --remote=auru --confirm
+
+  # ConanCenter is not automated on purpose: submitting there is a pull request
+  # against conan-center-index, reviewed by people, and it should be opened
+  # deliberately rather than by a tag push. This job only produces the recipe
+  # exactly as it would be submitted, so the diff is easy to prepare.
+  conancenter-bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conan-recipe
+          path: |
+            sdk/cpp/conanfile.py
+            sdk/cpp/test_package

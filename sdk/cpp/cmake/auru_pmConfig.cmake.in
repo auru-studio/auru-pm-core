@@ -1,0 +1,13 @@
+@PACKAGE_INIT@
+
+# The core has no dependencies. The optional libcurl adapter does, and an
+# exported target that referenced CURL::libcurl without this would fail in the
+# consumer's configure step rather than here.
+if(@AURU_PM_WITH_CURL@)
+    include(CMakeFindDependencyMacro)
+    find_dependency(CURL)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/auru_pmTargets.cmake")
+
+check_required_components(auru_pm)

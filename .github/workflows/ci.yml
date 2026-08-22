@@ -182,6 +182,199 @@ jobs:
           name: auru-pm-${{ matrix.platform }}
           path: sdk/typescript/platforms/${{ matrix.platform }}
 
+  # The Java SDK is pure Java — it implements RFC 8785 and BLAKE3 itself rather
+  # than binding to the Rust kernel — so the conformance vectors are the only
+  # thing standing between it and a commit id no provider accepts.
+  sdk-java:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/java
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+      # The transport tests run against a real auru-pm-server.
+      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
+      - run: ./gradlew build --no-daemon
+      # The library claims zero runtime dependencies; this runs a consumer with
+      # nothing but auru-pm.jar on the classpath, which is the only way to know.
+      - run: ./consumer-check/run.sh
+      # Fails here rather than at upload if the POM or artifact set is missing
+      # something Maven Central insists on.
+      - run: ./gradlew verifyPublishable --no-daemon
+
+  # The C++ SDK is pure C++ — it implements RFC 8785, BLAKE3 and SHA-256 itself
+  # rather than binding to the Rust kernel — so the conformance vectors are the
+  # only thing standing between it and a commit id no provider accepts.
+  sdk-cpp:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: ubuntu-latest
+            compiler: gcc
+          - runs-on: ubuntu-latest
+            compiler: clang
+          - runs-on: macos-14
+            compiler: clang
+    runs-on: ${{ matrix.runs-on }}
+    defaults:
+      run:
+        working-directory: sdk/cpp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Select the compiler
+        run: |
+          if [ "${{ matrix.compiler }}" = "gcc" ]; then
+            echo "CC=gcc"  >> "$GITHUB_ENV"
+            echo "CXX=g++" >> "$GITHUB_ENV"
+          else
+            echo "CC=clang"    >> "$GITHUB_ENV"
+            echo "CXX=clang++" >> "$GITHUB_ENV"
+          fi
+      # Warnings are errors in this build, so both compilers have to be clean —
+      # they disagree often enough that checking one proves little.
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure
+      # The optional adapter has to keep compiling even though nothing depends
+      # on it.
+      - run: cmake -S . -B build-curl -DAURU_PM_WITH_CURL=ON && cmake --build build-curl
+      # The no-dependency claim, checked by giving it nothing else.
+      - run: ./consumer-check/run.sh
+
+  # Conan is how this library is distributed, so the recipe is tested rather
+  # than merely present. `conan create` runs test_package, which derives a
+  # commit id from the packaged library and compares it against the published
+  # vector — a package that built but encodes differently fails here.
+  sdk-cpp-conan:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/cpp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "conan>=2.0,<3"
+      - run: conan profile detect --force
+      - name: Package with the default options
+        run: conan create . --build=missing
+      # The optional adapter has a real dependency, and its install rules are a
+      # separate code path from the core's.
+      - name: Package with the libcurl adapter
+        run: conan create . -o "&:with_curl=True" --build=missing
+
+  # The Swift SDK is pure Swift — it implements RFC 8785, BLAKE3 and SHA-256
+  # itself — so the conformance vectors are the only thing standing between it
+  # and a commit id no provider accepts.
+  sdk-swift:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: macos-14
+          - runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runs-on }}
+    defaults:
+      run:
+        working-directory: sdk/swift
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Swift on Linux
+        if: runner.os == 'Linux'
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"
+      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
+      - run: swift build
+      - run: swift test
+      # Building the library proves it compiles; this proves it is usable as a
+      # dependency, through its public API only.
+      - run: ./consumer-check/run.sh
+
+  # The C header is generated from capi.rs and checked in. A hand-written one
+  # would drift silently, and the symptom would be memory corruption rather than
+  # a compile error — so regeneration must produce no diff.
+  capi-header:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cbindgen@0.29.4
+      - run: |
+          cbindgen --config crates/auru-pm-ffi/cbindgen.toml \
+            --crate auru-pm-ffi --output /tmp/auru_pm.h 2>/dev/null
+          diff -u crates/auru-pm-ffi/include/auru_pm.h /tmp/auru_pm.h
+
+  # The compute kernel on Apple platforms. `swift test` runs it on the macOS
+  # slice, which is the only place a wrong hash surfaces as a test failure
+  # rather than as a crash in a simulator.
+  kernel-apple:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: ./sdk/swift-kernel/scripts/build-xcframework.sh
+      - run: swift test --package-path sdk/swift-kernel
+      # Every slice a device or simulator would actually load.
+      - run: |
+          for slice in ios-arm64 ios-arm64-simulator macos-arm64; do
+            test -f "sdk/swift-kernel/Artifacts/AuruPMKernelFFI.xcframework/$slice/libauru_pm_ffi.a" \
+              || { echo "missing slice $slice" >&2; exit 1; }
+          done
+
+  # The compute kernel on Android. The JNI glue is verified on the host JVM,
+  # where a marshalling bug is a test failure; cross-compiling only changes
+  # which linker produced the library.
+  kernel-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify the JNI binding on the host JVM
+        run: ./gradlew test --tests 'studio.auru.pm.KernelTest' --no-daemon
+        working-directory: sdk/java
+      - name: Cross-compile the Android libraries
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: ./sdk/java-kernel-build.sh
+      - name: Check both ABIs are present and export the JNI symbols
+        run: |
+          for abi in arm64-v8a x86_64; do
+            so="sdk/java/native/jniLibs/$abi/libauru_pm_ffi.so"
+            test -f "$so" || { echo "missing $abi" >&2; exit 1; }
+            count=$(llvm-nm -D --defined-only "$so" | grep -c Java_studio_auru_pm_Kernel)
+            test "$count" -eq 12 || { echo "$abi exports $count JNI symbols, expected 12" >&2; exit 1; }
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: auru-pm-jnilibs
+          path: sdk/java/native/jniLibs
+
   desktop:
     runs-on: ubuntu-latest
     defaults:

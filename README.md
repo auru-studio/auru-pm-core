@@ -24,6 +24,23 @@ The repository is usable without Auru. The DAW remains closed source, while this
   `auru-pm-kernel` compiled to wasm for the browser and to an N-API addon for
   Node and Electron, so no runtime can drift from the canonical encoding.
 - `crates/auru-pm-ffi` holds those bindings — one shared surface, two wrappers.
+- `sdk/java` is `studio.auru:auru-pm`, a pure-Java client with no runtime
+  dependencies. It implements RFC 8785 and BLAKE3 itself rather than binding to
+  the kernel, so it stays a portable JAR; the published vectors are what keep it
+  byte-exact. It speaks the protocol and derives commit ids, but does not read
+  DAW project files.
+- `sdk/cpp` is a pure C++17 client with no dependencies — not even an HTTP
+  stack, which it takes as an interface so an application can plug in the one it
+  already has. Distributed with Conan; `find_package(auru_pm)` and `auru::pm`
+  work the same from a plain CMake install. Like the Java SDK it implements the
+  canonical rule itself and does not read DAW project files.
+- `sdk/swift` is a pure Swift client for Apple platforms and Linux, with no
+  dependencies. `async`/`await` throughout; `AuruClient` is an actor. Transport
+  is a protocol, with a `URLSession` adapter shipped separately.
+- `sdk/swift-kernel` and `sdk/java/native` carry the compute kernel to mobile:
+  an xcframework for iOS and macOS, `jniLibs` for Android, both built from
+  `auru-pm-ffi`. They add snapshot normalization, diff and merge on device —
+  the half the pure clients deliberately lack — and are optional everywhere.
 - `apps/auru-pm-ui` is the GPUI desktop client. It remains a standalone nested Cargo workspace until `gpui-audio-components` has its first public revision.
 
 Native `.auru` compatibility tests stay in the private Auru repository because they depend on its project model. Public tests use DAWproject, Ableton Live Set, and protocol fixtures.

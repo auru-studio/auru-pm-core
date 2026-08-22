@@ -21,3 +21,9 @@ pub mod wasm;
 
 #[cfg(all(feature = "node", not(target_arch = "wasm32")))]
 pub mod node;
+
+#[cfg(all(feature = "capi", not(target_arch = "wasm32")))]
+pub mod capi;
+
+#[cfg(all(feature = "jni", not(target_arch = "wasm32")))]
+pub mod jni;

@@ -9,6 +9,7 @@ and any implementation disagree, this directory is correct.
 | [`openapi.yaml`](./openapi.yaml) | OpenAPI 3.1 for the HTTP surface — 13 operations, 27 schemas. |
 | [`schemas/commit.schema.json`](./schemas/commit.schema.json) | Standalone JSON Schema for `Commit`. Separate from the OpenAPI because canonical encoding is a hashing contract, not an HTTP one. |
 | [`vectors/commit-encoding.json`](./vectors/commit-encoding.json) | Frozen conformance cases: commit in, canonical bytes out, resulting id. |
+| [`vectors/content-hash.json`](./vectors/content-hash.json) | BLAKE3 cases at every length where its structure changes — for an implementation that hashes for itself rather than binding to the Rust one. |
 | [`conformance/verify-vectors.mjs`](./conformance/verify-vectors.mjs) | Runs the vectors against any JavaScript-reachable implementation. |
 
 ## Writing an implementation
@@ -54,3 +55,18 @@ node spec/conformance/verify-vectors.mjs path/to/binding.js
 
 CI runs it against both the wasm build and the N-API addon. They must agree with
 the Rust implementation and with each other.
+
+An implementation that is not reachable from JavaScript runs the same vectors in
+its own test suite. The Java SDK does this — it implements RFC 8785 and BLAKE3
+itself rather than binding to the Rust kernel, so both vector files are what
+stand between it and a commit id no provider accepts:
+
+```sh
+cd sdk/java  && ./gradlew test
+cd sdk/cpp   && ctest --test-dir build
+cd sdk/swift && swift test
+```
+
+Four independent implementations of the canonical rule now agree on the same
+cases: Rust, Java, C++ and Swift. That is what makes the spec a contract rather
+than a description of one codebase.
