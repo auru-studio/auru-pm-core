@@ -203,6 +203,17 @@ public struct ProviderProject: Sendable, Equatable {
     /// Unix epoch seconds of the HEAD commit.
     public var updatedAt: Int64
 
+    /// Present for the same reason ``ProjectProfile``'s is: a public value type nothing outside
+    /// this module can build is one a caller cannot write a test against.
+    public init(
+        handle: String, head: ContentHash, profile: ProjectProfile? = nil, updatedAt: Int64
+    ) {
+        self.handle = handle
+        self.head = head
+        self.profile = profile
+        self.updatedAt = updatedAt
+    }
+
     init(json: JSON) throws {
         handle = try json.string("handle")
         head = try ContentHash(parsing: try json.string("head"))
