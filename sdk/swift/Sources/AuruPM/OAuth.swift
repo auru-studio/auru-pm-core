@@ -1,8 +1,18 @@
 import Foundation
 
-/// OAuth 2.0 Authorization Code with PKCE, for providers that advertise it.
+/// OAuth 2.0 for providers that advertise it: Authorization Code with PKCE, and
+/// the RFC 8628 device authorization grant.
 ///
-/// Two things here are deliberate and worth reading before changing them.
+/// The two differ in where the person authenticates. PKCE sends them to a
+/// browser this application launched and reads the answer off a redirect it is
+/// listening for, which needs a redirect URI the identity provider has been told
+/// to allow. The device grant sends them anywhere at all — another device, if
+/// they like — and learns the answer by polling, which needs no redirect and so
+/// no per-platform client registration. On a phone, where a loopback redirect is
+/// not available, that difference is the whole reason the device grant is the
+/// path that works.
+///
+/// Two more things are deliberate and worth reading before changing them.
 ///
 /// **Endpoints come from discovery, never from the provider's health
 /// document.** A provider publishes only its issuer; ``discover(issuer:transport:)``
@@ -24,15 +34,19 @@ public enum OAuth {
         public var authorizationEndpoint: String
         public var tokenEndpoint: String
         public var codeChallengeMethodsSupported: [String]
+        /// Present only when the provider publishes one; the device grant needs it.
+        public var deviceAuthorizationEndpoint: String?
 
         public init(
             issuer: String, authorizationEndpoint: String, tokenEndpoint: String,
-            codeChallengeMethodsSupported: [String] = []
+            codeChallengeMethodsSupported: [String] = [],
+            deviceAuthorizationEndpoint: String? = nil
         ) {
             self.issuer = issuer
             self.authorizationEndpoint = authorizationEndpoint
             self.tokenEndpoint = tokenEndpoint
             self.codeChallengeMethodsSupported = codeChallengeMethodsSupported
+            self.deviceAuthorizationEndpoint = deviceAuthorizationEndpoint
         }
     }
 
@@ -42,12 +56,27 @@ public enum OAuth {
         public var tokenType: String
         public var expiresIn: TimeInterval?
         public var scope: String?
+
+        public init(
+            token: String, tokenType: String = "bearer", expiresIn: TimeInterval? = nil,
+            scope: String? = nil
+        ) {
+            self.token = token
+            self.tokenType = tokenType
+            self.expiresIn = expiresIn
+            self.scope = scope
+        }
     }
 
     /// An access token together with its refresh token.
     public struct RefreshableToken: Sendable, Equatable {
         public var access: AccessToken
         public var refreshToken: String?
+
+        public init(access: AccessToken, refreshToken: String? = nil) {
+            self.access = access
+            self.refreshToken = refreshToken
+        }
     }
 
     /// A prepared authorization request.
@@ -128,7 +157,8 @@ public enum OAuth {
                 authorizationEndpoint: authorization,
                 tokenEndpoint: token,
                 codeChallengeMethodsSupported: (document["code_challenge_methods_supported"]?
-                    .arrayValue ?? []).compactMap(\.stringValue))
+                    .arrayValue ?? []).compactMap(\.stringValue),
+                deviceAuthorizationEndpoint: document["device_authorization_endpoint"]?.stringValue)
         }
 
         throw AuruError(
@@ -201,36 +231,250 @@ public enum OAuth {
     ) async throws -> RefreshableToken {
         // A public client has no secret. Sending one would mean it had been
         // shipped to wherever this code runs.
-        let body = form([
+        let body = [
             ("grant_type", "authorization_code"),
             ("code", code),
             ("redirect_uri", client.redirectURI),
             ("client_id", client.clientID),
             ("code_verifier", request.codeVerifier),
-        ])
+        ]
 
-        let response = try await transport.send(
+        let response = try await postForm(
+            to: metadata.tokenEndpoint, body: body, transport: transport)
+        let payload = (try? JSON.parse(response.body)) ?? .emptyObject
+
+        guard response.status / 100 == 2 else {
+            throw AuruError(
+                code: .unauthorized,
+                message: "token exchange failed: \(failureDetail(payload, response.status))")
+        }
+        return try readToken(payload)
+    }
+
+    // MARK: - Device authorization (RFC 8628)
+
+    /// A device authorization, as issued by the authorization server.
+    ///
+    /// Show ``userCode`` and ``verificationURI`` to the person signing in.
+    /// ``deviceCode`` is a secret used only to poll with, and must never be
+    /// displayed.
+    public struct DeviceAuthorization: Sendable, Equatable {
+        public var deviceCode: String
+        public var userCode: String
+        public var verificationURI: String
+        /// The verification URI with the code already in it — what a QR code should carry.
+        public var verificationURIComplete: String?
+        public var expiresIn: TimeInterval
+        public var interval: TimeInterval
+
+        public init(
+            deviceCode: String, userCode: String, verificationURI: String,
+            verificationURIComplete: String? = nil, expiresIn: TimeInterval,
+            interval: TimeInterval
+        ) {
+            self.deviceCode = deviceCode
+            self.userCode = userCode
+            self.verificationURI = verificationURI
+            self.verificationURIComplete = verificationURIComplete
+            self.expiresIn = expiresIn
+            self.interval = interval
+        }
+    }
+
+    /// The outcome of one poll.
+    ///
+    /// Only the two outcomes that are not failures appear here. Everything
+    /// terminal — the person refused, the code expired, the server rejected the
+    /// client — is thrown, because a caller that has to pattern-match on failure
+    /// to notice it will eventually forget to.
+    public enum DevicePollResult: Sendable, Equatable {
+        /// Nobody has approved it yet. Wait this long, then poll again.
+        case pending(retryAfter: TimeInterval)
+        /// Approved, and the token is here.
+        case authorized(RefreshableToken)
+    }
+
+    /// Ask the authorization server for a device code.
+    ///
+    /// Unlike the authorization-code flow this needs no redirect URI, no browser
+    /// the app can observe, and no PKCE verifier: the person authenticates
+    /// somewhere else entirely and this client learns about it by polling. That
+    /// is why it works on a phone with no client registration changes at all.
+    public static func beginDeviceAuthorization(
+        metadata: ServerMetadata, client: OAuthClient, scope: String, transport: any Transport
+    ) async throws -> DeviceAuthorization {
+
+        guard let endpoint = metadata.deviceAuthorizationEndpoint else {
+            throw AuruError(
+                code: .unsupported,
+                message: "\(metadata.issuer) publishes no device authorization endpoint")
+        }
+        guard client.flows.contains("device_authorization") else {
+            throw AuruError(
+                code: .unsupported,
+                message: "client \(client.clientID) is not registered for device_authorization")
+        }
+
+        let response = try await postForm(
+            to: endpoint, body: [("client_id", client.clientID), ("scope", scope)],
+            transport: transport)
+        let payload = (try? JSON.parse(response.body)) ?? .emptyObject
+
+        guard response.status / 100 == 2 else {
+            throw AuruError(
+                code: .unauthorized,
+                message:
+                    "device authorization failed: \(failureDetail(payload, response.status))")
+        }
+
+        func required(_ field: String) throws -> String {
+            guard let value = payload[field]?.stringValue else {
+                throw AuruError(
+                    code: .unauthorized,
+                    message: "the device authorization response carried no \(field)")
+            }
+            return value
+        }
+
+        return DeviceAuthorization(
+            deviceCode: try required("device_code"),
+            userCode: try required("user_code"),
+            verificationURI: try required("verification_uri"),
+            verificationURIComplete: payload["verification_uri_complete"]?.stringValue,
+            // RFC 8628 makes both optional. Its own defaults are the only honest
+            // guess, and guessing beats polling forever.
+            expiresIn: payload["expires_in"]?.intValue.map(TimeInterval.init) ?? 300,
+            interval: payload["interval"]?.intValue.map(TimeInterval.init) ?? 5)
+    }
+
+    /// Poll once for the token.
+    ///
+    /// - Parameter interval: how long the caller waited before this attempt —
+    ///   ``DeviceAuthorization/interval`` for the first poll, and thereafter
+    ///   whatever the previous `.pending` said. RFC 8628 widens the interval
+    ///   permanently once a server has answered `slow_down`, so a caller that
+    ///   keeps passing the original value will keep being told to slow down.
+    public static func pollDeviceAuthorization(
+        metadata: ServerMetadata, client: OAuthClient, authorization: DeviceAuthorization,
+        interval: TimeInterval, transport: any Transport
+    ) async throws -> DevicePollResult {
+
+        let response = try await postForm(
+            to: metadata.tokenEndpoint,
+            body: [
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("device_code", authorization.deviceCode),
+                ("client_id", client.clientID),
+            ],
+            transport: transport)
+        let payload = (try? JSON.parse(response.body)) ?? .emptyObject
+
+        // The body decides, not the status. RFC 8628 carries the pending signal
+        // in an OAuth error object, which OAuth 2.0 returns as 400 — but this
+        // protocol's own legacy device endpoint returns the identical object as
+        // 200. Reading the body first works for both; the status only matters
+        // when there is no error code in it to read.
+        if let error = payload["error"]?.stringValue {
+            switch error {
+            case "authorization_pending":
+                return .pending(retryAfter: interval)
+            case "slow_down":
+                return .pending(retryAfter: interval + 5)
+            case "access_denied":
+                throw AuruError(code: .unauthorized, message: "the sign-in request was refused")
+            case "expired_token":
+                throw AuruError(
+                    code: .unauthorized,
+                    message: "the sign-in code expired. Start again for a new one.")
+            default:
+                throw AuruError(
+                    code: .unauthorized,
+                    message:
+                        "device authorization failed: \(payload["error_description"]?.stringValue ?? error)"
+                )
+            }
+        }
+
+        guard response.status / 100 == 2 else {
+            throw AuruError(
+                code: .unauthorized,
+                message:
+                    "device authorization failed: \(failureDetail(payload, response.status))")
+        }
+        return .authorized(try readToken(payload))
+    }
+
+    /// Poll until the person approves, discarding the refresh token.
+    ///
+    /// Suspends for as long as the code is valid — minutes. Cancelling the task
+    /// abandons the wait.
+    public static func completeDeviceAuthorization(
+        metadata: ServerMetadata, client: OAuthClient, authorization: DeviceAuthorization,
+        transport: any Transport
+    ) async throws -> AccessToken {
+        try await completeDeviceAuthorizationWithRefresh(
+            metadata: metadata, client: client, authorization: authorization, transport: transport
+        ).access
+    }
+
+    /// Poll until the person approves, keeping the refresh token.
+    ///
+    /// Only for callers with a real secret store — the Keychain on Apple
+    /// platforms — for the reason given on
+    /// ``completeAuthorizationWithRefresh(metadata:client:request:code:transport:)``.
+    public static func completeDeviceAuthorizationWithRefresh(
+        metadata: ServerMetadata, client: OAuthClient, authorization: DeviceAuthorization,
+        transport: any Transport
+    ) async throws -> RefreshableToken {
+
+        let deadline = Date().addingTimeInterval(authorization.expiresIn)
+        var interval = authorization.interval
+
+        while true {
+            guard Date() < deadline else {
+                throw AuruError(
+                    code: .unauthorized,
+                    message: "the sign-in code expired. Start again for a new one.")
+            }
+            try await Task.sleep(nanoseconds: UInt64(max(0, interval) * 1_000_000_000))
+
+            switch try await pollDeviceAuthorization(
+                metadata: metadata, client: client, authorization: authorization,
+                interval: interval, transport: transport)
+            {
+            case .authorized(let token):
+                return token
+            case .pending(let retryAfter):
+                interval = retryAfter
+            }
+        }
+    }
+
+    // MARK: - Helpers
+
+    private static func postForm(
+        to url: String, body: [(String, String)], transport: any Transport
+    ) async throws -> HTTPResponse {
+        try await transport.send(
             HTTPRequest(
-                method: "POST", url: metadata.tokenEndpoint,
+                method: "POST", url: url,
                 headers: [
                     (name: "content-type", value: "application/x-www-form-urlencoded"),
                     (name: "accept", value: "application/json"),
                 ],
-                body: Data(body.utf8)))
+                body: Data(form(body).utf8)))
+    }
 
-        let payload = (try? JSON.parse(response.body)) ?? .emptyObject
+    private static func failureDetail(_ payload: JSON, _ status: Int) -> String {
+        payload["error_description"]?.stringValue ?? payload["error"]?.stringValue
+            ?? "HTTP \(status)"
+    }
 
-        guard response.status / 100 == 2 else {
-            let detail =
-                payload["error_description"]?.stringValue ?? payload["error"]?.stringValue
-                ?? "HTTP \(response.status)"
-            throw AuruError(code: .unauthorized, message: "token exchange failed: \(detail)")
-        }
+    private static func readToken(_ payload: JSON) throws -> RefreshableToken {
         guard let token = payload["access_token"]?.stringValue else {
             throw AuruError(
                 code: .unauthorized, message: "the token response carried no access_token")
         }
-
         return RefreshableToken(
             access: AccessToken(
                 token: token,
@@ -239,8 +483,6 @@ public enum OAuth {
                 scope: payload["scope"]?.stringValue),
             refreshToken: payload["refresh_token"]?.stringValue)
     }
-
-    // MARK: - Helpers
 
     /// Cryptographically secure bytes.
     ///
