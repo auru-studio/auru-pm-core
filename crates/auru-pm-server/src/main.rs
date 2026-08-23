@@ -3,6 +3,9 @@
 //! Usage:
 //!   cargo run -p auru-pm-server -- --port 4242 --data-dir ./server-data
 //!   cargo run -p auru-pm-server -- --config ./server.toml
+//!   cargo run -p auru-pm-server -- --tls           # https, self-signed
+//!   cargo run -p auru-pm-server -- --tls --listen 0.0.0.0:4242 \
+//!       --allow-insecure-non-loopback                # reachable from a device
 //!
 //! The no-config compatibility mode advertises `auth_methods: ["none"]` and
 //! is loopback-only. Deployments use versioned TOML and standards-based OAuth.
@@ -30,6 +33,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use axum_server::tls_rustls::RustlsConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tower_http::cors::CorsLayer;
@@ -37,6 +41,7 @@ use tower_http::decompression::RequestDecompressionLayer;
 
 mod auth;
 mod config;
+mod tls;
 
 // ── Shared state ─────────────────────────────────────────────────────────────
 
@@ -1003,6 +1008,45 @@ fn app_with_auth_health_and_cors(
     .with_state(db)
 }
 
+/// Print the URLs a phone or emulator can actually paste in.
+///
+/// Worth the lines because the alternative is a fifteen-second connect timeout
+/// with no hint of what to try instead. A loopback listener is not reachable
+/// from a device at all, and the emulator's `10.0.2.2` host alias works from
+/// some system images and silently drops from others — so the address that does
+/// work is spelled out here rather than left to a README the reader has already
+/// followed.
+fn print_device_addresses(config: &config::ServerConfig, secure: bool) {
+    let scheme = if secure { "https" } else { "http" };
+    let port = config.listen.port();
+    if config.listen.ip().is_loopback() {
+        println!(
+            "device access: none — this listener is loopback-only. Restart with `--listen 0.0.0.0:{port} --allow-insecure-non-loopback` to reach it from a device."
+        );
+        return;
+    }
+    let addresses = if config.listen.ip().is_unspecified() {
+        tls::interface_addresses()
+    } else {
+        vec![config.listen.ip().to_string()]
+    };
+    // IPv6 only: a URL would need brackets, and no device flow here uses one.
+    let reachable: Vec<String> = addresses
+        .iter()
+        .filter(|address| !address.contains(':'))
+        .map(|address| format!("{scheme}://{address}:{port}"))
+        .collect();
+    match reachable.split_first() {
+        Some((first, rest)) => {
+            println!("device access: {first}");
+            for address in rest {
+                println!("               {address}");
+            }
+        }
+        None => println!("device access: no non-loopback IPv4 address found on this machine"),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
@@ -1022,6 +1066,31 @@ async fn main() {
         .windows(2)
         .find(|window| window[0] == "--config")
         .map(|window| PathBuf::from(&window[1]));
+    let tls_certificate = args
+        .windows(2)
+        .find(|window| window[0] == "--tls-cert")
+        .map(|window| PathBuf::from(&window[1]));
+    let tls_private_key = args
+        .windows(2)
+        .find(|window| window[0] == "--tls-key")
+        .map(|window| PathBuf::from(&window[1]));
+    let tls_subject_alt_names: Vec<String> = args
+        .windows(2)
+        .filter(|window| window[0] == "--tls-san")
+        .map(|window| window[1].clone())
+        .collect();
+    let tls_requested = args.iter().any(|argument| argument == "--tls");
+    let listen_override: Option<SocketAddr> = args
+        .windows(2)
+        .find(|window| window[0] == "--listen")
+        .map(|window| {
+            window[1]
+                .parse()
+                .unwrap_or_else(|error| panic!("--listen {}: {error}", window[1]))
+        });
+    let allow_insecure_non_loopback = args
+        .iter()
+        .any(|argument| argument == "--allow-insecure-non-loopback");
     let mut config = if let Some(path) = config_path {
         let source = fs::read_to_string(&path).unwrap_or_else(|error| {
             panic!("read server configuration {}: {error}", path.display())
@@ -1038,14 +1107,48 @@ async fn main() {
             requests_per_minute_override.unwrap_or(600),
         )
     };
+    if let Some(listen) = listen_override {
+        config.listen = listen;
+    }
     if let Some(port) = port_override {
         config.listen.set_port(port);
+    }
+    if allow_insecure_non_loopback {
+        // Only meaningful for the unauthenticated development mode; an OAuth
+        // server has never needed the guard this lifts.
+        if let config::AuthenticationConfig::None {
+            allow_insecure_non_loopback: allowed,
+        } = &mut config.authentication
+        {
+            *allowed = true;
+        }
     }
     if let Some(data_dir) = data_dir_override {
         config.data_dir = data_dir;
     }
     if let Some(requests_per_minute) = requests_per_minute_override {
         config.requests_per_minute = requests_per_minute;
+    }
+    match (tls_certificate, tls_private_key) {
+        (Some(certificate), Some(private_key)) => {
+            config.tls = Some(config::TlsConfig::Files {
+                certificate,
+                private_key,
+            });
+        }
+        // Half a pair is a typo, not a request to fall back to plain HTTP or to
+        // a self-signed chain the caller did not ask for.
+        (Some(_), None) | (None, Some(_)) => {
+            panic!("--tls-cert and --tls-key must be given together")
+        }
+        (None, None) => {
+            if tls_requested || !tls_subject_alt_names.is_empty() {
+                config.tls = Some(config::TlsConfig::DevelopmentCertificate {
+                    subject_alt_names: tls_subject_alt_names,
+                    authority_directory: None,
+                });
+            }
+        }
     }
     config
         .validate()
@@ -1068,8 +1171,17 @@ async fn main() {
         cors_layer(&config.allowed_origins),
     );
 
+    // Prepared before the banner so the certificate's names can be reported,
+    // and before binding so a bad certificate fails at startup rather than on
+    // the first connection.
+    let tls = config.tls.as_ref().map(|tls_config| {
+        tls::prepare(tls_config, &config.data_dir, config.listen)
+            .unwrap_or_else(|error| panic!("initialize TLS: {error}"))
+    });
+
     println!(
-        "auru-pm server listening on http://{}; data: {}; limit: {} requests/minute/client",
+        "auru-pm server listening on {}://{}; data: {}; limit: {} requests/minute/client",
+        if tls.is_some() { "https" } else { "http" },
         config.listen,
         config.data_dir.display(),
         config.requests_per_minute
@@ -1082,15 +1194,49 @@ async fn main() {
             config.allowed_origins.join(", ")
         );
     }
-    let listener = tokio::net::TcpListener::bind(config.listen)
-        .await
-        .expect("server address should be available");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .expect("HTTP server should run until shutdown");
+    if let Some(authority) = tls
+        .as_ref()
+        .and_then(|material| material.development_authority.as_ref())
+    {
+        // A self-signed chain is useless until the client is told to trust it,
+        // and the path to the anchor is the one thing nobody can guess.
+        println!(
+            "TLS: self-signed development certificate for {}",
+            authority.subject_alt_names.join(", ")
+        );
+        println!(
+            "     trust anchor: {}",
+            authority.certificate_path.display()
+        );
+        println!("     fingerprint:  {}", authority.fingerprint);
+        println!(
+            "     Android debug builds pick this up from auru-pm-mobile; see that repo's README."
+        );
+    }
+    print_device_addresses(&config, tls.is_some());
+
+    match tls {
+        Some(material) => {
+            axum_server::bind_rustls(
+                config.listen,
+                RustlsConfig::from_config(Arc::new(material.server_config)),
+            )
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+            .expect("HTTPS server should run until shutdown");
+        }
+        None => {
+            let listener = tokio::net::TcpListener::bind(config.listen)
+                .await
+                .expect("server address should be available");
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .expect("HTTP server should run until shutdown");
+        }
+    }
 }
 
 #[cfg(test)]

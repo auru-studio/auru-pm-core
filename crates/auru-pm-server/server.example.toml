@@ -13,6 +13,28 @@ requests_per_minute = 600
 # here from a signed-in user's browser. Plain http is accepted only on loopback.
 # allowed_origins = ["https://dashboard.example.com"]
 
+# TLS terminated by this server rather than by the proxy in front of it. Leave
+# it out for a deployment: the reverse proxy owns the certificate, which is what
+# public_base_url above describes. Uncomment one of these for local development
+# against a phone or emulator, where there is no proxy and Android refuses
+# cleartext HTTP outright.
+#
+# A self-signed authority minted into data_dir. The leaf is reissued on every
+# start so it always covers the addresses this run listens on; the authority
+# is not, because it is the file you told the device to trust. Loopback,
+# 10.0.2.2 (the Android emulator's host alias) and — for a wildcard listener —
+# this machine's own interface addresses are covered without configuration.
+# [tls]
+# mode = "development_certificate"
+# subject_alt_names = ["studio.local"]
+#
+# Or a chain issued elsewhere: mkcert, an internal CA, a staging certificate.
+# Leaf first in the certificate file, then any intermediates.
+# [tls]
+# mode = "files"
+# certificate = "/etc/auru-pm/fullchain.pem"
+# private_key = "/etc/auru-pm/privkey.pem"
+
 [authentication]
 mode = "oauth"
 # The exact issuer published by your OAuth 2.0 / OpenID Connect provider.

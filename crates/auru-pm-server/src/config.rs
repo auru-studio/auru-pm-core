@@ -31,6 +31,14 @@ pub struct ServerConfig {
     /// requests here on the user's behalf.
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    /// TLS terminated by this server rather than by a proxy in front of it.
+    ///
+    /// Absent by default, which is what a deployment wants: the reverse proxy
+    /// owns the certificate and this server listens on private HTTP. The
+    /// section exists for local development against a device, where there is
+    /// no proxy and Android refuses cleartext HTTP outright.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
     #[serde(default)]
     pub authentication: AuthenticationConfig,
 }
@@ -56,6 +64,7 @@ impl ServerConfig {
             data_dir,
             requests_per_minute,
             allowed_origins: Vec::new(),
+            tls: None,
             authentication: AuthenticationConfig::default(),
         }
     }
@@ -72,6 +81,9 @@ impl ServerConfig {
         }
         for origin in &self.allowed_origins {
             validate_origin(origin)?;
+        }
+        if let Some(tls) = &self.tls {
+            tls.validate()?;
         }
         match &self.authentication {
             AuthenticationConfig::None {
@@ -195,6 +207,93 @@ impl ServerConfig {
         }
         Ok(())
     }
+}
+
+/// Where this server's certificate and key come from.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TlsConfig {
+    /// A self-signed authority kept in the data directory.
+    ///
+    /// The leaf is reissued on every start so it always covers the addresses
+    /// this run listens on; the authority is not, because it is the file a
+    /// client was told to trust. Development only — nothing outside the
+    /// machine that minted it has any reason to accept this chain.
+    DevelopmentCertificate {
+        /// Names to cover beyond the loopback aliases, this run's listen
+        /// address, and — for a wildcard listener — the machine's own
+        /// interface addresses. A hostname a phone resolves over mDNS, say.
+        #[serde(default)]
+        subject_alt_names: Vec<String>,
+        /// Where the authority itself lives. Defaults to a per-user directory,
+        /// deliberately not `data_dir`: a client bakes the anchor in at build
+        /// time, so an authority per data directory breaks an installed client
+        /// the moment `--data-dir` changes.
+        #[serde(default)]
+        authority_directory: Option<PathBuf>,
+    },
+    /// A chain and key issued elsewhere: mkcert, an internal CA, staging.
+    Files {
+        /// PEM chain, leaf first. Intermediates belong here too — a client
+        /// that cannot build a path to its anchor rejects the connection.
+        certificate: PathBuf,
+        private_key: PathBuf,
+    },
+}
+
+impl TlsConfig {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::DevelopmentCertificate {
+                subject_alt_names, ..
+            } => {
+                for name in subject_alt_names {
+                    validate_subject_alt_name(name)?;
+                }
+            }
+            Self::Files {
+                certificate,
+                private_key,
+            } => {
+                for (field, path) in [
+                    ("tls.certificate", certificate),
+                    ("tls.private_key", private_key),
+                ] {
+                    if path.as_os_str().is_empty() {
+                        return Err(format!("{field} must name a file"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A subject alternative name is a bare host or IP — no scheme, port, or path.
+///
+/// Checked here rather than left to the certificate generator because the
+/// generator's own error arrives after the data directory has been touched and
+/// names the ASN.1 encoder, not the line of TOML that is wrong.
+fn validate_subject_alt_name(value: &str) -> Result<(), String> {
+    let field = "tls.subject_alt_names";
+    if value.is_empty() {
+        return Err(format!("{field} must not contain an empty name"));
+    }
+    if value.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+    if value.contains([':', '/', '@', ' ']) {
+        return Err(format!(
+            "{field}: {value:?} must be a bare hostname or IP address, with no scheme, port, or path"
+        ));
+    }
+    if !value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '.' || character == '-')
+    {
+        return Err(format!("{field}: {value:?} is not a valid hostname"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -454,6 +553,56 @@ mode = "none"
         )
         .expect_err("unauthenticated public listener");
         assert!(error.contains("loopback"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+
+    fn config(tls: &str) -> Result<ServerConfig, String> {
+        ServerConfig::from_toml(&format!("version = 1\nlisten = \"127.0.0.1:4242\"\n{tls}"))
+    }
+
+    #[test]
+    fn a_development_certificate_needs_no_further_configuration() {
+        let config = config("[tls]\nmode = \"development_certificate\"\n")
+            .expect("a development certificate is self-contained");
+        assert!(matches!(
+            config.tls,
+            Some(TlsConfig::DevelopmentCertificate { .. })
+        ));
+    }
+
+    #[test]
+    fn omitting_the_section_leaves_the_server_on_plain_http() {
+        // The deployment shape: a reverse proxy in front owns TLS.
+        let config = config("").expect("TLS is optional");
+        assert!(config.tls.is_none());
+    }
+
+    #[test]
+    fn a_supplied_chain_requires_both_halves() {
+        let error = config("[tls]\nmode = \"files\"\ncertificate = \"chain.pem\"\n")
+            .expect_err("a certificate without its key cannot serve anything");
+        assert!(error.contains("private_key"), "{error}");
+    }
+
+    #[test]
+    fn a_subject_alternative_name_may_not_carry_a_scheme_or_port() {
+        for name in ["https://studio.local", "studio.local:4242"] {
+            let error = config(&format!(
+                "[tls]\nmode = \"development_certificate\"\nsubject_alt_names = [\"{name}\"]\n"
+            ))
+            .expect_err("a SAN is a bare host, and a certificate never covers a port");
+            assert!(error.contains("bare hostname"), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn an_ip_address_is_a_valid_subject_alternative_name() {
+        config("[tls]\nmode = \"development_certificate\"\nsubject_alt_names = [\"::1\", \"10.0.2.2\"]\n")
+            .expect("IPv6 contains colons but is still a name a certificate can carry");
     }
 }
 

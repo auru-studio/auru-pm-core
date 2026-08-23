@@ -69,6 +69,65 @@ The server persists project state and content-addressed blobs and applies a
 per-client request limit. With no `--config`, it retains the development
 default: no authentication and a loopback-only listener.
 
+## HTTPS for a local device
+
+Android has refused cleartext HTTP by default since API 28, so a phone or
+emulator cannot reach a plain-HTTP development server at all. Add `--tls`:
+
+```sh
+cargo run -p auru-pm-server -- --tls
+```
+
+The first run mints a self-signed authority at
+`$XDG_DATA_HOME/auru-pm/development-tls/development-ca.pem` (usually under
+`~/.local/share`) and keeps it; every run issues a fresh leaf from it. The
+authority lives per user rather than per `data_dir` on purpose: a client bakes
+the anchor in at build time, so an authority per data directory would break an
+already-installed client the moment `--data-dir` changed.
+
+A loopback listener is only reachable from the host. To reach it from a device:
+
+```sh
+cargo run -p auru-pm-server -- --tls --listen 0.0.0.0:4242 --allow-insecure-non-loopback
+```
+
+The flag is required because an unauthenticated listener off loopback should
+never happen by accident. Startup then prints the addresses to paste:
+
+```
+TLS: self-signed development certificate for localhost, 127.0.0.1, ::1, 10.0.2.2, 192.168.1.122
+     trust anchor: /home/you/.local/share/auru-pm/development-tls/development-ca.pem
+     fingerprint:  67:85:CF:AB:…:A5:89
+device access: https://192.168.1.122:4242
+```
+
+The fingerprint is what a client bundles. `:app:generateDebugDevelopmentTrustAnchor`
+in `auru-pm-mobile` prints the same value for the anchor it built into the APK;
+if the two differ, that build trusts an authority this server does not use, and
+the symptom is a handshake failure naming neither certificate. Rebuild the
+client.
+
+The authority is never replaced silently. If one of its two files goes missing
+the server refuses to start rather than minting a new one, because minting one
+invalidates every client that already bundled the old anchor. Delete both files
+deliberately to start over, then rebuild the clients.
+
+Every non-loopback interface address goes into the certificate, so the printed
+URL works as-is. Add more names with `--tls-san studio.local`, repeated as
+needed.
+
+**`10.0.2.2` is not reliable.** The Android emulator's alias for the host's
+loopback address is in the certificate, and it works from some system images,
+but on others an app's traffic to it is silently dropped while `adb shell`
+reaches it fine — a fifteen-second connect timeout with no other symptom. Use
+the LAN address the banner prints; it behaves the same on an emulator and on a
+physical device.
+
+To serve a chain issued elsewhere — mkcert, an internal CA, a staging
+certificate — pass `--tls-cert fullchain.pem --tls-key privkey.pem`, or set
+`[tls] mode = "files"`. A deployment should do neither: the reverse proxy in
+front owns TLS, and the server listens on private HTTP behind it.
+
 ## Standards-based authentication
 
 For a deployable server, copy
