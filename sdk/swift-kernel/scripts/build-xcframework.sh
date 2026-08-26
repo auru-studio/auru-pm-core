@@ -22,6 +22,18 @@ repo="$(cd "$package/../.." && pwd)"
 # through a simulator, which is a poor place to find out a hash is wrong.
 targets=(aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin)
 
+# Pinned rather than left to default. Given no minimum, clang stamps a C
+# object with the SDK's own version — blake3's NEON path is the only C here,
+# and it came out marked iOS 26.5, which every consumer then linked against a
+# lower floor and warned about. rustc and cc-rs both read these, so one export
+# covers the Rust objects and the C ones. The values are the floors
+# Package.swift declares; a slice built higher would make that manifest a lie.
+# Changing either afterwards needs `cargo clean -p blake3 --release --target
+# <target>`: cc-rs does not make the C objects depend on these, so an existing
+# target/ hands back the ones built under the old floor and says nothing.
+export IPHONEOS_DEPLOYMENT_TARGET=15.0   # .iOS(.v15); the simulator reads it too
+export MACOSX_DEPLOYMENT_TARGET=12.0     # .macOS(.v12)
+
 for target in "${targets[@]}"; do
     echo "building $target"
     cargo build --manifest-path "$repo/Cargo.toml" \
