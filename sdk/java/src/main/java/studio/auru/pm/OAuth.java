@@ -276,6 +276,59 @@ public final class OAuth {
         return readToken(payload);
     }
 
+    // ── Refresh (RFC 6749 §6) ────────────────────────────────────────────────
+
+    /**
+     * Trade a refresh token for a new access token.
+     *
+     * <p>The point of holding a refresh token: an access token lives an hour or so, and without
+     * this a person is put back on a sign-in screen every time one expires. Nothing about it is
+     * interactive, so it can run while a view is loading.
+     *
+     * <p>Expect the refresh token itself to change. A server that rotates them — as auru-pm's own
+     * does — returns a new one and retires the one just used, so a caller that keeps presenting the
+     * original will be told the token was reused and have the whole session revoked. Always store
+     * what comes back. When the response carries no replacement, the presented one is still current
+     * and is returned unchanged, so the caller stores a usable value either way.
+     *
+     * @param scope a subset of what was originally granted, to narrow it, or null to keep it all.
+     *     RFC 6749 §6 forbids widening, and a provider will refuse it.
+     */
+    public static RefreshableToken refresh(
+            ServerMetadata metadata,
+            OAuthConfiguration.OAuthClient client,
+            String refreshToken,
+            String scope,
+            Transport transport) {
+
+        Map<String, String> body = new LinkedHashMap<>();
+        body.put("grant_type", "refresh_token");
+        body.put("refresh_token", refreshToken);
+        body.put("client_id", client.clientId());
+        if (scope != null && !scope.isBlank()) {
+            body.put("scope", scope);
+        }
+
+        Transport.Response response = postForm(metadata.tokenEndpoint(), body, transport);
+        Json payload = parseJsonBody(response);
+
+        if (response.status() / 100 != 2) {
+            // `invalid_grant` here is terminal, not transient: the token was
+            // revoked, expired, or already used. A caller must sign in again
+            // rather than retry, which is why this is UNAUTHORIZED and not a
+            // network-shaped failure.
+            throw new AuruException(
+                    ErrorCode.UNAUTHORIZED,
+                    "token refresh failed: " + failureDetail(payload, response.status()));
+        }
+
+        RefreshableToken refreshed = readToken(payload);
+        if (refreshed.refreshToken().isPresent()) {
+            return refreshed;
+        }
+        return new RefreshableToken(refreshed.access(), Optional.of(refreshToken));
+    }
+
     // ── Device authorization (RFC 8628) ──────────────────────────────────────
 
     /**

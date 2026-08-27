@@ -438,4 +438,92 @@ class OAuthDeviceTest {
         assertEquals("an-access-token", token.token());
         assertEquals("Bearer", token.tokenType());
     }
+
+    // ── Refresh (RFC 6749 §6) ────────────────────────────────────────────────
+
+    @Test
+    void refreshSendsTheGrantTheProviderExpects() {
+        ScriptedServer server = new ScriptedServer().answering(200, TOKEN_RESPONSE);
+
+        OAuth.refresh(metadata(), client(), "an-old-refresh-token", null, server);
+
+        assertEquals(ISSUER + "/token", server.lastRequest().url());
+        Map<String, String> form = server.lastForm();
+        assertEquals("refresh_token", form.get("grant_type"));
+        assertEquals("an-old-refresh-token", form.get("refresh_token"));
+        assertEquals("auru-pm-desktop", form.get("client_id"));
+        // A public client has no secret to send, and sending one would mean it
+        // had been shipped inside the app.
+        assertFalse(form.containsKey("client_secret"));
+        // Omitted rather than sent empty: an empty scope is not "everything".
+        assertFalse(form.containsKey("scope"));
+    }
+
+    @Test
+    void refreshCarriesANarrowedScopeWhenAskedFor() {
+        ScriptedServer server = new ScriptedServer().answering(200, TOKEN_RESPONSE);
+
+        OAuth.refresh(metadata(), client(), "a-refresh-token", "openid", server);
+
+        assertEquals("openid", server.lastForm().get("scope"));
+    }
+
+    @Test
+    void refreshReturnsTheRotatedTokenSoTheCallerStoresTheNewOne() {
+        ScriptedServer server =
+                new ScriptedServer()
+                        .answering(
+                                200,
+                                "{\"access_token\":\"a-new-access-token\","
+                                        + "\"refresh_token\":\"a-rotated-refresh-token\","
+                                        + "\"token_type\":\"Bearer\",\"expires_in\":3600}");
+
+        OAuth.RefreshableToken token =
+                OAuth.refresh(metadata(), client(), "the-old-one", null, server);
+
+        assertEquals("a-new-access-token", token.access().token());
+        // Storing the old one after a rotation is how a client gets its whole
+        // session revoked on the next refresh: the server reads a retired token
+        // as evidence that a copy leaked.
+        assertEquals(Optional.of("a-rotated-refresh-token"), token.refreshToken());
+    }
+
+    @Test
+    void refreshKeepsThePresentedTokenWhenTheProviderDoesNotRotate() {
+        ScriptedServer server =
+                new ScriptedServer()
+                        .answering(
+                                200,
+                                "{\"access_token\":\"a-new-access-token\","
+                                        + "\"token_type\":\"Bearer\",\"expires_in\":3600}");
+
+        OAuth.RefreshableToken token =
+                OAuth.refresh(metadata(), client(), "still-current", null, server);
+
+        // The caller stores whatever comes back, so a provider that does not
+        // rotate must not leave it storing nothing and signing in again.
+        assertEquals(Optional.of("still-current"), token.refreshToken());
+    }
+
+    @Test
+    void aRevokedRefreshTokenIsUnauthorizedRatherThanRetryable() {
+        ScriptedServer server =
+                new ScriptedServer()
+                        .answering(
+                                400,
+                                "{\"error\":\"invalid_grant\",\"error_description\":"
+                                        + "\"this refresh token has already been used\"}");
+
+        AuruException failure =
+                assertThrows(
+                        AuruException.class,
+                        () -> OAuth.refresh(metadata(), client(), "a-reused-token", null, server));
+
+        // Terminal, not transient. A caller that retries this will keep failing;
+        // the only way forward is to sign in again.
+        assertEquals(ErrorCode.UNAUTHORIZED, failure.code());
+        assertTrue(
+                failure.getMessage().contains("already been used"),
+                "the provider's own reason should survive: " + failure.getMessage());
+    }
 }

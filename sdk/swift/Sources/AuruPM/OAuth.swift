@@ -251,6 +251,58 @@ public enum OAuth {
         return try readToken(payload)
     }
 
+    // MARK: - Refresh (RFC 6749 §6)
+
+    /// Trade a refresh token for a new access token.
+    ///
+    /// The point of holding a refresh token: an access token lives an hour or
+    /// so, and without this a person is put back on a sign-in screen every time
+    /// one expires. Nothing about it is interactive, so it can run while a view
+    /// is loading.
+    ///
+    /// Expect the refresh token itself to change. A server that rotates them —
+    /// as auru-pm's own does — returns a new one and retires the one just used,
+    /// so a caller that keeps presenting the original will be told the token was
+    /// reused and have the whole session revoked. Always store what comes back.
+    /// When the response carries no replacement, the presented one is still
+    /// current and is returned unchanged, so the caller stores a usable value
+    /// either way.
+    ///
+    /// - Parameter scope: a subset of what was originally granted, to narrow it.
+    ///   RFC 6749 §6 forbids widening, and a provider will refuse it.
+    public static func refresh(
+        metadata: ServerMetadata, client: OAuthClient, refreshToken: String,
+        scope: String? = nil, transport: any Transport
+    ) async throws -> RefreshableToken {
+
+        var body = [
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refreshToken),
+            ("client_id", client.clientID),
+        ]
+        if let scope, !scope.isEmpty {
+            body.append(("scope", scope))
+        }
+
+        let response = try await postForm(
+            to: metadata.tokenEndpoint, body: body, transport: transport)
+        let payload = (try? JSON.parse(response.body)) ?? .emptyObject
+
+        guard response.status / 100 == 2 else {
+            // `invalid_grant` here is terminal, not transient: the token was
+            // revoked, expired, or already used. A caller must sign in again
+            // rather than retry, which is why this throws `.unauthorized`
+            // instead of reporting a network-shaped failure.
+            throw AuruError(
+                code: .unauthorized,
+                message: "token refresh failed: \(failureDetail(payload, response.status))")
+        }
+
+        let refreshed = try readToken(payload)
+        guard refreshed.refreshToken == nil else { return refreshed }
+        return RefreshableToken(access: refreshed.access, refreshToken: refreshToken)
+    }
+
     // MARK: - Device authorization (RFC 8628)
 
     /// A device authorization, as issued by the authorization server.

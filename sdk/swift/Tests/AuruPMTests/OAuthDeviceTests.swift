@@ -398,4 +398,89 @@ final class OAuthDeviceTests: XCTestCase {
             XCTAssertTrue(transport.requests.isEmpty, "it should not have polled at all")
         }
     }
+
+    // MARK: - Refresh (RFC 6749 §6)
+
+    func testRefreshSendsTheGrantTheProviderExpects() async throws {
+        let transport = scripted(StubTransport.json(200, tokenResponse))
+
+        _ = try await OAuth.refresh(
+            metadata: metadata, client: client, refreshToken: "an-old-refresh-token",
+            transport: transport)
+
+        XCTAssertEqual(transport.requests.last?.url, issuer + "/token")
+        let form = lastForm(transport)
+        XCTAssertEqual(form["grant_type"], "refresh_token")
+        XCTAssertEqual(form["refresh_token"], "an-old-refresh-token")
+        XCTAssertEqual(form["client_id"], "auru-pm-desktop")
+        // A public client has no secret to send, and sending one would mean it
+        // had been shipped inside the app.
+        XCTAssertNil(form["client_secret"])
+        // Omitted rather than sent empty: an empty scope is not "everything".
+        XCTAssertNil(form["scope"])
+    }
+
+    func testRefreshCarriesANarrowedScopeWhenAskedFor() async throws {
+        let transport = scripted(StubTransport.json(200, tokenResponse))
+
+        _ = try await OAuth.refresh(
+            metadata: metadata, client: client, refreshToken: "a-refresh-token", scope: "openid",
+            transport: transport)
+
+        XCTAssertEqual(lastForm(transport)["scope"], "openid")
+    }
+
+    func testRefreshReturnsTheRotatedTokenSoTheCallerStoresTheNewOne() async throws {
+        let rotated = """
+            {"access_token":"a-new-access-token","refresh_token":"a-rotated-refresh-token",\
+            "token_type":"Bearer","expires_in":3600,"scope":"openid"}
+            """
+        let transport = scripted(StubTransport.json(200, rotated))
+
+        let token = try await OAuth.refresh(
+            metadata: metadata, client: client, refreshToken: "the-old-one", transport: transport)
+
+        XCTAssertEqual(token.access.token, "a-new-access-token")
+        // Storing the old one after a rotation is how a client gets its whole
+        // session revoked on the next refresh: the server reads a retired token
+        // as evidence that a copy leaked.
+        XCTAssertEqual(token.refreshToken, "a-rotated-refresh-token")
+    }
+
+    func testRefreshKeepsThePresentedTokenWhenTheProviderDoesNotRotate() async throws {
+        let unrotated = """
+            {"access_token":"a-new-access-token","token_type":"Bearer","expires_in":3600}
+            """
+        let transport = scripted(StubTransport.json(200, unrotated))
+
+        let token = try await OAuth.refresh(
+            metadata: metadata, client: client, refreshToken: "still-current",
+            transport: transport)
+
+        // The caller stores whatever comes back, so a provider that does not
+        // rotate must not leave it storing nothing and signing in again.
+        XCTAssertEqual(token.refreshToken, "still-current")
+    }
+
+    func testARevokedRefreshTokenIsUnauthorizedRatherThanRetryable() async throws {
+        let transport = scripted(
+            StubTransport.json(
+                400,
+                #"{"error":"invalid_grant","error_description":"this refresh token has already been used"}"#
+            ))
+
+        do {
+            _ = try await OAuth.refresh(
+                metadata: metadata, client: client, refreshToken: "a-reused-token",
+                transport: transport)
+            XCTFail("expected a rejected refresh token to throw")
+        } catch let error as AuruError {
+            // Terminal, not transient. A caller that retries this will keep
+            // failing; the only way forward is to sign in again.
+            XCTAssertEqual(error.code, .unauthorized)
+            XCTAssertTrue(
+                error.message.contains("already been used"),
+                "the provider's own reason should survive: \(error.message)")
+        }
+    }
 }
