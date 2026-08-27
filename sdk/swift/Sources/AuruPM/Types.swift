@@ -41,10 +41,12 @@ public struct Capabilities: Sendable, Equatable {
 public struct OAuthClient: Sendable, Equatable {
     /// Which kind of client this is.
     ///
-    /// Not cosmetic: the two use different redirect rules and must not share a
-    /// client id, because an identity provider's redirect allow-list is per
-    /// client.
-    public enum Kind: String, Sendable { case native, browser }
+    /// Not cosmetic: each kind uses different redirect rules and they must not
+    /// share a client id, because an identity provider's redirect allow-list
+    /// is per client. `unknown` is a kind this build does not know — kept
+    /// rather than mislabelled, so a registration for a client newer than this
+    /// SDK is never mistaken for one of the others.
+    public enum Kind: String, Sendable { case native, browser, mobile, unknown }
 
     public var kind: Kind
     public var clientID: String
@@ -82,7 +84,7 @@ public struct OAuthConfiguration: Sendable, Equatable {
 
         clients = (json["clients"]?.arrayValue ?? []).map { entry in
             OAuthClient(
-                kind: entry["kind"]?.stringValue == "browser" ? .browser : .native,
+                kind: OAuthClient.Kind(rawValue: entry["kind"]?.stringValue ?? "") ?? .unknown,
                 clientID: entry["client_id"]?.stringValue ?? "",
                 redirectURI: entry["redirect_uri"]?.stringValue ?? "",
                 flows: (entry["flows"]?.arrayValue ?? []).compactMap(\.stringValue))

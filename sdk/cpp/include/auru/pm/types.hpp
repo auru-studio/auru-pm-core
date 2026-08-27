@@ -41,10 +41,12 @@ struct Capabilities {
 struct OAuthClient {
     /// Which kind of client this is.
     ///
-    /// Not cosmetic: the two use different redirect rules and must not share a
-    /// client id, because an identity provider's redirect allow-list is per
-    /// client.
-    enum class Kind { Native, Browser };
+    /// Not cosmetic: each kind uses different redirect rules and they must not
+    /// share a client id, because an identity provider's redirect allow-list
+    /// is per client. `Unknown` is a kind this build does not know — kept
+    /// rather than mislabelled, so a registration for a client newer than this
+    /// SDK is never mistaken for one of the others.
+    enum class Kind { Native, Browser, Mobile, Unknown };
 
     Kind kind = Kind::Native;
     std::string client_id;

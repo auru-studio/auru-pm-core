@@ -55,12 +55,15 @@ export interface Capabilities {
 /**
  * One public OAuth client a provider has registered.
  *
- * A desktop app and a browser dashboard cannot share one: an identity
- * provider's redirect allow-list is per client, and a loopback callback and an
- * https single-page callback have nothing in common.
+ * A desktop app, a browser dashboard, and a phone app cannot share one: an
+ * identity provider's redirect allow-list is per client, and a loopback
+ * callback, an https single-page callback, and a custom-scheme callback have
+ * nothing in common. A kind this build does not know arrives as whatever
+ * string the provider published, so a newer registration is never mistaken
+ * for one of the named kinds.
  */
 export interface OAuthClient {
-  kind: "native" | "browser";
+  kind: "native" | "browser" | "mobile" | (string & {});
   client_id: string;
   redirect_uri: string;
   flows: OAuthFlow[];

@@ -29,11 +29,12 @@ pub struct HealthResponse<C> {
 /// issuer's RFC 8414 / OpenID Connect metadata instead of trusting duplicated
 /// configuration.
 ///
-/// A provider may register more than one public client, because a desktop app
-/// and a browser dashboard cannot share one. A native client redirects to an
-/// exact loopback URI; a single-page app redirects to an `https` URL it serves
-/// itself. Identity providers treat those as separate registrations, so
-/// [`clients`](Self::clients) is a list and each entry names its
+/// A provider may register more than one public client, because a desktop app,
+/// a browser dashboard, and a phone app cannot share one. A native client
+/// redirects to an exact loopback URI; a single-page app redirects to an
+/// `https` URL it serves itself; a phone redirects to a custom scheme or a
+/// universal link. Identity providers treat those as separate registrations,
+/// so [`clients`](Self::clients) is a list and each entry names its
 /// [`OAuthClientKind`].
 ///
 /// The singular `client_id` / `redirect_uri` / `flows` fields predate that list
@@ -97,6 +98,14 @@ impl OAuthClientConfiguration {
     pub fn browser_client(&self) -> Option<&OAuthClient> {
         self.client(OAuthClientKind::Browser)
     }
+
+    /// The mobile (phone app) client, if this provider supports one.
+    ///
+    /// Absent means the phones share the native registration through the
+    /// device-authorization grant, which is where every provider starts.
+    pub fn mobile_client(&self) -> Option<&OAuthClient> {
+        self.client(OAuthClientKind::Mobile)
+    }
 }
 
 /// One public client registered with the provider's identity provider.
@@ -110,9 +119,9 @@ pub struct OAuthClient {
 
 /// Which kind of public client a registration is for.
 ///
-/// The distinction is not cosmetic: the two use different redirect URI rules
-/// and must not share a `client_id`, because an identity provider's redirect
-/// allow-list is per client.
+/// The distinction is not cosmetic: each kind uses different redirect URI
+/// rules and they must not share a `client_id`, because an identity provider's
+/// redirect allow-list is per client.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OAuthClientKind {
@@ -120,6 +129,16 @@ pub enum OAuthClientKind {
     Native,
     /// Single-page app. Redirects to an `https` URL the app serves itself.
     Browser,
+    /// Phone app. Redirects to a custom scheme (`studio.auru.pm:/callback`) or
+    /// an `https` universal link the app owns.
+    Mobile,
+    /// A kind this build does not know.
+    ///
+    /// Deserialization lands here rather than failing, so a provider that
+    /// registers a client kind newer than this crate does not make its whole
+    /// health document unreadable. Never published by a server.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Wire form, accepting either the singular fields or the `clients` list.

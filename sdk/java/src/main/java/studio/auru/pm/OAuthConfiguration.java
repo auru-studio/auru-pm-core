@@ -24,14 +24,21 @@ public record OAuthConfiguration(
     /**
      * Which kind of client a registration is for.
      *
-     * <p>Not cosmetic: the two use different redirect rules and must not share a client id, because
-     * an identity provider's redirect allow-list is per client.
+     * <p>Not cosmetic: each kind uses different redirect rules and they must not share a client id,
+     * because an identity provider's redirect allow-list is per client.
      */
     public enum Kind {
         /** Desktop or CLI, redirecting to an exact loopback URI. */
         NATIVE,
         /** Single-page app, redirecting to an https URL it serves itself. */
-        BROWSER
+        BROWSER,
+        /** Phone app, redirecting to a custom scheme or an https universal link it owns. */
+        MOBILE,
+        /**
+         * A kind this build does not know. Kept rather than mislabelled, so a registration for a
+         * client newer than this SDK is never mistaken for one of the kinds above.
+         */
+        UNKNOWN
     }
 
     public OAuthConfiguration {
@@ -48,7 +55,12 @@ public record OAuthConfiguration(
         for (Json client : json.get("clients").orElse(Json.NULL).elements()) {
             clients.add(
                     new OAuthClient(
-                            "browser".equals(client.string("kind")) ? Kind.BROWSER : Kind.NATIVE,
+                            switch (client.string("kind")) {
+                                case "native" -> Kind.NATIVE;
+                                case "browser" -> Kind.BROWSER;
+                                case "mobile" -> Kind.MOBILE;
+                                default -> Kind.UNKNOWN;
+                            },
                             client.string("client_id"),
                             client.string("redirect_uri"),
                             client.require("flows").elements().stream()

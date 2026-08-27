@@ -158,6 +158,36 @@ impl ServerConfig {
                         );
                     }
                 }
+                if let Some(mobile) = &oauth.mobile_client {
+                    if mobile.client_id.trim().is_empty() {
+                        return Err(
+                            "authentication.mobile_client.client_id must not be empty".to_owned()
+                        );
+                    }
+                    if mobile.client_id == oauth.desktop_client_id {
+                        return Err(
+                            "authentication.mobile_client.client_id must differ from desktop_client_id"
+                                .to_owned(),
+                        );
+                    }
+                    if oauth
+                        .browser_client
+                        .as_ref()
+                        .is_some_and(|browser| browser.client_id == mobile.client_id)
+                    {
+                        return Err(
+                            "authentication.mobile_client.client_id must differ from browser_client.client_id"
+                                .to_owned(),
+                        );
+                    }
+                    validate_mobile_redirect(&mobile.redirect_uri)?;
+                    if mobile.flows.is_empty() {
+                        return Err(
+                            "authentication.mobile_client.flows must declare at least one flow"
+                                .to_owned(),
+                        );
+                    }
+                }
                 if oauth.flows.is_empty() {
                     return Err("authentication.flows must declare at least one flow".to_owned());
                 }
@@ -334,6 +364,17 @@ pub struct OAuthConfig {
     /// one entry without widening it past either app's needs.
     #[serde(default)]
     pub browser_client: Option<BrowserClientConfig>,
+    /// A third public client for the phone apps, if the identity provider
+    /// registers one.
+    ///
+    /// Optional because the phones work without it: the device-authorization
+    /// grant needs no redirect URI, so they can share the native registration.
+    /// Registering this splits them — the phones send their own `client_id`,
+    /// and browser sign-in on a phone gets the custom-scheme or universal-link
+    /// redirect that a loopback callback cannot provide (§12.1 of the mobile
+    /// spec).
+    #[serde(default)]
+    pub mobile_client: Option<MobileClientConfig>,
     #[serde(default)]
     pub legacy_owner_subject: Option<String>,
     pub validation: TokenValidationConfig,
@@ -397,6 +438,25 @@ pub struct BrowserClientConfig {
     pub flows: Vec<OAuthFlow>,
 }
 
+/// The phone apps registered as their own public client.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MobileClientConfig {
+    pub client_id: String,
+    pub redirect_uri: String,
+    #[serde(default = "default_mobile_flows")]
+    pub flows: Vec<OAuthFlow>,
+}
+
+/// Phones lead with the device grant and add browser sign-in where the
+/// redirect works, so the default permits both.
+fn default_mobile_flows() -> Vec<OAuthFlow> {
+    vec![
+        OAuthFlow::AuthorizationCodePkce,
+        OAuthFlow::DeviceAuthorization,
+    ]
+}
+
 /// Whether `host` is a loopback name, for which plain http is acceptable.
 fn is_loopback_host(url: &Url) -> bool {
     match url.host_str() {
@@ -423,6 +483,27 @@ fn validate_browser_redirect(value: &str) -> Result<(), String> {
         return Err(format!(
             "{field} must use https, or http on loopback for local development"
         ));
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return Err(format!(
+            "{field} must not contain credentials or a fragment"
+        ));
+    }
+    Ok(())
+}
+
+/// A mobile redirect is a custom scheme the app claims, or an https universal
+/// link — never plain http, which no phone platform hands to an app.
+fn validate_mobile_redirect(value: &str) -> Result<(), String> {
+    let field = "authentication.mobile_client.redirect_uri";
+    let url = Url::parse(value).map_err(|error| format!("{field}: {error}"))?;
+    if url.scheme() == "http" {
+        return Err(format!(
+            "{field} must use a custom scheme or an https universal link, not plain http"
+        ));
+    }
+    if url.scheme() == "https" && url.host_str().is_none() {
+        return Err(format!("{field} must name a host when using https"));
     }
     if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
         return Err(format!(
@@ -709,5 +790,123 @@ redirect_uri = "http://dashboard.example.com/oauth/callback"
         ))
         .unwrap_err();
         assert!(error.contains("must use https"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod mobile_client_tests {
+    use super::*;
+
+    fn config(extra: &str) -> Result<ServerConfig, String> {
+        ServerConfig::from_toml(&format!(
+            r#"
+version = 1
+provider_id = "studio-pm"
+public_base_url = "https://pm.example.com"
+[authentication]
+mode = "oauth"
+issuer = "https://identity.example.com"
+audience = "auru-pm"
+desktop_client_id = "desktop"
+redirect_uri = "http://127.0.0.1:43827/oauth/callback"
+{extra}
+[authentication.validation]
+strategy = "jwt"
+"#
+        ))
+    }
+
+    #[test]
+    fn a_custom_scheme_redirect_is_accepted_and_the_flows_default_to_both_grants() {
+        let config = config(
+            r#"[authentication.mobile_client]
+client_id = "phones"
+redirect_uri = "studio.auru.pm:/oauth/callback"
+"#,
+        )
+        .unwrap();
+        let AuthenticationConfig::OAuth(oauth) = config.authentication else {
+            panic!("OAuth configuration");
+        };
+        let mobile = oauth.mobile_client.expect("mobile client");
+        assert_eq!(
+            mobile.flows,
+            vec![
+                OAuthFlow::AuthorizationCodePkce,
+                OAuthFlow::DeviceAuthorization
+            ],
+            "phones need the device grant to pick this registration at all"
+        );
+    }
+
+    #[test]
+    fn a_universal_link_redirect_is_accepted() {
+        config(
+            r#"[authentication.mobile_client]
+client_id = "phones"
+redirect_uri = "https://pm.example.com/app/oauth/callback"
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_mobile_client_may_not_reuse_the_desktop_client_id() {
+        let error = config(
+            r#"[authentication.mobile_client]
+client_id = "desktop"
+redirect_uri = "studio.auru.pm:/oauth/callback"
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("must differ from desktop_client_id"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_mobile_client_may_not_reuse_the_browser_client_id() {
+        let error = ServerConfig::from_toml(
+            r#"
+version = 1
+provider_id = "studio-pm"
+public_base_url = "https://pm.example.com"
+allowed_origins = ["https://dashboard.example.com"]
+[authentication]
+mode = "oauth"
+issuer = "https://identity.example.com"
+audience = "auru-pm"
+desktop_client_id = "desktop"
+redirect_uri = "http://127.0.0.1:43827/oauth/callback"
+[authentication.browser_client]
+client_id = "dashboard"
+redirect_uri = "https://dashboard.example.com/oauth/callback"
+[authentication.mobile_client]
+client_id = "dashboard"
+redirect_uri = "studio.auru.pm:/oauth/callback"
+[authentication.validation]
+strategy = "jwt"
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("must differ from browser_client.client_id"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_mobile_redirect_must_not_be_plain_http() {
+        // Unlike a dashboard there is no loopback development exception: no
+        // phone platform hands an http URL to an app.
+        let error = config(
+            r#"[authentication.mobile_client]
+client_id = "phones"
+redirect_uri = "http://127.0.0.1:8080/oauth/callback"
+"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("custom scheme"), "{error}");
     }
 }

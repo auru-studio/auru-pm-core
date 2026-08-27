@@ -90,7 +90,7 @@ async function s256(verifier: string): Promise<string> {
  */
 export function selectClient(
   configuration: OAuthClientConfiguration,
-  kind: "native" | "browser",
+  kind: "native" | "browser" | "mobile",
 ): OAuthClient {
   const listed = configuration.clients?.find((client) => client.kind === kind);
   if (listed !== undefined) return listed;

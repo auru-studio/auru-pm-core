@@ -59,6 +59,17 @@ flows = ["authorization_code_pkce"]
 # redirect_uri = "https://dashboard.example.com/oauth/callback"
 # flows = ["authorization_code_pkce"]
 
+# The phone apps as their own registration. Optional: without it the phones
+# share the desktop client through the device-authorization grant, which needs
+# no redirect URI. Register it to split them — the redirect is a custom scheme
+# the app claims, or an https universal link, never a loopback callback.
+# `flows` defaults to both grants: the phones need `device_authorization` to
+# pick this registration, and `authorization_code_pkce` is what the redirect
+# is for.
+# [authentication.mobile_client]
+# client_id = "auru-pm-mobile"
+# redirect_uri = "studio.auru.pm:/oauth/callback"
+
 # Required only when enabling OAuth over a data directory created by an older
 # unauthenticated server. Set it to the provider subject that owns all existing
 # projects, start once, then it may remain for auditability.

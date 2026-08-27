@@ -56,9 +56,11 @@ OAuthConfiguration OAuthConfiguration::from_json(const Json& json) {
     if (const Json* clients = json.find("clients")) {
         for (const Json& entry : clients->elements()) {
             OAuthClient client;
-            client.kind = entry.optional_string("kind").value_or("native") == "browser"
-                              ? OAuthClient::Kind::Browser
-                              : OAuthClient::Kind::Native;
+            const std::string kind = entry.optional_string("kind").value_or("native");
+            client.kind = kind == "native"    ? OAuthClient::Kind::Native
+                          : kind == "browser" ? OAuthClient::Kind::Browser
+                          : kind == "mobile"  ? OAuthClient::Kind::Mobile
+                                              : OAuthClient::Kind::Unknown;
             client.client_id = entry.optional_string("client_id").value_or("");
             client.redirect_uri = entry.optional_string("redirect_uri").value_or("");
             client.flows = string_list(entry.find("flows"));

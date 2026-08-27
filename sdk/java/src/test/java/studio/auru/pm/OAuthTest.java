@@ -123,7 +123,11 @@ class OAuthTest {
                                     + "\"flows\":[\"authorization_code_pkce\"]},"
                                     + "{\"kind\":\"browser\",\"client_id\":\"dashboard\","
                                     + "\"redirect_uri\":\"https://dashboard.example.com/cb\","
-                                    + "\"flows\":[\"authorization_code_pkce\"]}]}"));
+                                    + "\"flows\":[\"authorization_code_pkce\"]},"
+                                    + "{\"kind\":\"mobile\",\"client_id\":\"phones\","
+                                    + "\"redirect_uri\":\"studio.auru.pm:/oauth/callback\","
+                                    + "\"flows\":[\"authorization_code_pkce\","
+                                    + "\"device_authorization\"]}]}"));
 
         assertEquals(
                 "desktop",
@@ -131,6 +135,25 @@ class OAuthTest {
         assertEquals(
                 "dashboard",
                 configuration.client(OAuthConfiguration.Kind.BROWSER).orElseThrow().clientId());
+        assertEquals(
+                "phones",
+                configuration.client(OAuthConfiguration.Kind.MOBILE).orElseThrow().clientId());
+    }
+
+    @Test
+    void aClientKindNewerThanThisSdkIsKeptAsUnknownRatherThanMislabelled() {
+        OAuthConfiguration configuration =
+                OAuthConfiguration.fromJson(
+                        Json.parse(
+                                "{\"issuer\":\"https://i.example.com\",\"audience\":\"auru-pm\","
+                                    + "\"required_scope\":\"openid\",\"clients\":["
+                                    + "{\"kind\":\"holographic\",\"client_id\":\"future\","
+                                    + "\"redirect_uri\":\"future:/cb\",\"flows\":[]}]}"));
+
+        assertTrue(configuration.client(OAuthConfiguration.Kind.NATIVE).isEmpty());
+        assertEquals(
+                "future",
+                configuration.client(OAuthConfiguration.Kind.UNKNOWN).orElseThrow().clientId());
     }
 
     @Test

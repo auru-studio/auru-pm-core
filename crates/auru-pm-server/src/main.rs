@@ -406,6 +406,14 @@ fn oauth_clients(oauth: &config::OAuthConfig) -> Vec<auru_pm_protocol::OAuthClie
             flows: browser.flows.clone(),
         });
     }
+    if let Some(mobile) = &oauth.mobile_client {
+        clients.push(auru_pm_protocol::OAuthClient {
+            kind: auru_pm_protocol::OAuthClientKind::Mobile,
+            client_id: mobile.client_id.clone(),
+            redirect_uri: mobile.redirect_uri.clone(),
+            flows: mobile.flows.clone(),
+        });
+    }
     clients
 }
 
@@ -1896,6 +1904,41 @@ strategy = "jwt"
         assert_eq!(
             authentication.redirect_uri,
             "http://127.0.0.1:43827/oauth/callback"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_should_publish_the_mobile_client() {
+        let config = config::ServerConfig::from_toml(
+            r#"
+version = 1
+provider_id = "studio-pm"
+public_base_url = "https://pm.example.com"
+[authentication]
+mode = "oauth"
+issuer = "https://identity.example.com"
+audience = "auru-pm"
+desktop_client_id = "desktop"
+redirect_uri = "http://127.0.0.1:43827/oauth/callback"
+[authentication.mobile_client]
+client_id = "phones"
+redirect_uri = "studio.auru.pm:/oauth/callback"
+[authentication.validation]
+strategy = "jwt"
+"#,
+        )
+        .unwrap();
+        let authentication = health_of(&config).await;
+
+        let mobile = authentication.mobile_client().unwrap();
+        assert_eq!(mobile.client_id, "phones");
+        assert_eq!(mobile.redirect_uri, "studio.auru.pm:/oauth/callback");
+        // The native registration is untouched: a desktop keeps finding its
+        // own client, and an older phone build that picks by flow rather than
+        // kind still finds a device-authorization client to use.
+        assert_eq!(
+            authentication.client(OAuthClientKind::Native).unwrap().client_id,
+            "desktop"
         );
     }
 

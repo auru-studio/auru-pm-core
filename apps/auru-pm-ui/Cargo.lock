@@ -557,6 +557,7 @@ dependencies = [
 name = "auru-pm-kernel"
 version = "0.1.0"
 dependencies = [
+ "auru-pm-protocol",
  "base64",
  "blake3",
  "flate2",
