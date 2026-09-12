@@ -7,3 +7,4 @@ apps/*/target
 
 # Local server configuration; the shipped examples are server.example.toml and deploy/server.prod.example.toml.
 crates/auru-pm-server/server.toml
+.vscode/
