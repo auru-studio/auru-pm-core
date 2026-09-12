@@ -1,0 +1,37 @@
+# Auru PM server — production configuration, schema version 1.
+#
+# This is the file the container image expects at /etc/auru-pm/server.toml.
+# TLS is not configured here: the ingress in front of the pod owns the
+# certificate, which is what public_base_url describes, and the server listens
+# on private HTTP behind it. Rate limiting by real client IP happens at the
+# ingress too, so the per-peer limit below is set high enough that a whole
+# ingress sharing one source address never trips it.
+version = 1
+provider_id = "auru-cloud"
+listen = "0.0.0.0:4242"
+public_base_url = "https://pm.auru.studio"
+data_dir = "/var/lib/auru-pm"
+# providers.json and plugins.json, served at /providers.json and /plugins.json.
+# The image does not carry them; mount deploy/registry/ here.
+registry_dir = "/etc/auru-pm/registry"
+requests_per_minute = 6000
+
+[authentication]
+mode = "oauth"
+issuer = "https://kms.auru.studio"
+audience = "auru-pm"
+desktop_client_id = "auru-pm-desktop"
+required_scope = "openid"
+redirect_uri = "http://127.0.0.1:43827/oauth/callback"
+flows = ["authorization_code_pkce", "device_authorization"]
+
+# The phones as their own public client. The device grant is what /v1/health
+# advertises to them; browser sign-in on a phone uses the custom scheme.
+[authentication.mobile_client]
+client_id = "auru-pm-mobile"
+redirect_uri = "studio.auru.pm:/oauth/callback"
+flows = ["authorization_code_pkce", "device_authorization"]
+
+[authentication.validation]
+# Access tokens are JWTs verified against the issuer's discovered JWKS.
+strategy = "jwt"

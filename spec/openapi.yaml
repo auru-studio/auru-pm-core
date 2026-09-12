@@ -60,6 +60,30 @@ paths:
               schema: { $ref: "#/components/schemas/HealthResponse" }
         "429": { $ref: "#/components/responses/RateLimited" }
 
+  /v1/ready:
+    get:
+      tags: [discovery]
+      operationId: getReady
+      summary: Readiness probe.
+      description: |
+        Whether this instance can serve requests right now — its storage is
+        present and writable. For an orchestrator, not a client: a client
+        reads `/v1/health` for provider metadata and never needs this. Public,
+        and a provider should answer it outside any rate limit so a probe
+        cannot be starved by traffic.
+      security: []
+      responses:
+        "200":
+          description: Ready to serve.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+        "503":
+          description: Not ready. The body says why.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+
   /v1/me:
     get:
       tags: [discovery]
@@ -562,6 +586,17 @@ components:
           type: array
           deprecated: true
           items: { $ref: "#/components/schemas/OAuthFlow" }
+
+    Readiness:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        reason:
+          type: string
+          description: Present when `status` is `not_ready`.
 
     HealthResponse:
       type: object

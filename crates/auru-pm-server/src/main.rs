@@ -9,11 +9,16 @@
 //!
 //! The no-config compatibility mode advertises `auth_methods: ["none"]` and
 //! is loopback-only. Deployments use versioned TOML and standards-based OAuth.
+//!
+//! Logging goes to stderr through `tracing`: `RUST_LOG` filters it and
+//! `AURU_PM_LOG_FORMAT=json` switches to one JSON object per line. `/v1/ready`
+//! answers an orchestrator's readiness probe outside authentication and the
+//! rate limiter, and SIGINT or SIGTERM drains open connections before exit.
 
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
-use std::io::{self, Write as _};
+use std::io::{self, IsTerminal as _, Write as _};
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
@@ -27,7 +32,7 @@ use auru_pm_protocol::{
     RetentionReport, RetentionRequest, WIRE_VERSION,
 };
 use axum::body::Bytes;
-use axum::extract::{Extension, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::{HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -38,6 +43,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tower_http::cors::CorsLayer;
 use tower_http::decompression::RequestDecompressionLayer;
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+use tower_http::services::ServeFile;
+use tower_http::trace::{DefaultOnResponse, TraceLayer};
+use tracing::{Level, error, info, warn};
 
 mod auth;
 mod config;
@@ -920,6 +929,51 @@ async fn get_blob(
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
+/// The largest blob a single `PUT` may carry, measured after decompression.
+///
+/// axum's default is 2 MiB, which a sample library exceeds on its first
+/// upload. Applied to the blob route only: every other body is a small JSON
+/// document and keeps the default. Counting decompressed bytes means a gzipped
+/// upload is bounded by what it expands to, not by what crossed the wire.
+const MAX_BLOB_BYTES: usize = 512 * 1024 * 1024;
+
+/// How long a TLS listener waits for in-flight requests after a stop signal.
+const TLS_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Install the global `tracing` subscriber.
+///
+/// `RUST_LOG` selects what is logged, `info` when unset. `AURU_PM_LOG_FORMAT=json`
+/// emits one JSON object per line for a log pipeline; the default is a
+/// human-readable line, coloured only when stderr is a terminal.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let json =
+        env::var("AURU_PM_LOG_FORMAT").is_ok_and(|format| format.eq_ignore_ascii_case("json"));
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(io::stderr);
+    if json {
+        builder.json().flatten_event(true).init();
+    } else {
+        builder
+            .with_target(false)
+            .with_ansi(io::stderr().is_terminal())
+            .init();
+    }
+}
+
+/// Report a startup failure and exit.
+///
+/// A wrong path or a bad line of TOML is not a bug, so it does not panic: a
+/// panic prints a backtrace hint and exits 101, and neither helps the operator
+/// reading the log. One line naming the problem, then exit status 1.
+fn fail(message: impl std::fmt::Display) -> ! {
+    error!("{message}");
+    std::process::exit(1)
+}
+
 #[cfg(test)]
 fn app_with_auth(db: SharedDb, requests_per_minute: u32, auth: auth::AuthState) -> Router {
     let config = config::ServerConfig::unauthenticated_legacy(
@@ -969,7 +1023,7 @@ fn app_with_auth_and_health(
     auth: auth::AuthState,
     health: HealthDocument,
 ) -> Router {
-    app_with_auth_health_and_cors(db, requests_per_minute, auth, health, None)
+    app_with_auth_health_and_cors(db, requests_per_minute, auth, health, None, None)
 }
 
 fn app_with_auth_health_and_cors(
@@ -978,6 +1032,7 @@ fn app_with_auth_health_and_cors(
     auth: auth::AuthState,
     health: HealthDocument,
     cors: Option<CorsLayer>,
+    registry_dir: Option<&FsPath>,
 ) -> Router {
     let limiter = Arc::new(RateLimiter::new(requests_per_minute));
     let protected = Router::new()
@@ -992,7 +1047,9 @@ fn app_with_auth_health_and_cors(
         .route("/v1/projects/:handle/blobs/has", post(post_blobs_has))
         .route(
             "/v1/projects/:handle/blobs/:hash",
-            put(put_blob).get(get_blob),
+            put(put_blob)
+                .get(get_blob)
+                .layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
         )
         .layer(middleware::from_fn_with_state(auth, auth::require_auth));
     let router = Router::new()
@@ -1005,18 +1062,184 @@ fn app_with_auth_health_and_cors(
         .layer(RequestDecompressionLayer::new().gzip(true))
         .layer(middleware::from_fn_with_state(limiter, enforce_rate_limit))
         .layer(Extension(health));
-    // CORS goes outermost, so a preflight is answered before auth or the rate
-    // limiter can reject it. A browser sends `OPTIONS` without the
+    // CORS sits outside auth and the rate limiter, so a preflight is answered
+    // before either can reject it. A browser sends `OPTIONS` without the
     // `Authorization` header, so a preflight behind auth always fails — and a
     // failed preflight means the real request is never sent at all.
-    match cors {
+    let router = match cors {
         Some(cors) => router.layer(cors),
         None => router,
-    }
-    .with_state(db)
+    };
+    // Outermost of all: a request id is assigned before anything else can log,
+    // the trace span carries it, and the id is echoed on the response so a
+    // client's report can be matched to a log line.
+    let router = router
+        .layer(PropagateRequestIdLayer::x_request_id())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(request_span)
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
+    let operational = operational_routes(&db, registry_dir);
+    router.with_state(db).merge(operational)
 }
 
-/// Print the URLs a phone or emulator can actually paste in.
+/// The span every log line for a request is written under.
+///
+/// Method, path, and the request id — nothing from the headers. `Authorization`
+/// carries a bearer token, and a log line is the one place it must never land.
+fn request_span(request: &Request<axum::body::Body>) -> tracing::Span {
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-");
+    tracing::info_span!(
+        "request",
+        method = %request.method(),
+        path = %request.uri().path(),
+        request_id = %request_id
+    )
+}
+
+/// Routes for the orchestrator and the app's discovery fetch, outside every
+/// layer the API carries.
+///
+/// Merged after the layers on purpose. A readiness probe must not need a
+/// token, must not spend a client's rate budget, and should not write a log
+/// line every few seconds; a registry document is public and static. None of
+/// those are exceptions the API middleware should be asked to make.
+fn operational_routes(db: &SharedDb, registry_dir: Option<&FsPath>) -> Router {
+    let data_dir = db.lock().unwrap().data_dir.clone();
+    let mut router = Router::new()
+        .route("/v1/ready", get(get_ready))
+        .with_state(ReadinessState { data_dir });
+    if let Some(directory) = registry_dir {
+        router = router
+            .route_service(
+                "/providers.json",
+                ServeFile::new(directory.join("providers.json")),
+            )
+            .route_service(
+                "/plugins.json",
+                ServeFile::new(directory.join("plugins.json")),
+            );
+    }
+    router
+}
+
+#[derive(Clone)]
+struct ReadinessState {
+    /// `None` for the in-memory database, which has nothing that can go missing.
+    data_dir: Option<PathBuf>,
+}
+
+/// Whether this instance can serve requests: its data directory is present and
+/// writable, and the state file — if one has been written yet — is not empty.
+///
+/// The state file is not parsed. It holds every commit, and re-reading it on
+/// each probe would turn a readiness check into a periodic full load. Absent
+/// is fine: a fresh data directory has no state file until the first write.
+fn readiness(data_dir: &FsPath) -> Result<(), String> {
+    let blobs = data_dir.join("blobs");
+    if !blobs.is_dir() {
+        return Err(format!("{} is not a directory", blobs.display()));
+    }
+    let probe = data_dir.join(".ready-probe");
+    fs::write(&probe, b"ready").map_err(|error| format!("write {}: {error}", probe.display()))?;
+    fs::remove_file(&probe).map_err(|error| format!("remove {}: {error}", probe.display()))?;
+    let state = data_dir.join("state.json");
+    match fs::metadata(&state) {
+        Ok(metadata) if metadata.len() == 0 => Err(format!("{} is empty", state.display())),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("read {}: {error}", state.display())),
+    }
+}
+
+async fn get_ready(State(state): State<ReadinessState>) -> Response {
+    let Some(data_dir) = state.data_dir else {
+        return Json(json!({ "status": "ready" })).into_response();
+    };
+    // Filesystem calls, off the async runtime's threads.
+    match tokio::task::spawn_blocking(move || readiness(&data_dir)).await {
+        Ok(Ok(())) => Json(json!({ "status": "ready" })).into_response(),
+        Ok(Err(reason)) => not_ready(reason),
+        Err(error) => not_ready(format!("readiness check did not complete: {error}")),
+    }
+}
+
+fn not_ready(reason: String) -> Response {
+    warn!("not ready: {reason}");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "status": "not_ready", "reason": reason })),
+    )
+        .into_response()
+}
+
+/// Resolves on SIGINT or SIGTERM: Ctrl-C at a terminal, or an orchestrator
+/// asking this process to stop.
+async fn shutdown_signal() {
+    let interrupt = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            fail(format!("install SIGINT handler: {error}"));
+        }
+        "SIGINT"
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                terminate.recv().await;
+            }
+            Err(error) => fail(format!("install SIGTERM handler: {error}")),
+        }
+        "SIGTERM"
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<&str>();
+    let received = tokio::select! {
+        name = interrupt => name,
+        name = terminate => name,
+    };
+    info!("received {received}; draining connections");
+}
+
+/// Build the authentication state, waiting for the identity provider.
+///
+/// OAuth start-up discovers the issuer and fetches its keys, and in a fresh
+/// deployment the identity provider is often still coming up when this server
+/// starts. Rather than exit and be restarted by the orchestrator with its own
+/// growing back-off, keep trying here with ours; the startup probe bounds how
+/// long a pod may spend in this loop. Every failure is logged, so a
+/// misconfiguration is visible rather than a silent stall.
+async fn authenticate_with_retry(config: &config::ServerConfig) -> auth::AuthState {
+    const INITIAL_DELAY: Duration = Duration::from_secs(2);
+    const MAXIMUM_DELAY: Duration = Duration::from_secs(30);
+
+    let mut delay = INITIAL_DELAY;
+    let mut attempt: u32 = 1;
+    loop {
+        match auth::build_auth_state(&config.provider_id, &config.authentication).await {
+            Ok(auth) => return auth,
+            Err(error) => {
+                warn!(
+                    attempt,
+                    retry_in_seconds = delay.as_secs(),
+                    "initialize authentication: {error}"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(MAXIMUM_DELAY);
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// Log the URLs a phone or emulator can actually paste in.
 ///
 /// Worth the lines because the alternative is a fifteen-second connect timeout
 /// with no hint of what to try instead. A loopback listener is not reachable
@@ -1024,11 +1247,11 @@ fn app_with_auth_health_and_cors(
 /// some system images and silently drops from others — so the address that does
 /// work is spelled out here rather than left to a README the reader has already
 /// followed.
-fn print_device_addresses(config: &config::ServerConfig, secure: bool) {
+fn log_device_addresses(config: &config::ServerConfig, secure: bool) {
     let scheme = if secure { "https" } else { "http" };
     let port = config.listen.port();
     if config.listen.ip().is_loopback() {
-        println!(
+        info!(
             "device access: none — this listener is loopback-only. Restart with `--listen 0.0.0.0:{port} --allow-insecure-non-loopback` to reach it from a device."
         );
         return;
@@ -1044,19 +1267,16 @@ fn print_device_addresses(config: &config::ServerConfig, secure: bool) {
         .filter(|address| !address.contains(':'))
         .map(|address| format!("{scheme}://{address}:{port}"))
         .collect();
-    match reachable.split_first() {
-        Some((first, rest)) => {
-            println!("device access: {first}");
-            for address in rest {
-                println!("               {address}");
-            }
-        }
-        None => println!("device access: no non-loopback IPv4 address found on this machine"),
+    if reachable.is_empty() {
+        info!("device access: no non-loopback IPv4 address found on this machine");
+    } else {
+        info!("device access: {}", reachable.join(" "));
     }
 }
 
 #[tokio::main]
 async fn main() {
+    init_tracing();
     let args: Vec<String> = env::args().collect();
     let port_override: Option<u16> = args
         .windows(2)
@@ -1094,17 +1314,20 @@ async fn main() {
         .map(|window| {
             window[1]
                 .parse()
-                .unwrap_or_else(|error| panic!("--listen {}: {error}", window[1]))
+                .unwrap_or_else(|error| fail(format!("--listen {}: {error}", window[1])))
         });
     let allow_insecure_non_loopback = args
         .iter()
         .any(|argument| argument == "--allow-insecure-non-loopback");
     let mut config = if let Some(path) = config_path {
         let source = fs::read_to_string(&path).unwrap_or_else(|error| {
-            panic!("read server configuration {}: {error}", path.display())
+            fail(format!(
+                "read server configuration {}: {error}",
+                path.display()
+            ))
         });
         config::ServerConfig::from_toml(&source)
-            .unwrap_or_else(|error| panic!("invalid server configuration: {error}"))
+            .unwrap_or_else(|error| fail(format!("invalid server configuration: {error}")))
     } else {
         config::ServerConfig::unauthenticated_legacy(
             SocketAddr::from(([127, 0, 0, 1], port_override.unwrap_or(4242))),
@@ -1147,7 +1370,7 @@ async fn main() {
         // Half a pair is a typo, not a request to fall back to plain HTTP or to
         // a self-signed chain the caller did not ask for.
         (Some(_), None) | (None, Some(_)) => {
-            panic!("--tls-cert and --tls-key must be given together")
+            fail("--tls-cert and --tls-key must be given together")
         }
         (None, None) => {
             if tls_requested || !tls_subject_alt_names.is_empty() {
@@ -1160,23 +1383,44 @@ async fn main() {
     }
     config
         .validate()
-        .unwrap_or_else(|error| panic!("invalid server configuration: {error}"));
+        .unwrap_or_else(|error| fail(format!("invalid server configuration: {error}")));
+    // Checked here rather than in `validate`, so the shipped configuration can
+    // be validated on a machine that does not have the directory.
+    if let Some(directory) = &config.registry_dir {
+        if !directory.is_dir() {
+            fail(format!(
+                "registry_dir {} is not a directory",
+                directory.display()
+            ));
+        }
+        for name in ["providers.json", "plugins.json"] {
+            if !directory.join(name).is_file() {
+                warn!(
+                    "registry_dir {} has no {name}; /{name} will answer 404",
+                    directory.display()
+                );
+            }
+        }
+    }
 
-    let mut database =
-        Db::open(&config.data_dir).expect("server data directory should be writable");
+    let mut database = Db::open(&config.data_dir).unwrap_or_else(|error| {
+        fail(format!(
+            "open data directory {}: {error}",
+            config.data_dir.display()
+        ))
+    });
     database
         .prepare_ownership(&config.authentication)
-        .unwrap_or_else(|error| panic!("initialize project ownership: {error}"));
+        .unwrap_or_else(|error| fail(format!("initialize project ownership: {error}")));
     let db: SharedDb = Arc::new(Mutex::new(database));
-    let auth = auth::build_auth_state(&config.provider_id, &config.authentication)
-        .await
-        .unwrap_or_else(|error| panic!("initialize authentication: {error}"));
+    let auth = authenticate_with_retry(&config).await;
     let app = app_with_auth_health_and_cors(
         db,
         config.requests_per_minute,
         auth,
         HealthDocument::from_config(&config),
         cors_layer(&config.allowed_origins),
+        config.registry_dir.as_deref(),
     );
 
     // Prepared before the banner so the certificate's names can be reported,
@@ -1184,10 +1428,10 @@ async fn main() {
     // the first connection.
     let tls = config.tls.as_ref().map(|tls_config| {
         tls::prepare(tls_config, &config.data_dir, config.listen)
-            .unwrap_or_else(|error| panic!("initialize TLS: {error}"))
+            .unwrap_or_else(|error| fail(format!("initialize TLS: {error}")))
     });
 
-    println!(
+    info!(
         "auru-pm server listening on {}://{}; data: {}; limit: {} requests/minute/client",
         if tls.is_some() { "https" } else { "http" },
         config.listen,
@@ -1195,12 +1439,19 @@ async fn main() {
         config.requests_per_minute
     );
     if config.allowed_origins.is_empty() {
-        println!("cross-origin browser access: disabled (allowed_origins is empty)");
+        info!("cross-origin browser access: disabled (allowed_origins is empty)");
     } else {
-        println!(
+        info!(
             "cross-origin browser access: {}",
             config.allowed_origins.join(", ")
         );
+    }
+    match &config.registry_dir {
+        Some(directory) => info!(
+            "registry: /providers.json and /plugins.json from {}",
+            directory.display()
+        ),
+        None => info!("registry: not served (registry_dir is unset)"),
     }
     if let Some(authority) = tls
         .as_ref()
@@ -1208,43 +1459,58 @@ async fn main() {
     {
         // A self-signed chain is useless until the client is told to trust it,
         // and the path to the anchor is the one thing nobody can guess.
-        println!(
+        info!(
             "TLS: self-signed development certificate for {}",
             authority.subject_alt_names.join(", ")
         );
-        println!(
-            "     trust anchor: {}",
+        info!(
+            "TLS: trust anchor: {}",
             authority.certificate_path.display()
         );
-        println!("     fingerprint:  {}", authority.fingerprint);
-        println!(
-            "     Android debug builds pick this up from auru-pm-mobile; see that repo's README."
+        info!("TLS: fingerprint: {}", authority.fingerprint);
+        info!(
+            "TLS: Android debug builds pick this up from auru-pm-mobile; see that repo's README."
         );
     }
-    print_device_addresses(&config, tls.is_some());
+    log_device_addresses(&config, tls.is_some());
 
     match tls {
         Some(material) => {
-            axum_server::bind_rustls(
+            // axum-server binds lazily inside `serve`, so a taken port surfaces
+            // there rather than from a separate bind step.
+            let handle = axum_server::Handle::new();
+            let stopper = handle.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                stopper.graceful_shutdown(Some(TLS_DRAIN_TIMEOUT));
+            });
+            if let Err(error) = axum_server::bind_rustls(
                 config.listen,
                 RustlsConfig::from_config(Arc::new(material.server_config)),
             )
+            .handle(handle)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
-            .expect("HTTPS server should run until shutdown");
+            {
+                fail(format!("serve https on {}: {error}", config.listen));
+            }
         }
         None => {
             let listener = tokio::net::TcpListener::bind(config.listen)
                 .await
-                .expect("server address should be available");
-            axum::serve(
+                .unwrap_or_else(|error| fail(format!("bind {}: {error}", config.listen)));
+            if let Err(error) = axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
             )
+            .with_graceful_shutdown(shutdown_signal())
             .await
-            .expect("HTTP server should run until shutdown");
+            {
+                fail(format!("serve http on {}: {error}", config.listen));
+            }
         }
     }
+    info!("stopped");
 }
 
 #[cfg(test)]
@@ -1310,6 +1576,109 @@ mod tests {
                 "message": "a bearer token is required"
             })
         );
+    }
+
+    #[tokio::test]
+    async fn ready_should_be_reachable_without_a_token_and_outside_the_rate_limiter() {
+        let db: SharedDb = Arc::new(Mutex::new(Db::default()));
+        let auth = auth::AuthState::oauth("studio-pm", Arc::new(RejectAllTokens));
+        let app = app_with_auth(db, 1, auth);
+        let get = |uri: &'static str| {
+            app.clone().oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+        };
+
+        // The one request the limiter allows this minute.
+        assert_eq!(get("/v1/health").await.unwrap().status(), StatusCode::OK);
+        // The probe needs no token and is not counted against that budget.
+        assert_eq!(get("/v1/ready").await.unwrap().status(), StatusCode::OK);
+        assert_eq!(get("/v1/ready").await.unwrap().status(), StatusCode::OK);
+        // And the budget really was spent by the API request.
+        assert_eq!(
+            get("/v1/health").await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[test]
+    fn readiness_should_check_the_data_directory_without_parsing_state() {
+        let temp = tempfile::tempdir().expect("temporary data directory");
+        Db::open(temp.path()).expect("open database");
+        readiness(temp.path()).expect("a freshly opened data directory is ready");
+        assert!(!temp.path().join(".ready-probe").exists());
+
+        fs::write(temp.path().join("state.json"), b"").expect("truncate state");
+        let error = readiness(temp.path()).expect_err("an empty state file is a torn write");
+        assert!(error.contains("empty"), "{error}");
+
+        fs::remove_dir_all(temp.path().join("blobs")).expect("remove blobs");
+        let error = readiness(temp.path()).expect_err("no blob directory");
+        assert!(error.contains("blobs"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn registry_documents_should_be_served_from_registry_dir() {
+        let registry = tempfile::tempdir().expect("temporary registry directory");
+        fs::write(
+            registry.path().join("providers.json"),
+            br#"{"providers":[{"id":"studio-pm","name":"Studio","endpoint":"https://pm.example.com"}]}"#,
+        )
+        .expect("write providers.json");
+        let db: SharedDb = Arc::new(Mutex::new(Db::default()));
+        let config = config::ServerConfig::unauthenticated_legacy(
+            SocketAddr::from(([127, 0, 0, 1], 4242)),
+            PathBuf::from("auru-pm-server-data"),
+            600,
+        );
+        let app = app_with_auth_health_and_cors(
+            db,
+            600,
+            auth::AuthState::oauth("studio-pm", Arc::new(RejectAllTokens)),
+            HealthDocument::from_config(&config),
+            None,
+            Some(registry.path()),
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/providers.json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let document: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(document["providers"][0]["id"], "studio-pm");
+
+        // The other document was not provided, so it is absent rather than
+        // empty: an empty plugin list would replace the app's bundled one.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/plugins.json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1855,6 +2224,7 @@ strategy = "jwt"
             auth::AuthState::oauth("studio-pm", Arc::new(RejectAll)),
             HealthDocument::from_config(config),
             cors_layer(&config.allowed_origins),
+            None,
         )
     }
 
@@ -1937,7 +2307,10 @@ strategy = "jwt"
         // own client, and an older phone build that picks by flow rather than
         // kind still finds a device-authorization client to use.
         assert_eq!(
-            authentication.client(OAuthClientKind::Native).unwrap().client_id,
+            authentication
+                .client(OAuthClientKind::Native)
+                .unwrap()
+                .client_id,
             "desktop"
         );
     }

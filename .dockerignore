@@ -1,0 +1,14 @@
+# The image builds only the headless crates; everything else is context bloat.
+# README.md stays: the server manifest points at it. crates/auru-pm/data/
+# stays: plugins.json is compiled into the build.
+target
+**/target
+**/node_modules
+apps
+sdk
+spec
+deploy
+auru-pm-server-data
+crates/auru-pm-server/server.toml
+.git
+.github

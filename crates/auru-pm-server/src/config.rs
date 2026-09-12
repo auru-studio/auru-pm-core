@@ -21,6 +21,16 @@ pub struct ServerConfig {
     pub data_dir: PathBuf,
     #[serde(default = "default_requests_per_minute")]
     pub requests_per_minute: u32,
+    /// Directory holding the registry documents this server publishes.
+    ///
+    /// `providers.json` in it is served at `/providers.json` and `plugins.json`
+    /// at `/plugins.json` — the two documents the Auru app fetches from
+    /// `pm.auru.studio` at startup. Absent by default, which serves neither: a
+    /// studio's own server has no catalogue to publish. Existence is checked at
+    /// startup rather than here, so a configuration can be validated on a
+    /// machine that does not have the directory.
+    #[serde(default)]
+    pub registry_dir: Option<PathBuf>,
     /// Browser origins permitted to call this server cross-origin.
     ///
     /// Empty by default, which installs no CORS layer at all — a server that
@@ -63,6 +73,7 @@ impl ServerConfig {
             public_base_url: None,
             data_dir,
             requests_per_minute,
+            registry_dir: None,
             allowed_origins: Vec::new(),
             tls: None,
             authentication: AuthenticationConfig::default(),
@@ -620,6 +631,31 @@ issuer = "https://identity.example.com"
     fn shipped_oauth_example_should_remain_valid() {
         ServerConfig::from_toml(include_str!("../server.example.toml"))
             .expect("shipped server configuration");
+    }
+
+    #[test]
+    fn shipped_production_example_should_remain_valid() {
+        // The file the container image expects at /etc/auru-pm/server.toml.
+        // `registry_dir` names a path that exists only inside the image, which
+        // is why its existence is checked at startup rather than by `validate`.
+        let config =
+            ServerConfig::from_toml(include_str!("../../../deploy/server.prod.example.toml"))
+                .expect("shipped production configuration");
+        assert_eq!(config.provider_id, "auru-cloud");
+        assert_eq!(
+            config.registry_dir.as_deref(),
+            Some(std::path::Path::new("/etc/auru-pm/registry"))
+        );
+        assert!(config.tls.is_none(), "the ingress owns TLS");
+        assert!(config.allowed_origins.is_empty());
+        let AuthenticationConfig::OAuth(oauth) = config.authentication else {
+            panic!("OAuth configuration");
+        };
+        assert!(matches!(oauth.validation, TokenValidationConfig::Jwt));
+        assert!(
+            oauth.mobile_client.is_some(),
+            "the phones have their own registration"
+        );
     }
 
     #[test]

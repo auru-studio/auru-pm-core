@@ -163,6 +163,27 @@ from an older unauthenticated server is not assigned implicitly: OAuth startup
 refuses until `legacy_owner_subject` explicitly names its owner. Access and
 refresh tokens are stored only in the desktop OS keychain.
 
+### Deploying the server
+
+[`deploy/`](deploy/) holds what a hosted instance needs beyond the binary:
+[`server.prod.example.toml`](deploy/server.prod.example.toml) is the
+configuration the root [`Dockerfile`](Dockerfile) expects at
+`/etc/auru-pm/server.toml`, and [`deploy/registry/`](deploy/registry/) holds
+the `providers.json` and `plugins.json` documents the server publishes at
+`/providers.json` and `/plugins.json` when `registry_dir` points at them.
+`plugins.json` there is a verbatim copy of the bundled
+`crates/auru-pm/data/plugins.json`; CI refuses to build the image when they
+differ, because the app replaces its bundled list with the served one.
+`release-server.yml` publishes the image to
+`ghcr.io/<owner>/auru-pm-server`, tagged by commit and by `server-v*` tag, and
+records the digest to pin.
+
+At runtime the server logs to stderr through `tracing` — `RUST_LOG` filters
+it, `AURU_PM_LOG_FORMAT=json` switches to JSON lines — answers `GET /v1/ready`
+outside authentication and the rate limiter for an orchestrator's readiness
+probe, waits for the identity provider with a backoff at startup rather than
+exiting, and drains open connections on SIGTERM.
+
 ## GPUI inspection and automation
 
 The desktop app integrates the published `gpui-mcp` crate behind an explicit

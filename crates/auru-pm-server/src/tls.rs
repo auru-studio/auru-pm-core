@@ -169,11 +169,10 @@ fn load_or_create_authority(directory: &Path) -> Result<Authority, String> {
         (None, None) => {
             // Loud, because every client that bundled the previous authority
             // stops being able to complete a handshake the moment this happens.
-            println!(
-                "TLS: minting a new development authority in {}",
+            tracing::warn!(
+                "TLS: minting a new development authority in {}; rebuild and reinstall any client that bundled the previous one",
                 directory.display()
             );
-            println!("     Rebuild and reinstall any client that bundled the previous one.");
             create_authority(directory, &certificate_path, &key_path)?
         }
         // Half a pair is not repaired by overwriting it. Re-minting would throw

@@ -1,0 +1,14 @@
+{
+  "providers": [
+    {
+      "id": "auru-cloud",
+      "name": "Auru Cloud",
+      "endpoint": "https://pm.auru.studio",
+      "auth_methods": ["authorization_code_pkce", "oauth_device_code"],
+      "description": "Project history hosted by Auru. Sign in with your Auru account.",
+      "detail": "Hosted · pm.auru.studio",
+      "recommended": true,
+      "availability": "recommended"
+    }
+  ]
+}

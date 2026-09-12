@@ -1,0 +1,60 @@
+# Fallback image pipeline on Forgejo (self-hosted runners + Forgejo's built-in
+# container registry). Mirrors .github/workflows/docker.yml; either registry
+# works with auru-infra — pick one in apps/overlays/prod/kustomization.yaml.
+#
+# Repo secrets: none required. The workflow's automatic token can push
+# packages to the repository owner's namespace. Set REGISTRY_TOKEN (a Forgejo
+# access token with package:write) only if your instance restricts that.
+name: Server image (Forgejo)
+
+on:
+  push:
+    branches: [main]
+    tags: ["server-v*"]
+  workflow_dispatch:
+
+jobs:
+  image:
+    name: ${{ matrix.image }}
+    runs-on: linux-amd64
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: auru-pm-server
+            context: .
+    env:
+      REGISTRY: ${{ vars.REGISTRY_HOST || 'git.pottsnpans.house' }}
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v4
+
+      - name: Hosted plugin registry must match the bundled one
+        run: cmp crates/auru-pm/data/plugins.json deploy/registry/plugins.json
+
+      - name: Log in to the Forgejo registry
+        run: |
+          echo "${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}" \
+            | docker login "$REGISTRY" -u "${{ vars.REGISTRY_USER || github.actor }}" --password-stdin
+
+      - name: Build and push
+        id: push
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="$(echo '${{ github.repository_owner }}' | tr 'A-Z' 'a-z')"
+          image="$REGISTRY/$owner/${{ matrix.image }}"
+          sha_tag="sha-${{ github.sha }}"
+          tags=(-t "$image:$sha_tag")
+          case "${{ github.ref }}" in
+            refs/heads/main) tags+=(-t "$image:main") ;;
+            refs/tags/server-v*) tags+=(-t "$image:${GITHUB_REF_NAME#server-v}") ;;
+          esac
+          docker build --pull "${tags[@]}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            "${{ matrix.context }}"
+          for t in "${tags[@]}"; do [[ "$t" == -t ]] && continue; docker push "$t"; done
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$image:$sha_tag" | cut -d@ -f2)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "$image@$digest" >> "$GITHUB_STEP_SUMMARY"
+          echo "pushed $image@$digest"

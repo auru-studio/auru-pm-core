@@ -29,9 +29,16 @@ ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
-tower-http = { version = "0.6", features = ["cors", "decompression-gzip"] }
+# `signal` for graceful shutdown on SIGINT/SIGTERM.
+tokio = { workspace = true, features = ["signal"] }
+# `fs` serves the provider and plugin registry documents; `request-id` and
+# `trace` give every request a correlation id and one structured log line.
+tower-http = { version = "0.6", features = ["cors", "decompression-gzip", "fs", "request-id", "trace"] }
 toml = "0.8"
+tracing = "0.1"
+# `RUST_LOG` filtering, human-readable output by default, JSON lines when
+# `AURU_PM_LOG_FORMAT=json` for a log pipeline.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 url = "2"
 
 [dev-dependencies]
