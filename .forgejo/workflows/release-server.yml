@@ -56,8 +56,16 @@ jobs:
           docker version --format 'client {{.Client.Version}} / daemon {{.Server.Version}}'
           docker buildx version
           if [[ "$b" != "$TARGET_ARCH" ]]; then
-            echo "runner is $b, target is $TARGET_ARCH: registering QEMU binfmt handlers (emulated build, expect it to be slow)"
-            docker run --privileged --rm tonistiigi/binfmt:qemu-v9.2.2 --install "$TARGET_ARCH" >/dev/null
+            # The Rust stages cross-compile natively; only the small runtime
+            # stage runs under QEMU. Register the handler only if it is missing:
+            # re-registering while another build is running makes in-flight
+            # execs fail with "Exec format error".
+            if docker run --rm --platform "linux/$TARGET_ARCH" alpine:3.20 true >/dev/null 2>&1; then
+              echo "QEMU handler for $TARGET_ARCH already registered"
+            else
+              echo "registering QEMU binfmt handler for $TARGET_ARCH"
+              docker run --privileged --rm tonistiigi/binfmt:qemu-v9.2.2 --install "$TARGET_ARCH" >/dev/null
+            fi
           fi
 
       - name: Log in to the Forgejo registry
