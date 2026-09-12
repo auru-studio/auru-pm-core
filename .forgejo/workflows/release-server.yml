@@ -25,6 +25,9 @@ jobs:
             context: .
     env:
       REGISTRY: ${{ vars.REGISTRY_HOST || 'git.pottsnpans.house' }}
+      # The static docker CLI in the job has no buildx plugin; this makes it use
+      # the daemon's built-in BuildKit (needed for RUN --mount cache mounts).
+      DOCKER_BUILDKIT: "1"
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v4
 
