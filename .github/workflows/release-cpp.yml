@@ -18,6 +18,8 @@ permissions:
 
 jobs:
   package:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     strategy:
       fail-fast: false
       matrix:
@@ -79,6 +81,8 @@ jobs:
   # deliberately rather than by a tag push. This job only produces the recipe
   # exactly as it would be submitted, so the diff is easy to prepare.
   conancenter-bundle:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

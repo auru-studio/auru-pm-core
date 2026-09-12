@@ -10,6 +10,8 @@ permissions:
 
 jobs:
   core:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +27,8 @@ jobs:
   # socket, or keychain dependency reaches the kernel, this job fails — which is
   # the whole reason the kernel is a separate crate rather than a feature flag.
   portable-kernel:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,6 +41,8 @@ jobs:
   # Every SDK verifies the same canonical-encoding vectors. A vector that passes
   # in one language and fails in another is exactly what the spec exists to catch.
   spec:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,6 +55,8 @@ jobs:
   # other. A commit whose id an implementation cannot reproduce is rejected by
   # every provider, so this is the check that keeps an SDK honest.
   bindings:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -88,6 +96,8 @@ jobs:
   # `typecheck` is a separate step from `test` on purpose — vitest does not
   # typecheck, so a type error can otherwise sail through a green test run.
   sdk-typescript:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -121,6 +131,8 @@ jobs:
   # a binary that cannot reproduce a commit id is worse than a missing one,
   # since the fallback would have worked.
   native-addons:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     strategy:
       fail-fast: false
       matrix:
@@ -186,6 +198,8 @@ jobs:
   # than binding to the Rust kernel — so the conformance vectors are the only
   # thing standing between it and a commit id no provider accepts.
   sdk-java:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -212,6 +226,8 @@ jobs:
   # rather than binding to the Rust kernel — so the conformance vectors are the
   # only thing standing between it and a commit id no provider accepts.
   sdk-cpp:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     strategy:
       fail-fast: false
       matrix:
@@ -255,6 +271,8 @@ jobs:
   # commit id from the packaged library and compares it against the published
   # vector — a package that built but encodes differently fails here.
   sdk-cpp-conan:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -277,6 +295,8 @@ jobs:
   # itself — so the conformance vectors are the only thing standing between it
   # and a commit id no provider accepts.
   sdk-swift:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     strategy:
       fail-fast: false
       matrix:
@@ -306,6 +326,8 @@ jobs:
   # would drift silently, and the symptom would be memory corruption rather than
   # a compile error — so regeneration must produce no diff.
   capi-header:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -323,6 +345,8 @@ jobs:
   # slice, which is the only place a wrong hash surfaces as a test failure
   # rather than as a crash in a simulator.
   kernel-apple:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -343,6 +367,8 @@ jobs:
   # where a marshalling bug is a test failure; cross-compiling only changes
   # which linker produced the library.
   kernel-android:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -376,6 +402,8 @@ jobs:
           path: sdk/java/native/jniLibs
 
   desktop:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
     defaults:
       run:

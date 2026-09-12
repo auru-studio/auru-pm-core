@@ -17,6 +17,8 @@ permissions:
 
 jobs:
   release:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
     defaults:
       run:

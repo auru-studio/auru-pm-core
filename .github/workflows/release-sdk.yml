@@ -20,6 +20,8 @@ jobs:
   # Every native addon, built where it will run and checked against the
   # published vectors before it is allowed near npm.
   addons:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     strategy:
       fail-fast: true
       matrix:
@@ -77,6 +79,8 @@ jobs:
           path: sdk/typescript/platforms/${{ matrix.platform }}
 
   publish:
+    # GitHub-hosted only; Forgejo runs .forgejo/workflows instead.
+    if: ${{ github.server_url == 'https://github.com' }}
     needs: addons
     runs-on: ubuntu-latest
     permissions:
