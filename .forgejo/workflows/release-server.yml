@@ -28,6 +28,10 @@ jobs:
       # Build with BuildKit (the Docker CLI step installs the buildx plugin;
       # needed for RUN --mount cache mounts and # syntax= Dockerfiles).
       DOCKER_BUILDKIT: "1"
+      # CPU architecture of the k3s node the image will run on. The runner must
+      # be native for it: emulated Rust builds take hours and DOCKER_DEFAULT_PLATFORM
+      # on a mislabelled runner silently produces the wrong image.
+      TARGET_ARCH: ${{ vars.TARGET_ARCH || 'arm64' }}
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v4
 
@@ -51,6 +55,8 @@ jobs:
           chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
           docker version --format 'client {{.Client.Version}} / daemon {{.Server.Version}}'
           docker buildx version
+          [[ "$b" == "$TARGET_ARCH" ]] || { echo "runner is $b but TARGET_ARCH is $TARGET_ARCH; use a native $TARGET_ARCH image-builder runner" >&2; exit 1; }
+          [[ -z "${DOCKER_DEFAULT_PLATFORM:-}" || "$DOCKER_DEFAULT_PLATFORM" == "linux/$TARGET_ARCH" ]] || { echo "DOCKER_DEFAULT_PLATFORM=$DOCKER_DEFAULT_PLATFORM would emulate a different arch" >&2; exit 1; }
 
       - name: Log in to the Forgejo registry
         run: |
@@ -70,12 +76,14 @@ jobs:
             "refs/heads/${{ github.event.repository.default_branch }}") tags+=(-t "$image:latest") ;;
             refs/tags/server-v*) tags+=(-t "$image:${GITHUB_REF_NAME#server-v}") ;;
           esac
-          docker build --pull "${tags[@]}" \
+          docker build --pull --platform "linux/$TARGET_ARCH" "${tags[@]}" \
             --label "org.opencontainers.image.revision=${{ github.sha }}" \
             --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
             "${{ matrix.context }}"
           for t in "${tags[@]}"; do [[ "$t" == -t ]] && continue; docker push "$t"; done
+          built_arch="$(docker inspect --format '{{.Architecture}}' "$image:$sha_tag")"
+          [[ "$built_arch" == "$TARGET_ARCH" ]] || { echo "built $built_arch, expected $TARGET_ARCH" >&2; exit 1; }
           digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$image:$sha_tag" | cut -d@ -f2)"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-          echo "$image@$digest" >> "$GITHUB_STEP_SUMMARY"
-          echo "pushed $image@$digest"
+          echo "$image@$digest ($built_arch)" >> "$GITHUB_STEP_SUMMARY"
+          echo "pushed $image@$digest ($built_arch)"
