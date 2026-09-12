@@ -16,7 +16,7 @@ on:
 jobs:
   image:
     name: ${{ matrix.image }}
-    runs-on: linux-amd64
+    runs-on: image-builder
     strategy:
       fail-fast: false
       matrix:
