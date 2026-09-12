@@ -25,8 +25,8 @@ jobs:
             context: .
     env:
       REGISTRY: ${{ vars.REGISTRY_HOST || 'git.pottsnpans.house' }}
-      # The static docker CLI in the job has no buildx plugin; this makes it use
-      # the daemon's built-in BuildKit (needed for RUN --mount cache mounts).
+      # Build with BuildKit (the Docker CLI step installs the buildx plugin;
+      # needed for RUN --mount cache mounts and # syntax= Dockerfiles).
       DOCKER_BUILDKIT: "1"
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v4
@@ -37,12 +37,20 @@ jobs:
       - name: Docker CLI (job runs in node:20-bookworm; the daemon is the runner host's)
         run: |
           set -euo pipefail
+          arch="$(uname -m)"
+          case "$arch" in x86_64) a=x86_64; b=amd64 ;; aarch64) a=aarch64; b=arm64 ;; *) echo "unsupported arch $arch"; exit 1 ;; esac
           if ! command -v docker >/dev/null; then
-            arch="$(uname -m)"; case "$arch" in x86_64) a=x86_64 ;; aarch64) a=aarch64 ;; *) echo "unsupported arch $arch"; exit 1 ;; esac
             curl -fsSL "https://download.docker.com/linux/static/stable/${a}/docker-27.5.1.tgz" \
               | tar -xz --strip-components=1 -C /usr/local/bin docker/docker
           fi
+          # The static CLI ships without buildx, and Docker 27 needs the plugin
+          # for any BuildKit build (RUN --mount, # syntax= directives).
+          mkdir -p /usr/local/lib/docker/cli-plugins
+          curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-buildx \
+            "https://github.com/docker/buildx/releases/download/v0.37.1/buildx-v0.37.1.linux-${b}"
+          chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
           docker version --format 'client {{.Client.Version}} / daemon {{.Server.Version}}'
+          docker buildx version
 
       - name: Log in to the Forgejo registry
         run: |
