@@ -9,7 +9,7 @@ name: Server image (Forgejo)
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
     tags: ["server-v*"]
   workflow_dispatch:
 
@@ -31,6 +31,16 @@ jobs:
       - name: Hosted plugin registry must match the bundled one
         run: cmp crates/auru-pm/data/plugins.json deploy/registry/plugins.json
 
+      - name: Docker CLI (job runs in node:20-bookworm; the daemon is the runner host's)
+        run: |
+          set -euo pipefail
+          if ! command -v docker >/dev/null; then
+            arch="$(uname -m)"; case "$arch" in x86_64) a=x86_64 ;; aarch64) a=aarch64 ;; *) echo "unsupported arch $arch"; exit 1 ;; esac
+            curl -fsSL "https://download.docker.com/linux/static/stable/${a}/docker-27.5.1.tgz" \
+              | tar -xz --strip-components=1 -C /usr/local/bin docker/docker
+          fi
+          docker version --format 'client {{.Client.Version}} / daemon {{.Server.Version}}'
+
       - name: Log in to the Forgejo registry
         run: |
           echo "${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}" \
@@ -46,7 +56,7 @@ jobs:
           sha_tag="sha-${{ github.sha }}"
           tags=(-t "$image:$sha_tag")
           case "${{ github.ref }}" in
-            refs/heads/main) tags+=(-t "$image:main") ;;
+            "refs/heads/${{ github.event.repository.default_branch }}") tags+=(-t "$image:latest") ;;
             refs/tags/server-v*) tags+=(-t "$image:${GITHUB_REF_NAME#server-v}") ;;
           esac
           docker build --pull "${tags[@]}" \
