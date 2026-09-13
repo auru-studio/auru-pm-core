@@ -16,7 +16,8 @@ on:
 jobs:
   image:
     name: ${{ matrix.image }}
-    runs-on: image-builder
+    # Native runner for the target architecture (labels image-builder-arm64 / image-builder-amd64).
+    runs-on: image-builder-${{ vars.TARGET_ARCH || 'arm64' }}
     strategy:
       fail-fast: false
       matrix:
