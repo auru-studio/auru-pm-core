@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "auru/pm/content_hash.hpp"
@@ -41,6 +42,22 @@ struct TreeRef {
     static Result<TreeRef> from_json(const Json& json);
 };
 
+/// Why a commit was made, when it was not a person pressing Save Version.
+///
+/// A commit without an origin is a version a person saved. The member is left
+/// out of the wire form entirely when absent, so every explicit save keeps the
+/// id it was created with.
+enum class CommitOrigin {
+    /// Written by the app on a timer or at session end, not asked for.
+    Autosave,
+};
+
+/// The value as it appears on a commit.
+std::string_view commit_origin_wire_name(CommitOrigin origin) noexcept;
+
+/// The origin a wire value names. Fails on a value this library does not know.
+Result<CommitOrigin> parse_commit_origin(std::string_view text);
+
 /// One version in a project's history.
 ///
 /// `parents.size()` is the shape: 0 root, 1 normal, 2 merge.
@@ -76,6 +93,10 @@ public:
     /// falls back to the snapshot.
     const std::optional<ContentHash>& metadata() const noexcept { return metadata_; }
 
+    /// Why this commit was made, when it was not a person pressing Save
+    /// Version. Empty for a version a person saved.
+    const std::optional<CommitOrigin>& origin() const noexcept { return origin_; }
+
     /// The exact bytes this commit's id is the BLAKE3 of.
     ///
     /// Worth having when a provider rejects a commit: comparing these against
@@ -105,6 +126,7 @@ private:
     std::string auru_version_;
     std::int64_t format_version_ = 0;
     std::optional<ContentHash> metadata_;
+    std::optional<CommitOrigin> origin_;
 };
 
 /// Assembles a commit and derives its id.
@@ -121,6 +143,8 @@ public:
     Builder& auru_version(std::string value);
     Builder& format_version(std::int64_t value);
     Builder& metadata(ContentHash value);
+    /// Leave unset for a version a person saved.
+    Builder& origin(CommitOrigin value);
 
     /// Derive the id and produce the commit.
     ///
@@ -138,6 +162,7 @@ private:
     std::optional<std::string> auru_version_;
     std::optional<std::int64_t> format_version_;
     std::optional<ContentHash> metadata_;
+    std::optional<CommitOrigin> origin_;
 };
 
 }  // namespace auru::pm

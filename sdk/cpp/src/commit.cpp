@@ -68,6 +68,24 @@ Result<TreeRef> TreeRef::from_json(const Json& json) {
     return Result<TreeRef>::ok(TreeRef{snapshot.value(), samples.value()});
 }
 
+// ── CommitOrigin ─────────────────────────────────────────────────────────────
+
+std::string_view commit_origin_wire_name(CommitOrigin origin) noexcept {
+    switch (origin) {
+        case CommitOrigin::Autosave:
+            return "autosave";
+    }
+    return "autosave";
+}
+
+Result<CommitOrigin> parse_commit_origin(std::string_view text) {
+    if (text == "autosave") {
+        return Result<CommitOrigin>::ok(CommitOrigin::Autosave);
+    }
+    return make_error<CommitOrigin>(
+        ErrorCode::BadRequest, "unknown commit origin \"" + std::string(text) + "\"");
+}
+
 // ── Commit ───────────────────────────────────────────────────────────────────
 
 Json Commit::to_json_without_id() const {
@@ -88,6 +106,9 @@ Json Commit::to_json_without_id() const {
     json.set("format_version", Json::integer(format_version_));
     if (metadata_) {
         json.set("metadata", Json::string(metadata_->to_string()));
+    }
+    if (origin_) {
+        json.set("origin", Json::string(std::string(commit_origin_wire_name(*origin_))));
     }
     return json;
 }
@@ -200,6 +221,13 @@ Result<Commit> Commit::from_json(const Json& json) {
         }
         commit.metadata_ = metadata.value();
     }
+    if (auto origin_text = json.optional_string("origin")) {
+        auto origin = parse_commit_origin(*origin_text);
+        if (!origin) {
+            return Result<Commit>::fail(origin.error());
+        }
+        commit.origin_ = origin.value();
+    }
     return Result<Commit>::ok(std::move(commit));
 }
 
@@ -255,6 +283,11 @@ Commit::Builder& Commit::Builder::metadata(ContentHash value) {
     return *this;
 }
 
+Commit::Builder& Commit::Builder::origin(CommitOrigin value) {
+    origin_ = value;
+    return *this;
+}
+
 Result<Commit> Commit::Builder::build() const {
     if (!tree_) {
         return make_error<Commit>(ErrorCode::BadRequest, "a commit needs a tree");
@@ -291,6 +324,7 @@ Result<Commit> Commit::Builder::build() const {
     commit.auru_version_ = *auru_version_;
     commit.format_version_ = *format_version_;
     commit.metadata_ = metadata_;
+    commit.origin_ = origin_;
 
     auto canonical = commit.canonical_encoding();
     if (!canonical) {

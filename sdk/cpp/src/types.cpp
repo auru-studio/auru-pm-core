@@ -260,6 +260,13 @@ Result<CommitSummary> CommitSummary::from_json(const Json& json) {
     summary.timestamp = timestamp.value();
     summary.message = std::move(message).value();
     summary.description = json.optional_string("description").value_or("");
+    if (auto origin_text = json.optional_string("origin")) {
+        auto origin = parse_commit_origin(*origin_text);
+        if (!origin) {
+            return Result<CommitSummary>::fail(origin.error());
+        }
+        summary.origin = origin.value();
+    }
     return Result<CommitSummary>::ok(std::move(summary));
 }
 

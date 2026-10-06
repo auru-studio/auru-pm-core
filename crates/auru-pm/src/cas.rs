@@ -475,6 +475,7 @@ mod tests {
                 auru_version: "test".into(),
                 format_version: 8,
                 metadata: None,
+                origin: None,
             };
             commit.id = compute_commit_id(&commit).unwrap();
             provider.put_commit(&commit).await.unwrap();

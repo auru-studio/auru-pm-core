@@ -746,7 +746,7 @@ async fn get_history(
         }
         if started {
             // Build a CommitSummary (drop `tree` and other full-commit-only fields).
-            let summary = json!({
+            let mut summary = json!({
                 "id": full["id"],
                 "parents": full["parents"],
                 "author": full["author"],
@@ -754,6 +754,11 @@ async fn get_history(
                 "message": full["message"],
                 "description": full.get("description").cloned().unwrap_or(Value::String(String::new())),
             });
+            // Carried only when the stored commit has it, so a row for an
+            // explicit save looks exactly as it did before origins existed.
+            if let (Some(origin), Value::Object(map)) = (full.get("origin"), &mut summary) {
+                map.insert("origin".into(), origin.clone());
+            }
             out.push(summary);
             if out.len() >= limit {
                 break;
@@ -1973,6 +1978,7 @@ strategy = "jwt"
             auru_version: "0.1.0".to_owned(),
             format_version: 1,
             metadata: None,
+            origin: None,
         };
         commit.id = compute_commit_id(&commit).unwrap();
         let response = send_json(
@@ -2008,6 +2014,105 @@ strategy = "jwt"
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_autosave_commit_should_be_accepted_and_listed_with_its_origin() {
+        let db: SharedDb = Arc::new(Mutex::new(Db::default()));
+        let auth = auth::AuthState::oauth("studio-pm", Arc::new(AcceptTestToken));
+        let app = app_with_auth(db, 600, auth);
+        send_json(
+            &app,
+            axum::http::Method::PUT,
+            "/v1/projects/song",
+            "valid-test-token",
+            json!({"display_name": "Song", "format": "auru"}),
+        )
+        .await;
+        let snapshot = upload_project_blob(&app, "song", "valid-test-token", b"{}").await;
+        let manifest_bytes = SampleManifest::default().canonical_encoding().unwrap();
+        let samples = upload_project_blob(&app, "song", "valid-test-token", &manifest_bytes).await;
+        let mut commit = Commit {
+            id: auru_pm::CommitId(ContentHash::ZERO),
+            parents: Vec::new(),
+            tree: auru_pm::TreeRef { snapshot, samples },
+            author: auru_pm::AuthorIdentity {
+                display_name: "Alice Example".to_owned(),
+                provider_user_id: "user_123".to_owned(),
+                provider_id: "studio-pm".to_owned(),
+                email: Some("alice@example.com".to_owned()),
+            },
+            timestamp: 1_800_000_000,
+            message: "Autosave".to_owned(),
+            description: String::new(),
+            auru_version: "0.1.0".to_owned(),
+            format_version: 1,
+            metadata: None,
+            origin: Some(auru_pm::CommitOrigin::Autosave),
+        };
+        commit.id = compute_commit_id(&commit).unwrap();
+
+        let response = send_json(
+            &app,
+            axum::http::Method::POST,
+            "/v1/projects/song/commits",
+            "valid-test-token",
+            serde_json::to_value(&commit).unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = send_json(
+            &app,
+            axum::http::Method::POST,
+            "/v1/projects/song/head",
+            "valid-test-token",
+            json!({"from": null, "to": commit.id.0.to_string()}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/projects/song/history")
+                    .header(header::AUTHORIZATION, "Bearer valid-test-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listing: Value = serde_json::from_slice(&body).unwrap();
+        let rows = listing["commits"].as_array().expect("history rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], json!(commit.id.0.to_string()));
+        assert_eq!(rows[0]["origin"], json!("autosave"));
+        let row: auru_pm::CommitSummary = serde_json::from_value(rows[0].clone()).unwrap();
+        assert_eq!(row.origin, Some(auru_pm::CommitOrigin::Autosave));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/projects/song/commits/{}", commit.id.0))
+                    .header(header::AUTHORIZATION, "Bearer valid-test-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let fetched: Commit = serde_json::from_slice(&body).unwrap();
+        assert_eq!(fetched.id, commit.id);
+        assert_eq!(fetched.origin, Some(auru_pm::CommitOrigin::Autosave));
+        assert_eq!(compute_commit_id(&fetched).unwrap(), commit.id);
     }
 
     #[test]

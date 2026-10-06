@@ -588,6 +588,7 @@ mod tests {
             auru_version: "0.1.0".into(),
             format_version: 8,
             metadata: None,
+            origin: None,
         };
         commit.id = compute_commit_id(&commit).unwrap();
         commit
@@ -1101,6 +1102,30 @@ mod tests {
                 Err(Error::Unsupported("permissions")) => {}
                 other => panic!("unexpected: {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn an_autosave_commit_should_round_trip_with_its_origin() {
+        let dir = TempDir::new().unwrap();
+        let provider = FilesystemProvider::open(dir.path()).unwrap();
+        let mut commit = build_commit("autosaved", None);
+        commit.origin = Some(crate::CommitOrigin::Autosave);
+        commit.id = compute_commit_id(&commit).unwrap();
+        rt().block_on(async {
+            provider.put_commit(&commit).await.unwrap();
+            let read = provider.get_commit(&commit.id).await.unwrap();
+            assert_eq!(read.id, commit.id);
+            assert_eq!(read.origin, Some(crate::CommitOrigin::Autosave));
+
+            provider.advance_head(None, commit.id).await.unwrap();
+            let history = provider
+                .list_history(crate::HistoryRange::default())
+                .await
+                .unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].id, commit.id);
+            assert_eq!(history[0].origin, Some(crate::CommitOrigin::Autosave));
         });
     }
 

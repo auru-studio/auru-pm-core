@@ -62,6 +62,7 @@ fn fixture_commit() -> Result<Commit, serde_json::Error> {
         // The fixture predates project summaries and must keep the commit id
         // it was generated with — see `pm_fixtures`.
         metadata: None,
+        origin: None,
     };
     commit.id = compute_commit_id(&commit)?;
     Ok(commit)

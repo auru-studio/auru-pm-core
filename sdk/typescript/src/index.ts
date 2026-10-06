@@ -33,6 +33,7 @@ export type {
   AuthorIdentity,
   Capabilities,
   Commit,
+  CommitOrigin,
   CommitSummary,
   ContentHash,
   HealthResponse,

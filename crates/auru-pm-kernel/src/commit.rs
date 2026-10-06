@@ -76,6 +76,19 @@ pub struct Commit {
     /// keep the ids they were created with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ContentHash>,
+    /// Why this commit was made, when it was not a person pressing Save
+    /// Version. `None` is a version a person saved. Omitted from the encoding
+    /// when absent, so every explicit save keeps the id it was created with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<CommitOrigin>,
+}
+
+/// Why a commit was made, when it was not a person pressing Save Version.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitOrigin {
+    /// Written by the app on a timer or at session end, not asked for.
+    Autosave,
 }
 
 /// Trimmed commit row used by the flat history UI.
@@ -90,6 +103,9 @@ pub struct CommitSummary {
     pub message: String,
     #[serde(default)]
     pub description: String,
+    /// See [`Commit::origin`]. `None` is a version a person saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<CommitOrigin>,
 }
 
 impl From<&Commit> for CommitSummary {
@@ -101,6 +117,7 @@ impl From<&Commit> for CommitSummary {
             timestamp: c.timestamp,
             message: c.message.clone(),
             description: c.description.clone(),
+            origin: c.origin,
         }
     }
 }

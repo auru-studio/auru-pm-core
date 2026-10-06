@@ -159,6 +159,14 @@ export interface TreeRef {
 }
 
 /**
+ * Why a commit was made, when it was not a person pressing Save Version.
+ *
+ * `"autosave"`: written by the app on a timer or at session end, not asked
+ * for. A commit without an origin is a version a person saved.
+ */
+export type CommitOrigin = "autosave";
+
+/**
  * A commit.
  *
  * `parents.length` is the shape: 0 root, 1 normal, 2 merge.
@@ -187,6 +195,11 @@ export interface Commit {
    * fetching the snapshot, which for a real Live Set is around 7 MB.
    */
   metadata?: ContentHash;
+  /**
+   * Absent on every explicit save, so older commits keep their ids. Never
+   * send `null` or `undefined` as a member: it must be left out entirely.
+   */
+  origin?: CommitOrigin;
 }
 
 /** History row. Omits `tree` so listing does not force a tree fetch per row. */
@@ -197,6 +210,7 @@ export interface CommitSummary {
   timestamp: number;
   message: string;
   description?: string;
+  origin?: CommitOrigin;
 }
 
 /**

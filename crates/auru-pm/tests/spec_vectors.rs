@@ -21,7 +21,8 @@
 use std::path::PathBuf;
 
 use auru_pm::{
-    AuthorIdentity, Commit, CommitId, ContentHash, TreeRef, canonical_encoding, compute_commit_id,
+    AuthorIdentity, Commit, CommitId, CommitOrigin, ContentHash, TreeRef, canonical_encoding,
+    compute_commit_id,
 };
 use serde_json::{Value, json};
 
@@ -75,6 +76,7 @@ fn base() -> Commit {
         auru_version: "0.1.0".into(),
         format_version: 8,
         metadata: None,
+        origin: None,
     }
 }
 
@@ -100,6 +102,11 @@ fn corpus() -> Vec<(&'static str, Commit)> {
     let mut with_metadata = base();
     with_metadata.metadata = Some(ContentHash::of(b"project info"));
     cases.push(("metadata present", with_metadata));
+
+    let mut autosave = base();
+    autosave.origin = Some(CommitOrigin::Autosave);
+    autosave.message = "autosave".into();
+    cases.push(("autosave origin", autosave));
 
     let mut with_email = base();
     with_email.author.email = Some("user@example.com".into());

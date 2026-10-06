@@ -138,6 +138,8 @@ struct CommitSummary {
     std::int64_t timestamp = 0;
     std::string message;
     std::string description;
+    /// See `Commit::origin`. Empty for a version a person saved.
+    std::optional<CommitOrigin> origin;
 
     static Result<CommitSummary> from_json(const Json& json);
 };

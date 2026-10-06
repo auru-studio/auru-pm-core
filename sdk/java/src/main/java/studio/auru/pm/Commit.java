@@ -28,6 +28,7 @@ public final class Commit {
     private final String auruVersion;
     private final long formatVersion;
     private final Optional<ContentHash> metadata;
+    private final Optional<CommitOrigin> origin;
 
     private Commit(
             ContentHash id,
@@ -39,7 +40,8 @@ public final class Commit {
             String description,
             String auruVersion,
             long formatVersion,
-            Optional<ContentHash> metadata) {
+            Optional<ContentHash> metadata,
+            Optional<CommitOrigin> origin) {
         this.id = id;
         this.parents = List.copyOf(parents);
         this.tree = tree;
@@ -50,6 +52,7 @@ public final class Commit {
         this.auruVersion = auruVersion;
         this.formatVersion = formatVersion;
         this.metadata = metadata;
+        this.origin = origin;
     }
 
     public ContentHash id() {
@@ -102,6 +105,16 @@ public final class Commit {
         return metadata;
     }
 
+    /**
+     * Why this commit was made, when it was not a person pressing Save Version.
+     *
+     * <p>Empty for a version a person saved. The member is absent from the wire form in that case,
+     * so every explicit save keeps the id it was created with.
+     */
+    public Optional<CommitOrigin> origin() {
+        return origin;
+    }
+
     public static Builder builder() {
         return new Builder();
     }
@@ -140,6 +153,7 @@ public final class Commit {
                 .put("auru_version", auruVersion)
                 .put("format_version", formatVersion)
                 .putIfPresent("metadata", metadata.map(hash -> Json.of(hash.toString())).orElse(null))
+                .putIfPresent("origin", origin.map(value -> Json.of(value.wireName())).orElse(null))
                 .build();
     }
 
@@ -165,7 +179,8 @@ public final class Commit {
                 json.optString("description").orElse(""),
                 json.string("auru_version"),
                 json.integer("format_version"),
-                json.optString("metadata").map(ContentHash::parse));
+                json.optString("metadata").map(ContentHash::parse),
+                json.optString("origin").map(CommitOrigin::fromWireName));
     }
 
     @Override
@@ -194,6 +209,7 @@ public final class Commit {
         private String auruVersion;
         private Long formatVersion;
         private Optional<ContentHash> metadata = Optional.empty();
+        private Optional<CommitOrigin> origin = Optional.empty();
 
         private Builder() {}
 
@@ -248,6 +264,12 @@ public final class Commit {
             return this;
         }
 
+        /** Leave unset for a version a person saved. */
+        public Builder origin(CommitOrigin origin) {
+            this.origin = Optional.ofNullable(origin);
+            return this;
+        }
+
         /**
          * Derive the id and produce the commit.
          *
@@ -278,7 +300,8 @@ public final class Commit {
                             description,
                             auruVersion,
                             formatVersion,
-                            metadata);
+                            metadata,
+                            origin);
             ContentHash id = ContentHash.of(canonicalEncoding(unidentified.toJsonWithoutId()));
             return new Commit(
                     id,
@@ -290,7 +313,8 @@ public final class Commit {
                     description,
                     auruVersion,
                     formatVersion,
-                    metadata);
+                    metadata,
+                    origin);
         }
 
         private static void require(Object value, String name) {

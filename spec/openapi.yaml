@@ -774,6 +774,13 @@ components:
             without fetching the snapshot, which for a real Live Set is around
             7 MB. Absent on older commits and on formats this crate does not
             read; a reader that finds it missing falls back to the snapshot.
+        origin:
+          type: string
+          enum: [autosave]
+          description: |
+            Why the commit was made when it was not a person pressing Save
+            Version. Absent on every explicit save, so older commits keep their
+            ids; a reader may treat absence as a saved version.
 
     CommitSummary:
       type: object
@@ -790,6 +797,13 @@ components:
             - { $ref: "#/components/schemas/SafeInteger" }
         message: { type: string }
         description: { type: string, default: "" }
+        origin:
+          type: string
+          enum: [autosave]
+          description: |
+            Why the commit was made when it was not a person pressing Save
+            Version. Absent on every explicit save; a reader may treat absence
+            as a saved version.
 
     RetentionRule:
       description: |

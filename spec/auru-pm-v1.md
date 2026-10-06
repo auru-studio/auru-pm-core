@@ -144,7 +144,11 @@ that writes commits must reproduce these bytes exactly.
 The rule is **RFC 8785, the JSON Canonicalization Scheme (JCS)**, applied to the
 commit object with the `id` member removed:
 
-1. Serialize the commit to JSON.
+1. Serialize the commit to JSON. Optional members — `metadata`, `origin` and
+   `author.email` — are omitted entirely when absent, never written as `null`.
+   A commit that does not carry one therefore keeps the id it had before the
+   member existed; adding an optional member to the spec never re-identifies
+   old commits.
 2. Remove the top-level `id` member. Identity is a function of content, not of
    itself.
 3. Canonicalize per RFC 8785 — object members sorted by UTF-16 code unit, no
@@ -183,7 +187,8 @@ rather than re-canonicalizing them in transit.
 cases: each is a commit, its canonical bytes, and the resulting id. An
 implementation is conformant when it reproduces all of them. They cover
 non-ASCII text, astral-plane characters, JSON escapes, control characters,
-merge commits, absent optional fields, and the numeric edges.
+merge commits, absent optional fields, a commit carrying an autosave `origin`,
+and the numeric edges.
 
 The commit shape itself is also published standalone as
 [`schemas/commit.schema.json`](./schemas/commit.schema.json), separate from

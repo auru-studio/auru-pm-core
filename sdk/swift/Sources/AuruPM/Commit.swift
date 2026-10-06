@@ -65,6 +65,29 @@ public struct TreeRef: Sendable, Equatable {
     }
 }
 
+/// Why a commit was made, when it was not a person pressing Save Version.
+///
+/// A commit without an origin is a version a person saved. The member is left
+/// out of the wire form entirely when absent, so every explicit save keeps the
+/// id it was created with.
+public enum CommitOrigin: String, Sendable, Equatable {
+    /// Written by the app on a timer or at session end, not asked for.
+    case autosave
+}
+
+extension CommitOrigin {
+    /// The optional `origin` member of a commit or history row.
+    ///
+    /// - Throws: when the member names an origin this library does not know.
+    static func member(of json: JSON) throws -> CommitOrigin? {
+        guard let text = json["origin"]?.stringValue else { return nil }
+        guard let origin = CommitOrigin(rawValue: text) else {
+            throw AuruError(code: .badRequest, message: "unknown commit origin \"\(text)\"")
+        }
+        return origin
+    }
+}
+
 /// One version in a project's history.
 ///
 /// `parents.count` is the shape: 0 root, 1 normal, 2 merge.
@@ -72,7 +95,7 @@ public struct TreeRef: Sendable, Equatable {
 /// The id is the BLAKE3 of the RFC 8785 canonicalization of every other field.
 /// Providers recompute it and treat a mismatch as auth-equivalent — a client
 /// writing what it did not compute — so no initializer accepts one.
-/// ``init(parents:tree:author:timestamp:message:description:auruVersion:formatVersion:metadata:)``
+/// ``init(parents:tree:author:timestamp:message:description:auruVersion:formatVersion:metadata:origin:)``
 /// derives it; ``init(json:)`` keeps the one a provider sent, and ``verifyID()``
 /// checks it.
 public struct Commit: Sendable, Equatable {
@@ -97,6 +120,9 @@ public struct Commit: Sendable, Equatable {
     /// formats the writer could not summarize; a reader that finds it missing
     /// falls back to the snapshot.
     public let metadata: ContentHash?
+    /// Why this commit was made, when it was not a person pressing Save
+    /// Version. `nil` is a version a person saved.
+    public let origin: CommitOrigin?
 
     /// Assemble a commit and derive its id.
     ///
@@ -111,7 +137,8 @@ public struct Commit: Sendable, Equatable {
         description: String = "",
         auruVersion: String,
         formatVersion: Int64,
-        metadata: ContentHash? = nil
+        metadata: ContentHash? = nil,
+        origin: CommitOrigin? = nil
     ) throws {
         guard parents.count <= 2 else {
             throw AuruError(
@@ -129,11 +156,12 @@ public struct Commit: Sendable, Equatable {
         self.auruVersion = auruVersion
         self.formatVersion = formatVersion
         self.metadata = metadata
+        self.origin = origin
 
         let canonical = try Commit.contentJSON(
             parents: parents, tree: tree, author: author, timestamp: timestamp, message: message,
             description: description, auruVersion: auruVersion, formatVersion: formatVersion,
-            metadata: metadata
+            metadata: metadata, origin: origin
         ).canonicalJSON()
         self.id = ContentHash.of(canonical)
     }
@@ -168,6 +196,7 @@ public struct Commit: Sendable, Equatable {
         self.auruVersion = try json.string("auru_version")
         self.formatVersion = try json.integer("format_version")
         self.metadata = try json["metadata"]?.stringValue.map { try ContentHash(parsing: $0) }
+        self.origin = try CommitOrigin.member(of: json)
     }
 
     /// The exact bytes this commit's id is the BLAKE3 of.
@@ -195,14 +224,14 @@ public struct Commit: Sendable, Equatable {
         Commit.contentJSON(
             parents: parents, tree: tree, author: author, timestamp: timestamp, message: message,
             description: description, auruVersion: auruVersion, formatVersion: formatVersion,
-            metadata: metadata)
+            metadata: metadata, origin: origin)
     }
 
     /// Everything except the id — identity is a function of content, not itself.
     private static func contentJSON(
         parents: [ContentHash], tree: TreeRef, author: AuthorIdentity, timestamp: Int64,
         message: String, description: String, auruVersion: String, formatVersion: Int64,
-        metadata: ContentHash?
+        metadata: ContentHash?, origin: CommitOrigin?
     ) -> JSON {
         .object([
             ("parents", .array(parents.map { .string($0.description) })),
@@ -214,6 +243,7 @@ public struct Commit: Sendable, Equatable {
             ("auru_version", .string(auruVersion)),
             ("format_version", .int(formatVersion)),
             ("metadata", metadata.map { JSON.string($0.description) }),
+            ("origin", origin.map { JSON.string($0.rawValue) }),
         ])
     }
 }

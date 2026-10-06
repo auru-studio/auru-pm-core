@@ -64,6 +64,7 @@ async fn m1_first_take_roundtrips() {
         auru_version: "0.1.0".into(),
         format_version: 8,
         metadata: None,
+        origin: None,
     };
     commit.id = compute_commit_id(&commit).unwrap();
     provider.put_commit(&commit).await.unwrap();
@@ -153,6 +154,7 @@ async fn m1_second_commit_chains_to_first() {
             auru_version: "0.1.0".into(),
             format_version: 8,
             metadata: None,
+            origin: None,
         };
         c.id = compute_commit_id(&c).unwrap();
         c

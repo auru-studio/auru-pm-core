@@ -2,6 +2,7 @@ package studio.auru.pm;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * A history row.
@@ -14,7 +15,8 @@ public record CommitSummary(
         AuthorIdentity author,
         long timestamp,
         String message,
-        String description) {
+        String description,
+        Optional<CommitOrigin> origin) {
 
     public CommitSummary {
         parents = List.copyOf(parents);
@@ -31,6 +33,7 @@ public record CommitSummary(
                 AuthorIdentity.fromJson(json.require("author")),
                 json.integer("timestamp"),
                 json.string("message"),
-                json.optString("description").orElse(""));
+                json.optString("description").orElse(""),
+                json.optString("origin").map(CommitOrigin::fromWireName));
     }
 }

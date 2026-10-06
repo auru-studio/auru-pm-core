@@ -97,6 +97,30 @@
       "name": "metadata present"
     },
     {
+      "canonical": "{\"auru_version\":\"0.1.0\",\"author\":{\"display_name\":\"Test User\",\"provider_id\":\"local-folder\",\"provider_user_id\":\"user-1\"},\"description\":\"\",\"format_version\":8,\"message\":\"autosave\",\"origin\":\"autosave\",\"parents\":[],\"timestamp\":1700000000,\"tree\":{\"samples\":\"blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc\",\"snapshot\":\"blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5\"}}",
+      "commit": {
+        "auru_version": "0.1.0",
+        "author": {
+          "display_name": "Test User",
+          "provider_id": "local-folder",
+          "provider_user_id": "user-1"
+        },
+        "description": "",
+        "format_version": 8,
+        "id": "blake3:7e6cf7d778c54bb11e9194a93d7fa56e6e44bdbd95123e2387e1cae831f70f53",
+        "message": "autosave",
+        "origin": "autosave",
+        "parents": [],
+        "timestamp": 1700000000,
+        "tree": {
+          "samples": "blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc",
+          "snapshot": "blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5"
+        }
+      },
+      "id": "blake3:7e6cf7d778c54bb11e9194a93d7fa56e6e44bdbd95123e2387e1cae831f70f53",
+      "name": "autosave origin"
+    },
+    {
       "canonical": "{\"auru_version\":\"0.1.0\",\"author\":{\"display_name\":\"Test User\",\"email\":\"user@example.com\",\"provider_id\":\"local-folder\",\"provider_user_id\":\"user-1\"},\"description\":\"\",\"format_version\":8,\"message\":\"first take\",\"parents\":[],\"timestamp\":1700000000,\"tree\":{\"samples\":\"blake3:5f21e8a045666d350bf53517da2ada8c5bfb5e280c7e5f3f7c3c86e4d9a0b9cc\",\"snapshot\":\"blake3:2d168e1ff20930e41ae0c8e9b0bfc97bba39b1afb272f6bf9b52bf30716e96a5\"}}",
       "commit": {
         "auru_version": "0.1.0",

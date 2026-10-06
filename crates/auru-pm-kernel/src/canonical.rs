@@ -82,7 +82,7 @@ pub fn compute_commit_id(commit: &Commit) -> Result<CommitId, serde_json::Error>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commit::{AuthorIdentity, Commit, TreeRef};
+    use crate::commit::{AuthorIdentity, Commit, CommitOrigin, TreeRef};
 
     fn fixture() -> Commit {
         Commit {
@@ -105,7 +105,42 @@ mod tests {
             auru_version: "0.1.0".into(),
             format_version: 8,
             metadata: None,
+            origin: None,
         }
+    }
+
+    /// The fixture's id before `origin` existed. Pinned so the field's
+    /// addition is provably invisible to every commit that does not carry it.
+    const FIXTURE_ID_BEFORE_ORIGIN: &str =
+        "blake3:8189ac12713762dcb92c060a1db950b532c06dc10ac9a83d05344a67f25906e7";
+
+    #[test]
+    fn absent_origin_keeps_the_encoding() {
+        let commit = fixture();
+        let bytes = canonical_encoding(&commit).unwrap();
+        let as_str = std::str::from_utf8(&bytes).unwrap();
+        assert!(!as_str.contains("origin"), "origin leaked: {as_str}");
+        assert_eq!(
+            compute_commit_id(&commit).unwrap().0.to_string(),
+            FIXTURE_ID_BEFORE_ORIGIN
+        );
+    }
+
+    #[test]
+    fn an_autosave_origin_changes_the_id_and_encodes_as_a_string() {
+        let mut autosave = fixture();
+        autosave.origin = Some(CommitOrigin::Autosave);
+        let bytes = canonical_encoding(&autosave).unwrap();
+        let as_str = std::str::from_utf8(&bytes).unwrap();
+        assert!(as_str.contains("\"origin\":\"autosave\""), "got {as_str}");
+        assert_ne!(
+            compute_commit_id(&autosave).unwrap(),
+            compute_commit_id(&fixture()).unwrap()
+        );
+        assert_ne!(
+            compute_commit_id(&autosave).unwrap().0.to_string(),
+            FIXTURE_ID_BEFORE_ORIGIN
+        );
     }
 
     #[test]

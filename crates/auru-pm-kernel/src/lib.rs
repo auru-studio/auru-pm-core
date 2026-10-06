@@ -42,7 +42,9 @@ pub use ableton::{
 };
 pub use auru_pm_protocol::WIRE_VERSION;
 pub use canonical::{canonical_encoding, compute_commit_id};
-pub use commit::{AuthorIdentity, Commit, CommitId, CommitSummary, HistoryRange, TreeRef};
+pub use commit::{
+    AuthorIdentity, Commit, CommitId, CommitOrigin, CommitSummary, HistoryRange, TreeRef,
+};
 pub use dawproject::{
     DawprojectAssetRef, DawprojectAssetSummary, DawprojectMetadata, DawprojectTrackCounts,
     DawprojectTrackKind, DawprojectTrackSummary,

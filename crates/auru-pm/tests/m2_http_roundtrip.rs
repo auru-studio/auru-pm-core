@@ -444,6 +444,7 @@ async fn m2_commit_roundtrip_over_http() {
         auru_version: "0.1.0".into(),
         format_version: 8,
         metadata: None,
+        origin: None,
     };
     commit.id = compute_commit_id(&commit).unwrap();
 
@@ -532,6 +533,7 @@ async fn m2_advance_head_conflict() {
             auru_version: "0".into(),
             format_version: 8,
             metadata: None,
+            origin: None,
         };
         c.id = compute_commit_id(&c).unwrap();
         c
@@ -584,6 +586,7 @@ async fn m2_two_commit_history() {
             auru_version: "0".into(),
             format_version: 8,
             metadata: None,
+            origin: None,
         };
         c.id = compute_commit_id(&c).unwrap();
         c

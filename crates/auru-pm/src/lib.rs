@@ -33,14 +33,15 @@ mod verified_io;
 // keep resolving after the split.
 pub use auru_pm_kernel::{
     AbletonMetadata, AssetKind, AssetRef, AssetSummary, AuthorIdentity, ChangeKind, ChangeRow,
-    ChangeTag, ChannelDiff, ChannelKind, Commit, CommitId, CommitSummary, ConflictChoice,
-    ConflictResolution, ConflictedField, ContentHash, DawprojectAssetRef, DawprojectAssetSummary,
-    DawprojectMetadata, DawprojectTrackCounts, DawprojectTrackKind, DawprojectTrackSummary, Error,
-    HistoryRange, IntegrityProblem, KeyInfo, MergeOutcome, PROJECT_INFO_SCHEMA, ParseHashError,
-    PluginFormat, PluginId, PluginRef, ProjectDiff, ProjectFormat, ProjectInfo, ProjectSnapshot,
-    RefClass, Result, SampleEntry, SampleManifest, TimeSignature, TrackCounts, TrackKind,
-    TrackSummary, TreeRef, canonical_encoding, compute_commit_id, merge3, merge3_json_bytes,
-    resolve_conflicts, structured_diff, summarize_diff,
+    ChangeTag, ChannelDiff, ChannelKind, Commit, CommitId, CommitOrigin, CommitSummary,
+    ConflictChoice, ConflictResolution, ConflictedField, ContentHash, DawprojectAssetRef,
+    DawprojectAssetSummary, DawprojectMetadata, DawprojectTrackCounts, DawprojectTrackKind,
+    DawprojectTrackSummary, Error, HistoryRange, IntegrityProblem, KeyInfo, MergeOutcome,
+    PROJECT_INFO_SCHEMA, ParseHashError, PluginFormat, PluginId, PluginRef, ProjectDiff,
+    ProjectFormat, ProjectInfo, ProjectSnapshot, RefClass, Result, SampleEntry, SampleManifest,
+    TimeSignature, TrackCounts, TrackKind, TrackSummary, TreeRef, canonical_encoding,
+    compute_commit_id, merge3, merge3_json_bytes, resolve_conflicts, structured_diff,
+    summarize_diff,
 };
 pub use auru_pm_kernel::{
     canonical, commit, dawproject, diff, error, hash, merge, project_format, project_info,

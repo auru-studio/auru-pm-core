@@ -12,7 +12,7 @@ use crate::ableton::BundlePolicy;
 use crate::ableton::validate::IntegrityProblem;
 use crate::asset_plan::plan_assets_with_report;
 use crate::canonical::compute_commit_id;
-use crate::commit::{AuthorIdentity, Commit, CommitId, TreeRef};
+use crate::commit::{AuthorIdentity, Commit, CommitId, CommitOrigin, TreeRef};
 use crate::error::{Error, Result};
 use crate::hash::ContentHash;
 use crate::merge::{ConflictResolution, ConflictedField, MergeOutcome, merge3, resolve_conflicts};
@@ -70,6 +70,9 @@ pub enum PushOutcome {
 pub struct PushOptions {
     pub bundle_policy: BundlePolicy,
     pub conflict_resolutions: Option<Vec<ConflictResolution>>,
+    /// Recorded on the commit when the push was not a person pressing Save
+    /// Version. `None` (the default) is an explicit save.
+    pub origin: Option<CommitOrigin>,
     /// Opaque resources detached from a version-two project snapshot.
     ///
     /// Prefer [`Self::for_snapshot`] so hashes and bytes stay paired.
@@ -636,6 +639,7 @@ async fn write_commit_to_primary(
     author: AuthorIdentity,
     message: &str,
     description: &str,
+    origin: Option<CommitOrigin>,
     from_head: Option<CommitId>,
 ) -> Result<Commit, String> {
     // Snapshot blob.
@@ -679,6 +683,7 @@ async fn write_commit_to_primary(
         auru_version: env!("CARGO_PKG_VERSION").to_owned(),
         format_version: snapshot_format_version(snapshot_bytes),
         metadata,
+        origin,
     };
 
     let real_id = compute_commit_id(&commit).map_err(|e| format!("compute commit id: {e}"))?;
@@ -814,6 +819,7 @@ pub async fn push_with_options(
         options.conflict_resolutions.as_deref(),
         &options.bundle_policy,
         &options.snapshot_resources,
+        options.origin,
     )
     .await
 }
@@ -875,6 +881,7 @@ async fn push_with_optional_resolutions(
     resolutions: Option<&[ConflictResolution]>,
     bundle_policy: &BundlePolicy,
     snapshot_resources: &BTreeMap<String, Vec<u8>>,
+    origin: Option<CommitOrigin>,
 ) -> Result<PushOutcome, String> {
     let remote_head = primary
         .get_head()
@@ -1022,6 +1029,7 @@ async fn push_with_optional_resolutions(
         author,
         message,
         description,
+        origin,
         from_head,
     )
     .await?;

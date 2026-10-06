@@ -52,6 +52,11 @@
     "metadata": {
       "$ref": "#/$defs/contentHash",
       "description": "Blob holding this commit's ProjectInfo — a few kilobytes describing tempo, key, tracks and plugins, so a client can show what a version is without fetching the ~7 MB snapshot. Absent on older commits and on formats the writer could not summarize; a reader that finds it missing falls back to the snapshot."
+    },
+    "origin": {
+      "type": "string",
+      "enum": ["autosave"],
+      "description": "Why the commit was made when it was not a person pressing Save Version. Absent on every explicit save, so older commits keep their ids; a reader may treat absence as a saved version."
     }
   },
   "$defs": {

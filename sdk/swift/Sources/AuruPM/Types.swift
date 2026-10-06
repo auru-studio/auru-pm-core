@@ -232,6 +232,8 @@ public struct CommitSummary: Sendable, Equatable {
     public var timestamp: Int64
     public var message: String
     public var description: String
+    /// See ``Commit/origin``. `nil` is a version a person saved.
+    public var origin: CommitOrigin?
 
     init(json: JSON) throws {
         id = try ContentHash(parsing: try json.string("id"))
@@ -245,6 +247,7 @@ public struct CommitSummary: Sendable, Equatable {
         timestamp = try json.integer("timestamp")
         message = try json.string("message")
         description = json["description"]?.stringValue ?? ""
+        origin = try CommitOrigin.member(of: json)
     }
 }
 
